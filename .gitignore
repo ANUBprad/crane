@@ -1,0 +1,30 @@
+# Local application data and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+
+# Go
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
