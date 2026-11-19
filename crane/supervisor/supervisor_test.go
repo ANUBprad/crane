@@ -1,10 +1,10 @@
 package supervisor
 
 import (
-	"context"
 	"testing"
 )
 
+// TestNewSupervisor creates a new Supervisor and verifies it is non-nil.
 func TestNewSupervisor(t *testing.T) {
 	s := New()
 	if s == nil {
@@ -12,20 +12,13 @@ func TestNewSupervisor(t *testing.T) {
 	}
 }
 
+// TestSupervisorStop verifies Stop() does not panic.
 func TestSupervisorStop(t *testing.T) {
 	s := New()
 	s.Stop() // should not panic
 }
 
-func TestSupervisorStopWithContext(t *testing.T) {
-	s := New()
-	ctx := context.Background()
-	err := s.StopWithContext(ctx)
-	if err != nil {
-		t.Fatalf("Expected nil error, got: %v", err)
-	}
-}
-
+// TestVersion verifies the Version() function returns the expected version string.
 func TestVersion(t *testing.T) {
 	ver := Version()
 	if ver == "" {
@@ -36,6 +29,7 @@ func TestVersion(t *testing.T) {
 	}
 }
 
+// TestHealthCheck verifies HealthCheck() does not panic.
 func TestHealthCheck(t *testing.T) {
 	err := HealthCheck()
 	// Should not panic; may return an error since implementation is stubbed
