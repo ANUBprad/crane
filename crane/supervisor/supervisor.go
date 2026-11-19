@@ -195,6 +195,88 @@ func (s *Supervisor) launchPythonRuntime() error {
 	return nil
 }
 
+// handleProtocolMessage processes incoming protocol messages from the Python runtime.
+// This is called from the Go supervisor when communicating via stdin/stdout.
+func (s *Supervisor) handleProtocolMessage(rawMsg json.RawMessage) error {
+	var msg python_protocol.Message
+	if err := json.Unmarshal(rawMsg, &msg); err != nil {
+		return fmt.Errorf("failed to parse protocol message: %w", err)
+	}
+
+	switch msg.Type {
+	case python_protocol.TypeHealthCheck:
+		// Health check response already handled during startup
+		return nil
+
+	case python_protocol.TypeRegisterServer:
+		var registerMsg python_protocol.RegisterServer
+		if err := json.Unmarshal(rawMsg, &registerMsg); err != nil {
+			return fmt.Errorf("failed to parse register_server message: %w", err)
+		}
+		logger := fmt.Sprintf("Registering MCP server: %s (transport: %s)", registerMsg.ServerName, registerMsg.Transport)
+		fmt.Println(logger)
+		// TODO: Implement server registration via Go/Python protocol
+		// For now, just acknowledge
+		return nil
+
+	case python_protocol.TypeRemoveServer:
+		var removeMsg python_protocol.RemoveServer
+		if err := json.Unmarshal(rawMsg, &removeMsg); err != nil {
+			return fmt.Errorf("failed to parse remove_server message: %w", err)
+		}
+		fmt.Printf("Removing MCP server: %s\n", removeMsg.ServerName)
+		// TODO: Implement server removal
+		return nil
+
+	case python_protocol.TypeListServers:
+		// List all registered MCP servers
+		servers := python_manager_get_servers()
+		data, _ := json.Marshal(map[string]interface{}{
+			"servers": servers,
+		})
+		fmt.Println(string(data))
+		return nil
+
+	case python_protocol.TypeDiscoverTools:
+		var discoverMsg python_protocol.DiscoverTools
+		if err := json.Unmarshal(rawMsg, &discoverMsg); err != nil {
+			return fmt.Errorf("failed to parse discover_tools message: %w", err)
+		}
+		serverName := discoverMsg.ServerName
+		fmt.Printf("Discovering tools from server: %s\n", serverName)
+		// TODO: Implement tool discovery
+		return nil
+
+	case python_protocol.TypeInvokeTool:
+		var invokeMsg python_protocol.InvokeTool
+		if err := json.Unmarshal(rawMsg, &invokeMsg); err != nil {
+			return fmt.Errorf("failed to parse invoke_tool message: %w", err)
+		}
+		fmt.Printf("Invoking tool: %s on server: %s\n", invokeMsg.ToolName, invokeMsg.ServerName)
+		// TODO: Implement tool invocation
+		return nil
+
+	case python_protocol.TypeToolResult:
+		var toolResult python_protocol.ToolResult
+		if err := json.Unmarshal(rawMsg, &toolResult); err != nil {
+			return fmt.Errorf("failed to parse tool_result message: %w", err)
+		}
+		fmt.Printf("Tool result from %s: success=%v, error=%s\n", toolResult.ServerName, toolResult.Success, toolResult.Error)
+		// TODO: Handle tool result
+		return nil
+
+	default:
+		return fmt.Errorf("unknown protocol message type: %s", msg.Type)
+	}
+}
+
+// python_manager_get_servers is a placeholder for the Go supervisor's server list.
+// In the full implementation, this would interface with the MCP manager.
+func python_manager_get_servers() []map[string]interface{} {
+	// Return empty list for now; full implementation would query the MCP manager
+	return []map[string]interface{}{}
+}
+
 // RequestShutdown sends a shutdown request to the Python runtime and waits
 // for graceful shutdown within the configured timeout.
 func (s *Supervisor) RequestShutdown() error {

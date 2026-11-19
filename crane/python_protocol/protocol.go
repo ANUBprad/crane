@@ -13,11 +13,17 @@ const ProtocolVersion = "0.1.0"
 
 // These constants define the valid protocol message types.
 const (
-	TypeHealthCheck     = "health_check"
-	TypeShutdownRequest = "shutdown_request"
-	TypeRuntimeIdentity = "runtime_identity"
-	TypeErrorResponse   = "error_response"
-	TypeSuccessResponse = "success_response"
+	TypeHealthCheck      = "health_check"
+	TypeShutdownRequest  = "shutdown_request"
+	TypeRuntimeIdentity  = "runtime_identity"
+	TypeErrorResponse    = "error_response"
+	TypeSuccessResponse  = "success_response"
+	TypeRegisterServer   = "register_server"
+	TypeRemoveServer     = "remove_server"
+	TypeListServers      = "list_servers"
+	TypeDiscoverTools    = "discover_tools"
+	TypeInvokeTool       = "invoke_tool"
+	TypeToolResult       = "tool_result"
 )
 
 // Message is a base protocol message with version and type fields.
@@ -47,16 +53,60 @@ type RuntimeIdentity struct {
 // ErrorResponse is a protocol error message.
 type ErrorResponse struct {
 	Message
-	ErrMessage string `json:"message"`
-	Code       string `json:"code"`
-	RetryAfter *int   `json:"retry_after,omitempty"`
-	Retryable  bool   `json:"retryable"`
+	ErrMessage  string `json:"message"`
+	Code        string `json:"code"`
+	RetryAfter  *int   `json:"retry_after,omitempty"`
+	Retryable   bool   `json:"retryable"`
 }
 
 // SuccessResponse is a protocol success message.
 type SuccessResponse struct {
 	Message
 	Result json.RawMessage `json:"result,omitempty"`
+}
+
+// RegisterServer is a protocol message for registering an MCP server.
+type RegisterServer struct {
+	Message
+	ServerName   string `json:"server_name"`
+	Transport    string `json:"transport"` // "stdio" or "streamable_http"
+	Parameters   json.RawMessage `json:"parameters,omitempty"`
+	Capabilities json.RawMessage `json:"capabilities,omitempty"`
+}
+
+// RemoveServer is a protocol message for removing an MCP server.
+type RemoveServer struct {
+	Message
+	ServerName string `json:"server_name"`
+}
+
+// ListServers is a protocol message for listing registered servers.
+type ListServers struct {
+	Message
+}
+
+// DiscoverTools is a protocol message for discovering tools from a server.
+type DiscoverTools struct {
+	Message
+	ServerName string `json:"server_name,omitempty"`
+}
+
+// InvokeTool is a protocol message for invoking an MCP tool.
+type InvokeTool struct {
+	Message
+	ServerName string `json:"server_name"`
+	ToolName   string `json:"tool_name"`
+	Arguments  json.RawMessage `json:"arguments,omitempty"`
+}
+
+// ToolResult is a protocol message returning tool invocation results.
+type ToolResult struct {
+	Message
+	ServerName string `json:"server_name"`
+	ToolName   string `json:"tool_name"`
+	Success    bool      `json:"success"`
+	Result     json.RawMessage `json:"result,omitempty"`
+	Error      string    `json:"error,omitempty"`
 }
 
 // Unmarshal parses a raw JSON byte slice into a Message.
@@ -92,7 +142,9 @@ func MarshalMsg(msg Message) ([]byte, error) {
 func ValidateType(msgType string) bool {
 	switch msgType {
 	case TypeHealthCheck, TypeShutdownRequest, TypeRuntimeIdentity,
-		TypeErrorResponse, TypeSuccessResponse:
+		TypeErrorResponse, TypeSuccessResponse,
+		TypeRegisterServer, TypeRemoveServer, TypeListServers,
+		TypeDiscoverTools, TypeInvokeTool, TypeToolResult:
 		return true
 	default:
 		return false
@@ -122,8 +174,8 @@ func PrintError(code, message string, retryable bool, retryAfter *int) {
 			Type:    TypeErrorResponse,
 		},
 		ErrMessage: message,
-		Code:       code,
-		Retryable:  retryable,
+		Code:      code,
+		Retryable: retryable,
 		RetryAfter: retryAfter,
 	}
 	data, _ := json.Marshal(response)
@@ -196,31 +248,74 @@ func ReadHealthCheck() (*HealthCheck, error) {
 	return &HealthCheck{Message: msg}, nil
 }
 
-// ReadShutdownRequest reads and validates a shutdown_request message from stdin.
-func ReadShutdownRequest() (*ShutdownRequest, error) {
+// ReadRegisterServer reads and validates a register_server message from stdin.
+func ReadRegisterServer() (*RegisterServer, error) {
 	msg, err := ParseAndValidate()
 	if err != nil {
 		return nil, err
 	}
-	if msg.Type != TypeShutdownRequest {
-		return nil, fmt.Errorf("expected shutdown_request, got %s", msg.Type)
+	if msg.Type != TypeRegisterServer {
+		return nil, fmt.Errorf("expected register_server, got %s", msg.Type)
 	}
-	return &ShutdownRequest{Message: msg}, nil
+	return &RegisterServer{Message: msg}, nil
 }
 
-// ReadRuntimeIdentity reads and validates a runtime_identity message from stdin.
-func ReadRuntimeIdentity() (*RuntimeIdentity, error) {
+// ReadRemoveServer reads and validates a remove_server message from stdin.
+func ReadRemoveServer() (*RemoveServer, error) {
 	msg, err := ParseAndValidate()
 	if err != nil {
 		return nil, err
 	}
-	if msg.Type != TypeRuntimeIdentity {
-		return nil, fmt.Errorf("expected runtime_identity, got %s", msg.Type)
+	if msg.Type != TypeRemoveServer {
+		return nil, fmt.Errorf("expected remove_server, got %s", msg.Type)
 	}
-	return &RuntimeIdentity{
-		Message:        msg,
-		RuntimeVersion: msg.Version,
-		PythonVersion:  os.Getenv("PYTHON_VERSION"),
-		PID:            os.Getpid(),
-	}, nil
+	return &RemoveServer{Message: msg}, nil
+}
+
+// ReadListServers reads and validates a list_servers message from stdin.
+func ReadListServers() (*ListServers, error) {
+	msg, err := ParseAndValidate()
+	if err != nil {
+		return nil, err
+	}
+	if msg.Type != TypeListServers {
+		return nil, fmt.Errorf("expected list_servers, got %s", msg.Type)
+	}
+	return &ListServers{Message: msg}, nil
+}
+
+// ReadDiscoverTools reads and validates a discover_tools message from stdin.
+func ReadDiscoverTools() (*DiscoverTools, error) {
+	msg, err := ParseAndValidate()
+	if err != nil {
+		return nil, err
+	}
+	if msg.Type != TypeDiscoverTools {
+		return nil, fmt.Errorf("expected discover_tools, got %s", msg.Type)
+	}
+	return &DiscoverTools{Message: msg}, nil
+}
+
+// ReadInvokeTool reads and validates an invoke_tool message from stdin.
+func ReadInvokeTool() (*InvokeTool, error) {
+	msg, err := ParseAndValidate()
+	if err != nil {
+		return nil, err
+	}
+	if msg.Type != TypeInvokeTool {
+		return nil, fmt.Errorf("expected invoke_tool, got %s", msg.Type)
+	}
+	return &InvokeTool{Message: msg}, nil
+}
+
+// ReadToolResult reads and validates a tool_result message from stdin.
+func ReadToolResult() (*ToolResult, error) {
+	msg, err := ParseAndValidate()
+	if err != nil {
+		return nil, err
+	}
+	if msg.Type != TypeToolResult {
+		return nil, fmt.Errorf("expected tool_result, got %s", msg.Type)
+	}
+	return &ToolResult{Message: msg}, nil
 }
