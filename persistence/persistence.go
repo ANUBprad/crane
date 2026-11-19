@@ -275,6 +275,16 @@ func (s *Store) SaveTaskState(taskID string, snapshot []byte) error {
 		return fmt.Errorf("begin checkpoint transaction: %w", err)
 	}
 	defer tx.Rollback()
+	// The first workflow checkpoint can arrive before any separate task-create
+	// request. Create a minimal task row in the same transaction so the
+	// checkpoint's foreign key is valid and the state is never discarded.
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.Exec(
+		"INSERT OR IGNORE INTO tasks (id, created_at, status, input) VALUES (?, ?, 'queued', '')",
+		taskID, now,
+	); err != nil {
+		return fmt.Errorf("ensure task row for checkpoint %q: %w", taskID, err)
+	}
 	var version int
 	if err := tx.QueryRow(
 		"SELECT COALESCE(MAX(version), 0) + 1 FROM checkpoints WHERE task_id = ?", taskID,

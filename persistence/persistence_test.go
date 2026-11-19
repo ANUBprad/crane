@@ -58,8 +58,11 @@ func TestCheckpointVersionsAreMonotonic(t *testing.T) {
 	if !ok || string(got) != `{"state":"succeeded"}` {
 		t.Fatalf("latest checkpoint = %q, ok = %v", got, ok)
 	}
-	if err := store.SaveTaskState("missing-task", []byte(`{"state":"running"}`)); err == nil {
-		t.Fatal("expected foreign-key violation for unknown task")
+	if err := store.SaveTaskState("first-checkpoint-task", []byte(`{"state":"running"}`)); err != nil {
+		t.Fatalf("first checkpoint should create its task row: %v", err)
+	}
+	if _, ok := store.GetLatestTaskState("first-checkpoint-task"); !ok {
+		t.Fatal("expected checkpoint to be persisted for a task created by first snapshot")
 	}
 }
 
