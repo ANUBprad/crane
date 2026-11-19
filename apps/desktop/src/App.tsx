@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import {
-  Activity, ArrowUpRight, Bot, Boxes, Check, ChevronDown, CircleHelp,
+  Activity, ArrowUpRight, Bot, Boxes, Check, ChevronDown, CircleHelp, Sun, Moon,
   Command, Cpu, Gauge, GitBranch, HardDrive, LayoutDashboard, ListTodo,
   LockKeyhole, Menu, MoreHorizontal, Plus, Search, Settings2, ShieldCheck,
   SlidersHorizontal, Sparkles, Terminal, Workflow, X,
@@ -23,6 +23,7 @@ function App() {
   const [prompt, setPrompt] = useState("");
   const [showComposer, setShowComposer] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
 
   useEffect(() => {
     window.craneDesktop?.getAppInfo().then(setAppInfo).catch(() => setAppInfo(null));
@@ -31,10 +32,10 @@ function App() {
   const active = navItems.find((item) => item.label === section) ?? navItems[0];
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-theme={theme}>
       <aside className={`sidebar ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
         <div className="brand">
-          <div className="brand-mark"><span /></div>
+          <img className="brand-logo" src={theme === "dark" ? "/crane-mark-dark.webp" : "/crane-mark-light.webp"} alt="CRANE crane emblem" />
           {sidebarOpen && <div className="brand-copy"><strong>CRANE</strong><small>EXECUTION RUNTIME</small></div>}
           <button className="icon-button sidebar-toggle" onClick={() => setSidebarOpen(!sidebarOpen)} aria-label="Toggle sidebar"><Menu size={17} /></button>
         </div>
@@ -72,6 +73,7 @@ function App() {
           <div className="topbar-actions">
             <div className="connection-pill"><span className="status-dot offline" /> Runtime disconnected</div>
             <button className="icon-button" aria-label="Search"><Search size={17} /></button>
+            <button className="icon-button theme-toggle" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"} title={theme === "dark" ? "Light theme" : "Dark theme"}>{theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}</button>
             <div className="topbar-divider" />
             <button className="icon-button" aria-label="Command menu"><Command size={17} /></button>
           </div>
