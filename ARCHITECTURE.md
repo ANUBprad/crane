@@ -1,91 +1,210 @@
-# CRANE — Architecture
+# CRANE — System Architecture
 
-## System overview
+## 1. Purpose
 
-CRANE has a local Go supervisor and a packaged Python agent runtime. Go owns the product process, task lifecycle and machine-level responsibilities. Python owns agent execution using LangChain, LangGraph and MCP integrations.
+CRANE is a headless, offline-first execution runtime for tasks that interact with software systems through Model Context Protocol (MCP) tools. It coordinates bounded workflows, persists task state, applies action policy, handles failures, and returns concise results.
 
-```text
-CLI (agent) / Local API
-          |
-          v
-     Go Supervisor
-  - command handling
-  - task lifecycle
-  - local IPC/API
-  - concurrency and scheduling
-  - process supervision
-  - policy coordination
-          |
-          | versioned local protocol
-          v
-   Python Agent Runtime
-  - LangChain integrations
-  - LangGraph workflows
-  - planning and routing
-  - checkpoint interaction
-  - tool selection and execution
-          |
-          +-----------------------+
-          |                       |
-          v                       v
-      MCP Manager            Model Provider Layer
-  - server registry          - local providers
-  - stdio transport          - optional hosted APIs
-  - Streamable HTTP          - explicit egress policy
-  - discovery/schema
-  - invocation
-          |                       |
-          v                       v
-  Local/Remote MCP tools      Local/Remote LLMs
+This document distinguishes:
 
-Shared local state: SQLite + structured log/artifact files
+- **Target architecture:** the intended ownership and runtime design.
+- **Current repository implementation:** source modules that exist today.
+- **Verified behavior:** behavior demonstrated by tests or end-to-end execution.
+
+A component existing in source is not, by itself, proof that its full integration path works.
+
+## 2. Architectural principles
+
+- Headless and CLI-first; no mandatory dashboard.
+- Go owns the executable, process supervision, task lifecycle, and local persistence coordination.
+- Python owns agent workflow execution.
+- LangGraph provides stateful workflow orchestration.
+- LangChain provides model and tool abstractions.
+- MCP is the tool integration boundary.
+- SQLite is the default local persistence engine.
+- Local execution is preferred; hosted providers are explicit optional integrations.
+- No silent cloud fallback or unauthorized data egress.
+- Risky, sensitive, privilege-changing, destructive, or externally consequential operations require policy authorization.
+- Windows is the first target; core logic should remain portable.
+
+## 3. Target component view
+
+```mermaid
+flowchart TB
+    CLI[CLI / Local Client]
+    GO[Go CLI and Supervisor]
+    PROTO[Versioned Go-Python Protocol]
+    PY[Python Agent Runtime]
+    GRAPH[LangGraph Workflow Engine]
+    LC[LangChain Model and Tool Layer]
+    MCP[MCP Client Manager]
+    MODEL[Configured Model Provider]
+    TOOLS[Local stdio and Remote Streamable HTTP MCP Servers]
+    DB[(SQLite)]
+    FILES[Managed Logs and Artifacts]
+
+    CLI --> GO
+    GO <--> PROTO
+    PROTO <--> PY
+    GO <--> DB
+    GO --> FILES
+    PY --> GRAPH
+    GRAPH --> LC
+    LC --> MODEL
+    LC --> MCP
+    MCP --> TOOLS
+    GRAPH <--> PROTO
 ```
 
-## Component ownership
+The diagram is the intended logical architecture. In the current codebase, the CLI entry point is not yet fully wired to the separate supervisor package, and the full task execution/recovery path still requires behavioral integration testing.
 
-### Go supervisor
-- Owns the user-facing `agent` executable and CLI.
-- Starts, monitors and recovers the packaged Python runtime.
-- Owns task admission, identifiers, lifecycle, cancellation and concurrency limits.
-- Provides local API/IPC with restrictive defaults.
-- Coordinates approval requests and policy outcomes.
-- Owns diagnostics and install/update coordination.
-- Does not duplicate LangGraph planning logic.
+## 4. Component responsibilities
 
-### Python agent runtime
-- Executes workflows using LangChain and LangGraph.
-- Receives versioned task envelopes from Go.
-- Maintains explicit workflow state and checkpoint boundaries.
-- Invokes MCP tools only through authorized integration paths.
-- Emits structured events and results to the supervisor.
-- Does not independently own global task identity or installation state.
+### 4.1 Go CLI — `cmd/agent`
 
-### MCP registry and manager
-- Stores server definitions and transport settings.
-- Supports runtime registration, updates, enable/disable and removal.
-- Supervises local stdio server processes and Streamable HTTP connections.
-- Discovers tools and schemas dynamically.
-- Applies connection/request timeouts and bounded reconnect behavior.
-- Isolates failures by server.
-- Never assumes a tool is safe because an MCP server exposes it.
+Intended responsibilities:
+- Parse user commands and flags.
+- Submit tasks and display task identifiers.
+- Retrieve status and results.
+- Request cancellation.
+- Expose diagnostics without requiring a graphical interface.
 
-### Workflow engine
-- Uses LangGraph for stateful multi-step workflows.
-- Uses bounded planning/execution loops, conditional routing, retry policy and approval nodes.
-- Persists checkpoints at explicit boundaries.
-- Resumes only when checkpoint and side-effect semantics permit safe continuation.
-- Avoids multi-agent complexity unless a concrete workflow needs it.
+Current implementation:
+- A Go entry point exists.
+- The development version flag is present.
+- The current `main.go` still contains placeholder supervisor lifecycle code; task-oriented commands are not yet a complete CLI.
 
-### Persistence
-- SQLite is the default local database.
-- Store task metadata, lifecycle events, approval records and checkpoint/artifact references.
-- Keep large logs and artifacts in managed files when appropriate.
-- Never store secrets as plaintext in ordinary task/configuration tables.
-- Version and test all database migrations.
+### 4.2 Go supervisor — `supervisor`
 
-## Task lifecycle
+Intended responsibilities:
+- Own runtime process lifecycle.
+- Coordinate task admission, state transitions, cancellation, and recovery.
+- Start and monitor the Python runtime.
+- Exchange versioned messages with Python.
+- Coordinate policy and approval decisions.
+- Keep execution independent of the submitting terminal.
 
-Initial states:
+Current implementation:
+- A supervisor package and Python process-launch/protocol handling code exist.
+- The package is not yet fully integrated into the CLI entry point.
+- Process restart recovery must be demonstrated through a real multi-process test before being considered verified.
+
+### 4.3 Python agent runtime — `crane/python_runtime`
+
+Responsibilities:
+- Receive task and runtime messages.
+- Execute the workflow engine.
+- Maintain typed workflow state.
+- Coordinate MCP tool discovery and invocation through the MCP/LangChain integration.
+- Emit structured state and result messages to Go.
+
+Current implementation:
+- Runtime, CLI, workflow engine, and workflow state modules exist.
+- A reproducible Python dependency manifest and packaged Python runtime are not yet present in the repository.
+
+### 4.4 LangGraph workflow engine
+
+The workflow engine is intended to:
+- Normalize task input.
+- Select an authorized next action.
+- Route to approval when policy requires it.
+- Invoke a selected MCP tool.
+- Evaluate the result and decide whether to continue, retry, or finish.
+- Enforce step, time, and retry bounds.
+- Persist state at defined checkpoints.
+
+Current implementation:
+- A `StateGraph` workflow engine and typed workflow state are present.
+- Correct behavior across process termination, approval restoration, and consequential side effects remains an integration-test requirement.
+
+### 4.5 LangChain and model providers
+
+LangChain provides the abstraction for:
+- Model/provider invocation.
+- Tool interfaces and structured outputs.
+- Adapting discovered MCP tools into the workflow.
+
+Provider policy:
+- Local providers are preferred for offline/private execution.
+- Hosted providers must be explicitly configured.
+- CRANE must not silently fall back from local inference to a hosted model.
+- Provider selection and data-egress authorization must be enforced outside model-generated instructions.
+
+Current implementation:
+- MCP-to-LangChain tool adapter code exists.
+- A complete provider configuration layer and Ollama integration are not yet present.
+
+### 4.6 MCP manager — `crane/mcp_runtime`
+
+Intended responsibilities:
+- Register, update, enable, disable, and remove MCP servers.
+- Support stdio and Streamable HTTP transports.
+- Discover tool names and schemas.
+- Validate invocation arguments.
+- Apply connection and request timeouts.
+- Preserve server identity and isolate server failures.
+- Route invocations through policy-approved paths.
+
+Current implementation:
+- MCP manager, transport, discovery, and LangChain adapter code are present.
+- Live local MCP-server integration and transport lifecycle behavior still require end-to-end validation.
+
+### 4.7 SQLite persistence — `persistence`
+
+SQLite is the default single-machine persistence layer. It is intended to store:
+- Task metadata and lifecycle state.
+- Task events.
+- Checkpoint snapshots/references.
+- Approval records.
+- Migration metadata.
+
+The current Go persistence package includes database initialization and task/checkpoint-related storage methods. Correct transaction semantics, checkpoint round-tripping, restart restoration, and concurrent access must be covered by behavioral tests.
+
+### 4.8 Versioned protocol — `python_protocol`
+
+The Go/Python boundary uses newline-delimited JSON messages with an explicit protocol version and message type.
+
+Protocol requirements:
+- Validate version, type, and required fields at the boundary.
+- Bound message size and reject malformed messages safely.
+- Keep stdout reserved for protocol messages when running as a child process.
+- Send diagnostics to stderr.
+- Ensure one reader owns each pipe.
+- Avoid blocking the process on an unread pipe.
+- Define startup handshake, task submission, task state, approval, cancellation, result, error, and shutdown semantics consistently.
+
+## 5. Task execution flow
+
+Target flow:
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant CLI as Go CLI
+    participant Sup as Go Supervisor
+    participant DB as SQLite
+    participant Py as Python Runtime
+    participant Graph as LangGraph
+    participant MCP as MCP Manager
+
+    User->>CLI: Submit task
+    CLI->>Sup: Task request
+    Sup->>DB: Create task (QUEUED)
+    Sup->>Py: Start runtime / send task
+    Py->>Graph: Initialize workflow
+    Graph->>DB: Persist state via supervisor protocol
+    Graph->>MCP: Discover and invoke authorized tool
+    MCP-->>Graph: Tool result
+    Graph->>Sup: State/result message
+    Sup->>DB: Persist lifecycle/checkpoint
+    Sup-->>CLI: Task ID / concise status
+    CLI-->>User: Accepted
+```
+
+The sequence is a design target. The full path must be exercised with real Go and Python processes before it can be described as verified.
+
+## 6. Task lifecycle
+
+Expected lifecycle:
 
 ```text
 QUEUED -> STARTING -> RUNNING -> SUCCEEDED
@@ -93,42 +212,91 @@ QUEUED -> STARTING -> RUNNING -> SUCCEEDED
                          |       CANCELLED
                          |       WAITING_APPROVAL
                          |              |
-                         +--------------+-> RUNNING
+                         +--------------+-> RUNNING (after approval)
 ```
 
-Every transition must be validated and durably persisted before being reported as committed.
+Rules:
+- Validate allowed state transitions.
+- Persist transitions before reporting them as durable.
+- Keep task IDs stable across process restarts.
+- Persist concise results and failure summaries.
+- Cancellation must propagate to active workflow/tool execution.
+- Pending approval must be tied to the exact action and survive restart.
 
-A task record should include a stable ID, timestamps, input reference, state, workflow/checkpoint reference, approval state, concise result/failure summary, log/artifact references and schema/runtime version metadata.
+## 7. Checkpointing and recovery
 
-## Recovery semantics
+Recovery is a safety-critical property.
 
-- On startup, the supervisor reconciles non-terminal tasks with runtime/checkpoint state.
-- Safely resumable work can be resumed or re-queued.
-- Work with uncertain external side effects must not be blindly replayed.
-- Record idempotency metadata when supported by a remote tool.
-- Do not claim exactly-once execution unless the underlying operation can guarantee it.
-- Make recovery decisions inspectable through task diagnostics.
+Required behavior:
+1. Persist workflow state at explicit boundaries.
+2. Associate checkpoint state with a stable task ID.
+3. On runtime restart, load the latest valid checkpoint from SQLite.
+4. Deliver the checkpoint to the new Python process through the protocol.
+5. Restore the workflow at a safe continuation point.
+6. Do not replay completed consequential operations unless the tool's idempotency semantics make replay safe.
+7. Preserve pending approval and require a decision for the same action.
+8. Record recovery decisions and ambiguous outcomes for diagnostics.
 
-## Go/Python boundary
+Do not claim exactly-once execution. External tools may perform a side effect even if CRANE loses the response. Use idempotency keys or operation records where supported; otherwise treat uncertain outcomes as requiring reconciliation.
 
-Use a versioned local protocol. Select a Windows-compatible IPC mechanism (such as named pipes) and use a narrowly bound loopback fallback only if necessary. Do not expose the runtime publicly by default.
+**Current verification status:** checkpoint message types, Python state serialization, and Go persistence code exist. A full separate-process test proving checkpoint writes, process termination, restoration, approval recovery, and replay prevention is still required. See [PROJECT_TRACKER.md](PROJECT_TRACKER.md).
 
-Initial message families: `SubmitTask`, `TaskAccepted`, `TaskEvent`, `ApprovalRequired`, `ApprovalDecision`, `TaskCompleted`, `TaskFailed`, `CancelTask` and `HealthCheck`.
+## 8. Security and policy boundary
 
-Validate messages at the boundary. Do not allow arbitrary executable commands through IPC.
+Tool descriptions and model output are untrusted data. They cannot grant permissions or constitute user approval.
 
-## Configuration and extensions
+Default policy:
+- Harmless read-only actions should not prompt unnecessarily.
+- Destructive, sensitive, privilege-changing, execution-capable, and externally consequential actions require explicit authorization by default.
+- Approval must bind to the exact action, target, and relevant arguments.
+- Any material action change requires new approval.
+- Denial prevents invocation.
+- Secrets and sensitive arguments must be redacted from logs and diagnostics.
 
-- Use a predictable per-user application-data directory, not the current working directory.
-- Validate config on load and return actionable errors.
-- Keep secrets separate from ordinary configuration.
-- Treat MCP servers as extensions. Core must not hardcode vendors such as GitHub, browsers, databases or Kubernetes.
-- Keep OS-specific behavior behind narrow adapters.
+See [SECURITY_AND_PRIVACY.md](SECURITY_AND_PRIVACY.md).
 
-## Observability
+## 9. Process and data layout
 
-- Write structured local logs with task/component correlation IDs.
-- Keep normal CLI output concise.
-- Offer explicit verbose/trace inspection.
-- Redact tokens, authorization headers, secrets and sensitive tool arguments.
-- Do not require a dashboard for observability.
+Proposed per-user data root on Windows:
+
+```text
+%LOCALAPPDATA%\\CRANE\\
+  config/
+  data/
+    crane.db
+  logs/
+  artifacts/
+  runtimes/
+  downloads/
+  backups/
+```
+
+Executable/runtime files must be separate from user data so updates and uninstall do not erase task history or configuration.
+
+## 10. Current repository map
+
+```text
+.
+├── cmd/agent/                 # Go CLI entry point
+├── supervisor/                # Go process/supervisor package
+├── persistence/               # SQLite persistence package
+├── python_protocol/           # Versioned protocol types and parsing
+├── crane/
+│   ├── python_runtime/        # Python runtime, workflow engine and state
+│   └── mcp_runtime/           # MCP manager and LangChain adapter
+└── *.md                       # Product, architecture and engineering docs
+```
+
+## 11. Known gaps before production use
+
+- Wire the actual Go supervisor into the CLI.
+- Correct and validate Go/Python package imports after repository restructuring.
+- Add a pinned Python dependency manifest and reproducible environment.
+- Prove protocol handshake and bidirectional messages with subprocess tests.
+- Prove durable restart recovery against the same SQLite database.
+- Validate MCP stdio and Streamable HTTP against real local test servers.
+- Verify approval, cancellation, timeout, and uncertain side-effect handling.
+- Implement explicit model-provider configuration and Ollama integration.
+- Complete Windows acceptance, packaging, signing, update, rollback, and uninstall.
+
+No production installer, official install URL, or Windows release is currently available.
