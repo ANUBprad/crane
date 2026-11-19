@@ -28,3 +28,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.swp
+
+# Local-only development instructions
+OPENCODE.md
