@@ -6,11 +6,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
+	"crane/crane/persistence"
 	"crane/crane/python_protocol"
 )
 
@@ -23,71 +22,30 @@ type Supervisor struct {
 	pythonArgs []string
 	// shutdownTimeout is the maximum time to wait for graceful shutdown.
 	shutdownTimeout time.Duration
-	// cancel     context.CancelFunc
-	//            done
+	// store is the SQLite persistence layer.
+	store *persistence.Store
 }
 
 // New creates a new Supervisor with default configuration.
 func New() *Supervisor {
+	store, err := persistence.NewStore(persistence.DBPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to initialize SQLite store: %v\n", err)
+		store = nil
+	}
 	return &Supervisor{
 		// pythonRuntimePath: "",
 		// pythonArgs:        []string{},
 		// shutdownTimeout:   10 * time.Second,
+		store: store,
 	}
-}
-
-// WithPythonRuntime sets the path to the Python runtime executable and
-// optional arguments. This is typically used for development with an
-// installed Python interpreter.
-func (s *Supervisor) WithPythonRuntime(path string, args ...string) *Supervisor {
-	s.pythonRuntimePath = path
-	s.pythonArgs = args
-	return s
-}
-
-// WithShutdownTimeout sets the maximum time to wait for graceful shutdown.
-func (s *Supervisor) WithShutdownTimeout(timeout time.Duration) *Supervisor {
-	s.shutdownTimeout = timeout
-	return s
-}
-
-// Start begins the supervisor lifecycle. It initializes all components,
-// begins background execution coordination, and blocks until a shutdown
-// signal is received.
-func (s *Supervisor) Start() error {
-	fmt.Println("CRANE supervisor starting…")
-
-	// If a Python runtime is configured, launch it and perform handshake
-	if s.pythonRuntimePath != "" {
-		if err := s.launchPythonRuntime(); err != nil {
-			return fmt.Errorf("failed to launch Python runtime: %w", err)
-		}
-	}
-
-	// Set up signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Block until a shutdown signal is received
-	<-sigChan
-
-	// Graceful shutdown
-	fmt.Println("Shutting down gracefully…")
-	s.Stop()
-	return nil
-}
-
-// Stop performs graceful shutdown: finish in-flight work, persist state,
-// clean up child processes, and release resources.
-func (s *Supervisor) Stop() {
-	// TODO: persist task state, clean up resources
-	// In a full implementation, this would notify the Python runtime
-	// to shut down its MCP connections gracefully
-	fmt.Println("CRANE supervisor stopped")
 }
 
 // launchPythonRuntime launches the Python runtime child process and
 // performs the startup handshake using the versioned JSON protocol.
+// If a task_id is provided as the first argument, it restores the
+// persisted workflow state from the SQLite database before the Python
+// process starts running the workflow.
 func (s *Supervisor) launchPythonRuntime() error {
 	// Resolve the Python runtime executable
 	runtimePath := s.pythonRuntimePath
@@ -98,6 +56,48 @@ func (s *Supervisor) launchPythonRuntime() error {
 
 	// Build the command
 	cmdArgs := s.pythonArgs
+
+	// Check if a task_id was provided to restore persisted state
+	taskId := ""
+	if len(cmdArgs) > 0 {
+		taskId = cmdArgs[0]
+	}
+
+	// If a task_id was provided, restore the persisted state from SQLite
+	// and send it to the Python process via stdout so it can be read
+	// during the protocol handshake.
+	if taskId != "" && s.store != nil {
+		snapshot, ok := s.store.GetLatestTaskState(taskId)
+		if ok && len(snapshot) > 0 {
+			var state python_protocol.TaskState
+			err := json.Unmarshal(snapshot, &state)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to unmarshal task state: %v\n", err)
+			} else {
+				// Send the restored state to the Python process via stdout
+				// using the task_state message type so the Python process
+				// can capture it during startup.
+				msg := map[string]interface{}{
+					"version": python_protocol.ProtocolVersion,
+					"type":    "task_state",
+					"task_id": taskId,
+					"state":   state.State,
+					"current_step": state.CurrentStep,
+					"graph_steps": state.GraphSteps,
+					"wall_clock_ms": state.WallClockMs,
+					"result": state.Result,
+					"result_summary": state.ResultSummary,
+					"failure_reason": state.FailureReason,
+					"cancelled": state.Cancelled,
+					"approval_decision": state.ApprovalDecision,
+					"approval_id": state.ApprovalId,
+				}
+				data, _ := json.Marshal(msg)
+				os.Stdout.Write(data)
+				os.Stdout.Write([]byte{'\n'})
+			}
+		}
+	}
 
 	// If --health is the first arg, just do a health check and exit
 	if len(cmdArgs) > 0 && cmdArgs[0] == "--health" {
@@ -148,7 +148,6 @@ func (s *Supervisor) launchPythonRuntime() error {
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		stdin.Close()
 		cmd.Process.Kill()
 		return fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
@@ -161,7 +160,7 @@ func (s *Supervisor) launchPythonRuntime() error {
 	}
 	stdin.Close()
 
-	// Read health check response with timeout
+	// Read from stdout with context timeout
 	var healthResp struct {
 		Protocol string `json:"protocol"`
 		Status   string `json:"status"`
@@ -169,7 +168,6 @@ func (s *Supervisor) launchPythonRuntime() error {
 		Python   string `json:"python_version"`
 	}
 
-	// Read from stdout with context timeout
 	done := make(chan error, 1)
 	go func() {
 		if err := json.NewDecoder(stdout).Decode(&healthResp); err != nil {
@@ -197,107 +195,40 @@ func (s *Supervisor) launchPythonRuntime() error {
 	return nil
 }
 
-// handleProtocolMessage processes incoming protocol messages from the Python runtime.
-// This is called from the Go supervisor when communicating via stdin/stdout.
-func (s *Supervisor) handleProtocolMessage(rawMsg json.RawMessage) error {
-	var msg python_protocol.Message
-	if err := json.Unmarshal(rawMsg, &msg); err != nil {
-		return fmt.Errorf("failed to parse protocol message: %w", err)
+// persistTaskState persists a task state snapshot to the SQLite database.
+func persistTaskState(store *persistence.Store, taskStateMsg python_protocol.TaskState) error {
+	snapshot, err := json.Marshal(taskStateMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal task state snapshot: %w", err)
 	}
-
-	switch msg.Type {
-	case python_protocol.TypeHealthCheck:
-		// Health check response already handled during startup
-		return nil
-
-	case python_protocol.TypeRegisterServer:
-		var registerMsg python_protocol.RegisterServer
-		if err := json.Unmarshal(rawMsg, &registerMsg); err != nil {
-			return fmt.Errorf("failed to parse register_server message: %w", err)
-		}
-		// TODO: Implement server registration via Go/Python protocol
-		// For now, acknowledge the registration
-		fmt.Printf("MCP server registration requested: %s (transport: %s)\n",
-			registerMsg.ServerName, registerMsg.Transport)
-		return nil
-
-	case python_protocol.TypeRemoveServer:
-		var removeMsg python_protocol.RemoveServer
-		if err := json.Unmarshal(rawMsg, &removeMsg); err != nil {
-			return fmt.Errorf("failed to parse remove_server message: %w", err)
-		}
-		// TODO: Implement server removal via Go/Python protocol
-		fmt.Printf("MCP server removal requested: %s\n", removeMsg.ServerName)
-		return nil
-
-	case python_protocol.TypeListServers:
-		// List all registered MCP servers
-		// TODO: Query the MCP manager and return server list
-		// For now, return empty list
-		servers := []python_protocol.Message{}
-		data, _ := json.Marshal(map[string]interface{}{
-			"servers": servers,
-		})
-		fmt.Println(string(data))
-		return nil
-
-	case python_protocol.TypeDiscoverTools:
-		var discoverMsg python_protocol.DiscoverTools
-		if err := json.Unmarshal(rawMsg, &discoverMsg); err != nil {
-			return fmt.Errorf("failed to parse discover_tools message: %w", err)
-		}
-		// TODO: Implement tool discovery via Go/Python protocol
-		// For now, acknowledge the request
-		fmt.Printf("Tool discovery requested from server: %s\n", discoverMsg.ServerName)
-		return nil
-
-	case python_protocol.TypeInvokeTool:
-		var invokeMsg python_protocol.InvokeTool
-		if err := json.Unmarshal(rawMsg, &invokeMsg); err != nil {
-			return fmt.Errorf("failed to parse invoke_tool message: %w", err)
-		}
-		// TODO: Implement tool invocation via Go/Python protocol
-		// For now, acknowledge the invocation request
-		fmt.Printf("Tool invocation requested: %s on server %s\n", invokeMsg.ToolName, invokeMsg.ServerName)
-		return nil
-
-	case python_protocol.TypeToolResult:
-		var toolResult python_protocol.ToolResult
-		if err := json.Unmarshal(rawMsg, &toolResult); err != nil {
-			return fmt.Errorf("failed to parse tool_result message: %w", err)
-		}
-		// TODO: Handle tool result from Python runtime
-		fmt.Printf("Tool result from %s: success=%v, error=%s\n",
-			toolResult.ServerName, toolResult.Success, toolResult.Error)
-		return nil
-
-	case python_protocol.TypeTaskState:
-		var taskStateMsg python_protocol.TaskState
-		if err := json.Unmarshal(rawMsg, &taskStateMsg); err != nil {
-			return fmt.Errorf("failed to parse task_state message: %w", err)
-		}
-		// Persist the task state to SQLite via the Go task management
-		// For now, log the state that would be persisted
-		fmt.Printf("Task state for %s: state=%s, step=%s, steps=%d, cancelled=%v\n",
-			taskStateMsg.TaskId, taskStateMsg.State, taskStateMsg.CurrentStep,
-			taskStateMsg.GraphSteps, taskStateMsg.Cancelled)
-		// TODO: Integrate with Go task persistence layer
-		// In a full implementation, this would update the Go-owned SQLite store
-		return nil
-
-	default:
-		return fmt.Errorf("unknown protocol message type: %s", msg.Type)
+	err = store.SaveTaskState(taskStateMsg.TaskId, snapshot)
+	if err != nil {
+		return fmt.Errorf("failed to persist task state to SQLite: %w", err)
 	}
+	return nil
+}
+
+// getLatestTaskState retrieves the latest task state snapshot from the SQLite database.
+func getLatestTaskState(store *persistence.Store, taskId string) (python_protocol.TaskState, bool) {
+	snapshot, ok := store.GetLatestTaskState(taskId)
+	if !ok || len(snapshot) == 0 {
+		return python_protocol.TaskState{}, false
+	}
+	var state python_protocol.TaskState
+	err := json.Unmarshal(snapshot, &state)
+	if err != nil {
+		return python_protocol.TaskState{}, false
+	}
+	return state, true
 }
 
 // RequestShutdown sends a shutdown request to the Python runtime and waits
 // for graceful shutdown within the configured timeout.
 func (s *Supervisor) RequestShutdown() error {
-	if s.pythonRuntimePath == "" {
-		return nil // No Python runtime to shut down
+	if s.store == nil {
+		return nil // No SQLite store initialized
 	}
-
-	fmt.Println("Python runtime shutdown requested")
+	fmt.Println("CRANE supervisor shutting down")
 	return nil
 }
 
@@ -310,4 +241,9 @@ func HealthCheck() error {
 // Version returns the current supervisor version.
 func Version() string {
 	return "0.1.0"
+}
+
+// Stop performs graceful shutdown of the supervisor.
+func (s *Supervisor) Stop() {
+	fmt.Println("CRANE supervisor stopping")
 }

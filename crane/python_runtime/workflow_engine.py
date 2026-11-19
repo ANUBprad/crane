@@ -147,7 +147,8 @@ async def _persist_task_state(task_id: str, workflow_state: WorkflowState) -> No
     (ParseAndValidate + dispatch in the Go supervisor). The Go supervisor
     persists the state and can resume the workflow after restart.
     """
-    # Construct the task state message as JSON
+    # Construct the task state message as JSON, including all fields
+    # needed for workflow restoration after Python runtime termination.
     msg = {
         "version": ProtocolVersion,
         "type": "task_state",
@@ -156,10 +157,20 @@ async def _persist_task_state(task_id: str, workflow_state: WorkflowState) -> No
         "current_step": workflow_state.current_step,
         "graph_steps": workflow_state.graph_steps,
         "wall_clock_ms": workflow_state.wall_clock_ms,
-        "result": None,
-        "result_summary": "",
-        "failure_reason": "",
+        "result": workflow_state.result,
+        "result_summary": workflow_state.result_summary,
+        "failure_reason": workflow_state.failure_reason,
         "cancelled": workflow_state.cancelled,
+        "approval_decision": workflow_state.approval_decision,
+        "approval_id": workflow_state.approval_id,
+        "selected_tool": workflow_state.selected_tool,
+        "tool_arguments": workflow_state.tool_arguments,
+        "tool_result": workflow_state.tool_result,
+        "tool_error": workflow_state.tool_error,
+        "tool_retry_count": workflow_state.tool_retry_count,
+        "failure_step": workflow_state.failure_step,
+        "persistent_state": workflow_state.persistent_state,
+        "last_tool_side_effect": workflow_state.last_tool_side_effect,
     }
 
     # Marshal to JSON and send to supervisor via stdout
@@ -172,9 +183,9 @@ async def _persist_task_state(task_id: str, workflow_state: WorkflowState) -> No
             sys.stdout.write(data + "\n")
             sys.stdout.flush()
         except Exception:
-            logger.info(f"Would persist task {task_id} state: state={workflow_state.state.value}, step={workflow_state.current_step}, checkpoint={workflow_state.checkpoint_identifier}")
+            logger.info(f"Would persist task {task_id} state: state={workflow_state.state.value}, step={workflow_state.current_step}")
     else:
-        logger.info(f"Would persist task {task_id} state: state={workflow_state.state.value}, step={workflow_state.current_step}, checkpoint={workflow_state.checkpoint_identifier}")
+        logger.info(f"Would persist task {task_id} state: state={workflow_state.state.value}, step={workflow_state.current_step}")
 
 
 async def _task_submitted(task_id: str, user_input: str, python_runtime_pid: Optional[int] = None) -> WorkflowState:
@@ -673,6 +684,18 @@ async def execute_task(
     if task_id is None:
         task_id = str(uuid.uuid4())
 
+    # If a task_id was provided, attempt to restore persisted workflow state
+    # from the Go-owned SQLite store (via the Go supervisor).
+    restored_state: Optional[WorkflowState] = None
+    if task_id is not None:
+        # Note: In a full implementation, the Go supervisor would have already
+        # sent the persisted state to the Python process during startup. 
+        # For now, we acknowledge the task_id and proceed with a new workflow,
+        # as the restoration mechanism requires Go supervisor integration.
+        logger.info(f"Task ID provided: {task_id} - proceeding with new workflow")
+        # TODO: When Go supervisor integration is complete, restore state here:
+        # restored_state = await _get_restored_state(task_id)
+
     # Initialize workflow state
     initial_state = WorkflowState(
         task_id=task_id,
@@ -787,15 +810,60 @@ async def execute_task(
         }
 
 
-async def _get_task_state(task_id: str) -> Optional[WorkflowState]:
-    """Retrieve task state from persistence.
-
-    In a full implementation, this would query the Go-owned SQLite database
-    through the protocol. For now, we return None as a placeholder.
+async def _get_task_state_from_store(task_id: str) -> Optional[WorkflowState]:
+    """Retrieve task state from the Go-owned SQLite store.
+    
+    This is called when a task_id is provided to execute_task, and it
+    queries the Go supervisor (which owns the SQLite store) for the
+    latest persisted state. In a full implementation with direct
+    database access, this would query SQLite directly.
+    
+    For now, this is a placeholder that will be implemented when
+    the Go supervisor sends persisted state to the Python process.
     """
-    # Placeholder - in production, query SQLite via Go protocol
-    logger.info(f"Would retrieve task state for {task_id} from SQLite")
+    # Placeholder - the Go supervisor will send persisted state
+    # to the Python process during startup. The Python process
+    # should capture this state and pass it to the workflow execution.
+    logger.info(f"Would retrieve task state for {task_id} from Go supervisor")
     return None
+
+
+async def _restore_workflow_state(raw_msg: dict) -> Optional[WorkflowState]:
+    """Restore a WorkflowState from a task_state protocol message.
+    
+    This is called when the Python process receives a task_state message
+    from the Go supervisor during startup (indicating persisted state
+    from a previous run).
+    """
+    try:
+        state = WorkflowState(
+            task_id=raw_msg.get("task_id", ""),
+            user_input="",  # Will be set by execute_task
+            state=TaskState(raw_msg.get("state", "queued")),
+            current_step=raw_msg.get("current_step", "initialization"),
+            graph_steps=raw_msg.get("graph_steps", 0),
+            wall_clock_ms=raw_msg.get("wall_clock_ms", 0),
+            result=raw_msg.get("result"),
+            result_summary=raw_msg.get("result_summary"),
+            failure_reason=raw_msg.get("failure_reason"),
+            cancelled=raw_msg.get("cancelled", False),
+            approval_decision=raw_msg.get("approval_decision"),
+            approval_id=raw_msg.get("approval_id"),
+            selected_tool=raw_msg.get("selected_tool"),
+            tool_arguments=raw_msg.get("tool_arguments", {}),
+            tool_result=raw_msg.get("tool_result"),
+            tool_error=raw_msg.get("tool_error"),
+            tool_retry_count=raw_msg.get("tool_retry_count", 0),
+            failure_step=raw_msg.get("failure_step"),
+            persistent_state=raw_msg.get("persistent_state", {}),
+            last_tool_side_effect=raw_msg.get("last_tool_side_effect"),
+            python_runtime_pid=None,
+            supervisor_version="0.1.0",
+        )
+        return state
+    except Exception as e:
+        logger.error(f"Failed to restore workflow state: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------

@@ -165,3 +165,22 @@ func (s *Store) SetMigrationVersion(version int) error {
 	_, err := s.db.Exec("INSERT OR REPLACE INTO schema_migrations (version, description, applied_at) VALUES (?, 'migration', datetime('now'))", version)
 	return err
 }
+
+// SaveTaskState saves a task state snapshot to the checkpoints table.
+func (s *Store) SaveTaskState(taskId string, snapshot []byte) error {
+	_, err := s.db.Exec(
+		"INSERT INTO checkpoints (task_id, version, timestamp, snapshot) VALUES (?, 1, datetime('now'), ?)",
+		taskId, string(snapshot),
+	)
+	return err
+}
+
+// GetLatestTaskState retrieves the latest task state snapshot from the checkpoints table.
+func (s *Store) GetLatestTaskState(taskId string) ([]byte, bool) {
+	var snapshot string
+	err := s.db.QueryRow("SELECT snapshot FROM checkpoints WHERE task_id = ? ORDER BY version DESC LIMIT 1", taskId).Scan(&snapshot)
+	if err != nil {
+		return nil, false
+	}
+	return []byte(snapshot), true
+}

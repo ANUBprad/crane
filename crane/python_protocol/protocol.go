@@ -123,6 +123,8 @@ type TaskState struct {
 	ResultSummary string `json:"result_summary,omitempty"`
 	FailureReason string `json:"failure_reason,omitempty"`
 	Cancelled    bool   `json:"cancelled"`
+	ApprovalDecision string `json:"approval_decision,omitempty"`
+	ApprovalId string `json:"approval_id,omitempty"`
 }
 
 // Unmarshal parses a raw JSON byte slice into a Message.
