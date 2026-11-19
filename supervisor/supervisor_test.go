@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"crane/crane/python_protocol"
+	"crane/python_protocol"
 )
 
 // TestNewSupervisor creates a new Supervisor and verifies it is non-nil.

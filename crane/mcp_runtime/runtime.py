@@ -7,7 +7,7 @@ import asyncio
 import logging
 from typing import Dict, List, Optional
 
-from crane.mcp_runtime._init_ import (
+from crane.mcp_runtime import (
     mcp_manager,
     MCPServer,
     TRANSPORT_STDIO,
