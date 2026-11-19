@@ -26,7 +26,7 @@ A component existing in source is not, by itself, proof that its full integratio
 - Risky, sensitive, privilege-changing, destructive, or externally consequential operations require policy authorization.
 - Windows is the first target; core logic should remain portable.
 
-## 3. Target component view
+## 2.1 Optional desktop client\n\nThe desktop workspace is a separate application under `apps/desktop`; it is not part of the execution core and is never required to run CRANE. The initial client uses Electron for the desktop lifecycle and React/TypeScript for presentation. It communicates only through a narrow preload bridge. It must not access SQLite directly, spawn arbitrary shell commands, or bypass Go-owned policy.\n\nThe current desktop shell is intentionally disconnected because the supervisor does not yet expose the required authenticated local API. It must display an explicit disconnected state rather than fabricate executions, health, MCP servers or approvals. When the API is implemented, it should be versioned, authenticated, loopback-only by default, and expose task submission, status/results, event streaming, cancellation and approval operations. Closing the desktop window must not stop supervisor-owned tasks.\n\n## 3. Target component view
 
 ```mermaid
 flowchart TB

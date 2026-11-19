@@ -90,9 +90,9 @@ Agent prototypes can demonstrate tool calling but leave operational concerns to 
 - **Usability:** concise output, actionable errors and no mandatory GUI.
 - **Portability:** keep OS-specific behavior behind narrow adapters.
 
-## Out of scope for v1
+## Optional desktop client\n\nA desktop workspace is an optional companion interface, not a prerequisite for the runtime. It may display executions, workflow events, MCP server state and approval requests through the Go supervisor local API. The CLI and headless runtime remain fully independent. The desktop client must not become a dashboard-first dependency or connect directly to the database.\n\n## Out of scope for v1
 
-- Dashboard, admin console or visual analytics.
+- Mandatory dashboard, admin console or visual analytics. (An optional desktop workspace is permitted.)
 - Hosted multi-tenant control plane.
 - Mandatory cloud LLM.
 - Mandatory Redis, PostgreSQL, Docker or Kubernetes for a single machine.

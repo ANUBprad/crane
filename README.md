@@ -135,7 +135,7 @@ The full task-oriented CLI contract is still under development. Do not treat pro
 | [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md) | Engineering and validation rules |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow |
 
-## Contributing
+## Optional desktop workspace\n\nAn optional Windows-first desktop client now lives in [`apps/desktop`](apps/desktop). It is an Electron + React application, kept separate from the Go/Python runtime so the CLI remains independently usable. The current commit provides the secure desktop shell and local-first interface; live task submission, status streaming, MCP management and approvals remain unavailable until the Go supervisor exposes the versioned authenticated loopback API. The client does not fabricate runtime state. See the [desktop README](apps/desktop/README.md) for setup and current limits.\n\n## Contributing
 
 Read [AGENTS.md](AGENTS.md), [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md), and the relevant architecture/product documents before changing code. Keep changes focused, validate the behavior actually changed, preserve user data, and never claim unrun tests or unverified platform support.
 

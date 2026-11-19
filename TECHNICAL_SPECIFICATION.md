@@ -74,7 +74,7 @@ Minimum logical records: tasks, task events, checkpoint references, MCP server c
 
 Store large artifacts in CRANE-managed files when appropriate. Validate managed paths against traversal and unintended external locations.
 
-## Local API and IPC
+## Desktop client boundary\n\nThe optional desktop application is located at `apps/desktop` and uses Electron + React/TypeScript. Keep Electron main-process privileges isolated from the renderer. Enable context isolation, sandboxing and web security; disable Node integration. Expose only narrowly scoped methods through the preload bridge. The renderer must not read SQLite, access arbitrary filesystem paths, or launch shell commands.\n\nThe desktop client is not permitted to invent runtime status. Until the Go supervisor implements the authenticated local API, the UI must remain visibly disconnected and disable operations that would mutate runtime state. Do not add a cloud relay or telemetry path.\n\n## Local API and IPC
 
 - Local API is for programmatic integration, not public remote access.
 - Bind to loopback or use local IPC by default.
