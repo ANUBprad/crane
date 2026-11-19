@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"crane/crane/persistence"
-	"crane/crane/python_protocol"
+	"crane/persistence"
+	"crane/python_protocol"
 )
 
 // Supervisor owns the CRANE runtime lifecycle: task admission, lifecycle
