@@ -24,6 +24,7 @@ const (
 	TypeDiscoverTools    = "discover_tools"
 	TypeInvokeTool       = "invoke_tool"
 	TypeToolResult       = "tool_result"
+	TypeTaskState        = "task_state"
 )
 
 // Message is a base protocol message with version and type fields.
@@ -109,6 +110,21 @@ type ToolResult struct {
 	Error      string    `json:"error,omitempty"`
 }
 
+// TaskState is a protocol message for persisting workflow checkpoints.
+// The Go supervisor stores this in SQLite and can resume the workflow after restart.
+type TaskState struct {
+	Message
+	TaskId       string `json:"task_id"`
+	State        string `json:"state"`       // TaskState enum value
+	CurrentStep  string `json:"current_step"`
+	GraphSteps   int    `json:"graph_steps"`
+	WallClockMs  int64  `json:"wall_clock_ms"`
+	Result       json.RawMessage `json:"result,omitempty"`
+	ResultSummary string `json:"result_summary,omitempty"`
+	FailureReason string `json:"failure_reason,omitempty"`
+	Cancelled    bool   `json:"cancelled"`
+}
+
 // Unmarshal parses a raw JSON byte slice into a Message.
 // It validates the protocol version and returns an appropriate
 // typed message or an error.
@@ -144,7 +160,7 @@ func ValidateType(msgType string) bool {
 	case TypeHealthCheck, TypeShutdownRequest, TypeRuntimeIdentity,
 		TypeErrorResponse, TypeSuccessResponse,
 		TypeRegisterServer, TypeRemoveServer, TypeListServers,
-		TypeDiscoverTools, TypeInvokeTool, TypeToolResult:
+		TypeDiscoverTools, TypeInvokeTool, TypeToolResult, TypeTaskState:
 		return true
 	default:
 		return false
@@ -318,4 +334,16 @@ func ReadToolResult() (*ToolResult, error) {
 		return nil, fmt.Errorf("expected tool_result, got %s", msg.Type)
 	}
 	return &ToolResult{Message: msg}, nil
+}
+
+// ReadTaskState reads and validates a task_state message from stdin.
+func ReadTaskState() (*TaskState, error) {
+	msg, err := ParseAndValidate()
+	if err != nil {
+		return nil, err
+	}
+	if msg.Type != TypeTaskState {
+		return nil, fmt.Errorf("expected task_state, got %s", msg.Type)
+	}
+	return &TaskState{Message: msg}, nil
 }

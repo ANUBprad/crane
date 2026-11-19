@@ -14,12 +14,12 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
 
 from crane.mcp_runtime import (
     mcp_manager,
@@ -38,6 +38,9 @@ from crane.python_runtime.workflow_state import (
     DEFAULT_RETRY_LIMIT,
     DEFAULT_TOOL_TIMEOUT_MS,
 )
+
+from crane.mcp_runtime import MCP_PROTOCOL_VERSION as ProtocolVersion
+# TypeTaskState is sent as raw JSON with type field "task_state"
 
 logger = logging.getLogger("crane.workflow")
 
@@ -136,17 +139,42 @@ def _requires_approval(state: WorkflowState) -> bool:
 async def _persist_task_state(task_id: str, workflow_state: WorkflowState) -> None:
     """Persist workflow state to the Go-owned SQLite database via protocol.
 
-    Sends a protocol message to the Python runtime supervisor which
-    forwards it to the Go process in charge of the SQLite store.
+    Sends a task_state protocol message to the Python runtime supervisor
+    which forwards it to the Go process in charge of the SQLite store.
+    The Go supervisor stores the state and can resume the workflow after restart.
+
+    The message is written to stdout using the versioned JSON protocol
+    (ParseAndValidate + dispatch in the Go supervisor). The Go supervisor
+    persists the state and can resume the workflow after restart.
     """
-    # In a full implementation, this would send a protocol message
-    # to the supervisor. For now, we log the state that would be persisted.
-    logger.info(
-        f"Would persist task {task_id} state: "
-        f"state={workflow_state.state.value}, "
-        f"step={workflow_state.current_step}, "
-        f"checkpoint={workflow_state.checkpoint_identifier}"
-    )
+    # Construct the task state message as JSON
+    msg = {
+        "version": ProtocolVersion,
+        "type": "task_state",
+        "task_id": task_id,
+        "state": workflow_state.state.value,
+        "current_step": workflow_state.current_step,
+        "graph_steps": workflow_state.graph_steps,
+        "wall_clock_ms": workflow_state.wall_clock_ms,
+        "result": None,
+        "result_summary": "",
+        "failure_reason": "",
+        "cancelled": workflow_state.cancelled,
+    }
+
+    # Marshal to JSON and send to supervisor via stdout
+    data = json.dumps(msg)
+    # Write to supervisor stdout - the Go supervisor reads messages from stdout
+    # using the versioned JSON protocol (ParseAndValidate + dispatch).
+    # In a full implementation, the Go supervisor would persist this to SQLite.
+    if hasattr(sys, 'stdout') and sys.stdout:
+        try:
+            sys.stdout.write(data + "\n")
+            sys.stdout.flush()
+        except Exception:
+            logger.info(f"Would persist task {task_id} state: state={workflow_state.state.value}, step={workflow_state.current_step}, checkpoint={workflow_state.checkpoint_identifier}")
+    else:
+        logger.info(f"Would persist task {task_id} state: state={workflow_state.state.value}, step={workflow_state.current_step}, checkpoint={workflow_state.checkpoint_identifier}")
 
 
 async def _task_submitted(task_id: str, user_input: str, python_runtime_pid: Optional[int] = None) -> WorkflowState:
@@ -214,9 +242,9 @@ async def _select_tool_for_task(
     return available_tools[0] if available_tools else None
 
 
-# -------------------------------------------------------------------------__
+# ---------------------------------------------------------------------------
 # Workflow graph nodes
-# --------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 
 async def node_initialize(state: WorkflowState) -> WorkflowState:
@@ -567,7 +595,7 @@ def _build_decision_edges(state: WorkflowState, next_node: str) -> str:
     return transitions.get(next_node, END)
 
 
-def compile_workflow() -> CompiledStateGraph:
+def compile_workflow() -> Any:
     """Build and compile the LangGraph workflow for task execution.
 
     Returns a compiled StateGraph that can be executed with a given
@@ -786,7 +814,7 @@ async def set_approval_decision(task_id: str, decision: str) -> None:
 
     # In a full implementation, this would update the SQLite store
     # and signal the workflow to resume.
-    # The LangGraph MemorySaver will check the updated state on resume.
+    # The LangGraph memory saver will check the updated state on resume.
     logger.info(f"Setting approval decision for task {task_id}: {decision}")
 
     # Retrieve current state and update

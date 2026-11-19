@@ -271,6 +271,20 @@ func (s *Supervisor) handleProtocolMessage(rawMsg json.RawMessage) error {
 			toolResult.ServerName, toolResult.Success, toolResult.Error)
 		return nil
 
+	case python_protocol.TypeTaskState:
+		var taskStateMsg python_protocol.TaskState
+		if err := json.Unmarshal(rawMsg, &taskStateMsg); err != nil {
+			return fmt.Errorf("failed to parse task_state message: %w", err)
+		}
+		// Persist the task state to SQLite via the Go task management
+		// For now, log the state that would be persisted
+		fmt.Printf("Task state for %s: state=%s, step=%s, steps=%d, cancelled=%v\n",
+			taskStateMsg.TaskId, taskStateMsg.State, taskStateMsg.CurrentStep,
+			taskStateMsg.GraphSteps, taskStateMsg.Cancelled)
+		// TODO: Integrate with Go task persistence layer
+		// In a full implementation, this would update the Go-owned SQLite store
+		return nil
+
 	default:
 		return fmt.Errorf("unknown protocol message type: %s", msg.Type)
 	}
