@@ -81,6 +81,8 @@ func (s *Supervisor) Start() error {
 // clean up child processes, and release resources.
 func (s *Supervisor) Stop() {
 	// TODO: persist task state, clean up resources
+	// In a full implementation, this would notify the Python runtime
+	// to shut down its MCP connections gracefully
 	fmt.Println("CRANE supervisor stopped")
 }
 
@@ -213,10 +215,10 @@ func (s *Supervisor) handleProtocolMessage(rawMsg json.RawMessage) error {
 		if err := json.Unmarshal(rawMsg, &registerMsg); err != nil {
 			return fmt.Errorf("failed to parse register_server message: %w", err)
 		}
-		logger := fmt.Sprintf("Registering MCP server: %s (transport: %s)", registerMsg.ServerName, registerMsg.Transport)
-		fmt.Println(logger)
 		// TODO: Implement server registration via Go/Python protocol
-		// For now, just acknowledge
+		// For now, acknowledge the registration
+		fmt.Printf("MCP server registration requested: %s (transport: %s)\n",
+			registerMsg.ServerName, registerMsg.Transport)
 		return nil
 
 	case python_protocol.TypeRemoveServer:
@@ -224,13 +226,15 @@ func (s *Supervisor) handleProtocolMessage(rawMsg json.RawMessage) error {
 		if err := json.Unmarshal(rawMsg, &removeMsg); err != nil {
 			return fmt.Errorf("failed to parse remove_server message: %w", err)
 		}
-		fmt.Printf("Removing MCP server: %s\n", removeMsg.ServerName)
-		// TODO: Implement server removal
+		// TODO: Implement server removal via Go/Python protocol
+		fmt.Printf("MCP server removal requested: %s\n", removeMsg.ServerName)
 		return nil
 
 	case python_protocol.TypeListServers:
 		// List all registered MCP servers
-		servers := python_manager_get_servers()
+		// TODO: Query the MCP manager and return server list
+		// For now, return empty list
+		servers := []python_protocol.Message{}
 		data, _ := json.Marshal(map[string]interface{}{
 			"servers": servers,
 		})
@@ -242,9 +246,9 @@ func (s *Supervisor) handleProtocolMessage(rawMsg json.RawMessage) error {
 		if err := json.Unmarshal(rawMsg, &discoverMsg); err != nil {
 			return fmt.Errorf("failed to parse discover_tools message: %w", err)
 		}
-		serverName := discoverMsg.ServerName
-		fmt.Printf("Discovering tools from server: %s\n", serverName)
-		// TODO: Implement tool discovery
+		// TODO: Implement tool discovery via Go/Python protocol
+		// For now, acknowledge the request
+		fmt.Printf("Tool discovery requested from server: %s\n", discoverMsg.ServerName)
 		return nil
 
 	case python_protocol.TypeInvokeTool:
@@ -252,8 +256,9 @@ func (s *Supervisor) handleProtocolMessage(rawMsg json.RawMessage) error {
 		if err := json.Unmarshal(rawMsg, &invokeMsg); err != nil {
 			return fmt.Errorf("failed to parse invoke_tool message: %w", err)
 		}
-		fmt.Printf("Invoking tool: %s on server: %s\n", invokeMsg.ToolName, invokeMsg.ServerName)
-		// TODO: Implement tool invocation
+		// TODO: Implement tool invocation via Go/Python protocol
+		// For now, acknowledge the invocation request
+		fmt.Printf("Tool invocation requested: %s on server %s\n", invokeMsg.ToolName, invokeMsg.ServerName)
 		return nil
 
 	case python_protocol.TypeToolResult:
@@ -261,20 +266,14 @@ func (s *Supervisor) handleProtocolMessage(rawMsg json.RawMessage) error {
 		if err := json.Unmarshal(rawMsg, &toolResult); err != nil {
 			return fmt.Errorf("failed to parse tool_result message: %w", err)
 		}
-		fmt.Printf("Tool result from %s: success=%v, error=%s\n", toolResult.ServerName, toolResult.Success, toolResult.Error)
-		// TODO: Handle tool result
+		// TODO: Handle tool result from Python runtime
+		fmt.Printf("Tool result from %s: success=%v, error=%s\n",
+			toolResult.ServerName, toolResult.Success, toolResult.Error)
 		return nil
 
 	default:
 		return fmt.Errorf("unknown protocol message type: %s", msg.Type)
 	}
-}
-
-// python_manager_get_servers is a placeholder for the Go supervisor's server list.
-// In the full implementation, this would interface with the MCP manager.
-func python_manager_get_servers() []map[string]interface{} {
-	// Return empty list for now; full implementation would query the MCP manager
-	return []map[string]interface{}{}
 }
 
 // RequestShutdown sends a shutdown request to the Python runtime and waits
