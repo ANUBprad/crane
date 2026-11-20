@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -27,9 +28,37 @@ func dataRoot() string {
 	return filepath.Join(home, ".crane")
 }
 
-// DBPath returns the default per-user CRANE database path.
+var migrateLegacyOnce sync.Once
+
+// DBPath returns the default per-user CRANE database path. Existing databases
+// created before the data/ layout was introduced are moved once, preserving
+// task history, approvals and MCP configuration across upgrades.
 func DBPath() string {
-	return filepath.Join(dataRoot(), "crane.db")
+	root := dataRoot()
+	target := filepath.Join(root, "data", "crane.db")
+	migrateLegacyOnce.Do(func() { migrateLegacyDatabase(root, target) })
+	return target
+}
+
+func migrateLegacyDatabase(root, target string) {
+	legacy := filepath.Join(root, "crane.db")
+	if _, err := os.Stat(target); err == nil {
+		return
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		return
+	}
+	if err := os.Rename(legacy, target); err != nil {
+		return
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(legacy + suffix); err == nil {
+			_ = os.Rename(legacy+suffix, target+suffix)
+		}
+	}
 }
 
 // ErrTaskNotFound is returned when a task ID has no persisted record.

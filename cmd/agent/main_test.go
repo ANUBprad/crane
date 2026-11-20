@@ -82,6 +82,49 @@ func TestRunAPITokenLifecycleAndTaskCreate(t *testing.T) {
 	}
 }
 
+func TestStatusAndResultReadPersistedTaskWithoutSupervisor(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("LOCALAPPDATA", root)
+
+	var out, errOut bytes.Buffer
+	if err := run([]string{"task", "create", "--id", "status-task", "--input", "private task body"}, &out, &errOut); err != nil {
+		t.Fatalf("task create error = %v", err)
+	}
+
+	out.Reset()
+	if err := run([]string{"status", "status-task"}, &out, &errOut); err != nil {
+		t.Fatalf("status error = %v; stderr = %q", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "Status: queued") {
+		t.Fatalf("unexpected status output: %q", out.String())
+	}
+	if strings.Contains(out.String(), "private task body") {
+		t.Fatal("status output exposed task input")
+	}
+
+	out.Reset()
+	errOut.Reset()
+	if err := run([]string{"result", "status-task"}, &out, &errOut); err == nil {
+		t.Fatal("result succeeded for a queued task")
+	}
+	if strings.Contains(out.String()+errOut.String(), "private task body") {
+		t.Fatal("result output exposed task input")
+	}
+}
+
+func TestLifecycleCommandsRejectUnsafeDataRemoval(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if err := run([]string{"uninstall", "--remove-data"}, &out, &errOut); err == nil {
+		t.Fatal("uninstall accepted --remove-data without confirmation")
+	}
+	if err := run([]string{"uninstall", "--remove-data", "--confirm", "wrong"}, &out, &errOut); err == nil {
+		t.Fatal("uninstall accepted an invalid confirmation token")
+	}
+	if err := run([]string{"run"}, &out, &errOut); err == nil {
+		t.Fatal("run accepted empty task text")
+	}
+}
+
 func TestDoctorReportsOllamaConfigurationWithoutTaskData(t *testing.T) {
 	if _, err := exec.LookPath("python"); err != nil {
 		t.Skip("python is not available on PATH")

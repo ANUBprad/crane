@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"crane/internal/runtimeenv"
 	"crane/mcpruntime"
 	"crane/persistence"
 	"crane/python_protocol"
@@ -213,11 +214,7 @@ func (s *Supervisor) RuntimeAvailable() (bool, string) {
 	}
 	candidates := []string{s.pythonRuntimePath}
 	if s.pythonRuntimePath == "" {
-		if configured := os.Getenv("CRANE_PYTHON"); configured != "" {
-			candidates = []string{configured}
-		} else {
-			candidates = []string{"python", "py"}
-		}
+		candidates = runtimeenv.PythonCandidates()
 	}
 	for _, runtimePath := range candidates {
 		if runtimePath == "" {
@@ -225,9 +222,7 @@ func (s *Supervisor) RuntimeAvailable() (bool, string) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), runtimeProbeTimeout)
 		cmd := exec.CommandContext(ctx, runtimePath, "-m", "crane.python_runtime", "--health")
-		if home := os.Getenv("CRANE_PYTHON_HOME"); home != "" {
-			cmd.Dir = home
-		}
+		runtimeenv.Configure(cmd)
 		output, err := cmd.Output()
 		cancel()
 		if err != nil {
@@ -416,9 +411,6 @@ func (s *Supervisor) executeTask(id, input string, checkpoint []byte, resume boo
 	}
 	stderr := &boundedBuffer{limit: 16 << 10}
 	cmd.Stderr = stderr
-	if home := os.Getenv("CRANE_PYTHON_HOME"); home != "" {
-		cmd.Dir = home
-	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = s.finalize(id, "failed", "", "unable to start Python runtime", nil)
@@ -539,17 +531,16 @@ func (s *Supervisor) mcpSubmissionContext() ([]python_protocol.MCPServerConfigMe
 func (s *Supervisor) pythonCommand(ctx context.Context) *exec.Cmd {
 	runtimePath := s.pythonRuntimePath
 	if runtimePath == "" {
-		if configured := os.Getenv("CRANE_PYTHON"); configured != "" {
-			runtimePath = configured
-		} else {
-			runtimePath = "python"
-		}
+		candidates := runtimeenv.PythonCandidates()
+		runtimePath = candidates[0]
 	}
 	args := append([]string{}, s.pythonArgs...)
 	if len(args) == 0 {
 		args = []string{"-m", "crane.python_runtime", "--protocol"}
 	}
-	return exec.CommandContext(ctx, runtimePath, args...)
+	cmd := exec.CommandContext(ctx, runtimePath, args...)
+	runtimeenv.Configure(cmd)
+	return cmd
 }
 
 func (s *Supervisor) handleProtocolFrame(id string, task *runningTask, frame []byte) bool {

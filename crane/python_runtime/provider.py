@@ -7,6 +7,7 @@ integration is the only supported provider boundary.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import ipaddress
 import json
 import math
@@ -517,6 +518,13 @@ def ollama_installed() -> bool:
     return shutil.which("ollama") is not None
 
 
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def collect_diagnostics(env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     """Return safe provider diagnostics without task data or credentials."""
     values = _environment(env)
@@ -563,11 +571,47 @@ def collect_diagnostics(env: Optional[Mapping[str, str]] = None) -> Dict[str, An
             "code": "provider_not_supported",
             "message": "CRANE_MODEL_PROVIDER must be local or ollama.",
         })
-    degraded = provider == "ollama" and bool(issues)
+    required_modules = {
+        "jsonschema",
+        "langchain_core",
+        "langchain_mcp_adapters",
+        "langchain_ollama",
+        "langgraph",
+        "mcp",
+        "ollama",
+    }
+    modules = {name: _module_available(name) for name in sorted(required_modules)}
+    for name, available in modules.items():
+        if not available:
+            issues.append({
+                "code": "python_module_missing",
+                "message": f"Required Python module {name!r} is not available in this runtime.",
+            })
+    sqlite_available = _module_available("sqlite3")
+    if not sqlite_available:
+        issues.append({
+            "code": "sqlite_module_missing",
+            "message": "The packaged Python runtime does not include the sqlite3 module.",
+        })
+    runtime = {
+        "available": all(modules.values()) and sqlite_available,
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "executable": sys.executable,
+        "sqlite_module": sqlite_available,
+        "modules": modules,
+    }
+    mcp_modules = {
+        "jsonschema": modules["jsonschema"],
+        "langchain_mcp_adapters": modules["langchain_mcp_adapters"],
+        "mcp": modules["mcp"],
+    }
+    degraded = bool(issues) or not runtime["available"]
     return {
         "protocol": "crane-agent/0.1.0",
         "status": "degraded" if degraded else "ok",
         "provider": provider,
+        "runtime": runtime,
+        "mcp": {"available": all(mcp_modules.values()), "modules": mcp_modules},
         "ollama": ollama,
         "issues": issues,
     }

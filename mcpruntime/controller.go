@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"crane/internal/runtimeenv"
 	"crane/persistence"
 	"crane/python_protocol"
 )
@@ -160,22 +161,16 @@ func (c *Controller) Start() error {
 
 	pythonPath := c.cfg.PythonPath
 	if pythonPath == "" {
-		pythonPath = os.Getenv("CRANE_PYTHON")
-	}
-	if pythonPath == "" {
-		pythonPath = "python"
+		pythonPath = runtimeenv.PythonCandidates()[0]
 	}
 	args := append([]string{}, c.cfg.PythonArgs...)
 	if len(args) == 0 {
 		args = []string{"-m", "crane.python_runtime", "--mcp-protocol"}
 	}
 	cmd := exec.CommandContext(c.ctx, pythonPath, args...)
-	home := c.cfg.PythonHome
-	if home == "" {
-		home = os.Getenv("CRANE_PYTHON_HOME")
-	}
-	if home != "" {
-		cmd.Dir = home
+	runtimeenv.Configure(cmd)
+	if c.cfg.PythonHome != "" {
+		cmd.Dir = c.cfg.PythonHome
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

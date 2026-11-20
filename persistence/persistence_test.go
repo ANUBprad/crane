@@ -2,8 +2,44 @@ package persistence
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 )
+
+func TestDBPathMigratesLegacyDatabaseOnce(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("LOCALAPPDATA", root)
+	migrateLegacyOnce = sync.Once{}
+	t.Cleanup(func() { migrateLegacyOnce = sync.Once{} })
+
+	legacy := filepath.Join(root, "CRANE", "crane.db")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte("legacy database"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy+"-wal", []byte("legacy wal"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	got := DBPath()
+	want := filepath.Join(root, "CRANE", "data", "crane.db")
+	if got != want {
+		t.Fatalf("DBPath() = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy database remained after migration: %v", err)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("migrated database is missing: %v", err)
+	}
+	if _, err := os.Stat(want + "-wal"); err != nil {
+		t.Fatalf("migrated WAL is missing: %v", err)
+	}
+}
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
