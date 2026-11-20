@@ -4,7 +4,8 @@ param(
     [string]$Action = 'Install',
     [string]$ReleaseSource = $env:CRANE_RELEASE_SOURCE,
     [string]$Version = '',
-    [string]$InstallRoot = $env:CRANE_INSTALL_ROOT
+    [string]$InstallRoot = $env:CRANE_INSTALL_ROOT,
+    [switch]$SkipPathUpdate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -435,23 +436,20 @@ function Assert-StagedPayload([object]$manifest, [string]$stagedDirectory) {
 
     $pythonExe = Join-Path $stagedDirectory 'runtime\python\python.exe'
     $appDirectory = Join-Path $stagedDirectory 'runtime\app'
-    $health = Invoke-CommandChecked -FilePath $pythonExe -Arguments @('-m', 'crane.python_runtime', '--health') -EnvironmentVariables @{
-        PYTHONPATH        = $appDirectory
-        CRANE_PYTHON      = $pythonExe
-        CRANE_PYTHON_HOME = $appDirectory
-    } -WorkingDirectory $appDirectory -TimeoutMs 60000
+    $isolatedEnvironment = @{
+        PYTHONPATH        = ''
+        CRANE_PYTHON      = ''
+        CRANE_PYTHON_HOME = ''
+    }
+    $health = Invoke-CommandChecked -FilePath $pythonExe -Arguments @('-m', 'crane.python_runtime', '--health') -EnvironmentVariables $isolatedEnvironment -WorkingDirectory $appDirectory -TimeoutMs 60000
     Assert-CommandSuccess $health 'packaged Python health check'
     try { $healthJson = $health.Stdout | ConvertFrom-Json } catch { throw 'Packaged Python returned invalid health JSON.' }
     if ((Get-Field $healthJson 'status') -ne 'healthy') { throw 'Packaged Python health check did not report healthy.' }
 
-    $importCode = 'import langchain_core, langgraph, langchain_mcp_adapters, langchain_ollama, ollama, mcp, jsonschema, sqlite3; print("ok")'
-    $imports = Invoke-CommandChecked -FilePath $pythonExe -Arguments @('-c', $importCode) -EnvironmentVariables @{
-        PYTHONPATH        = $appDirectory
-        CRANE_PYTHON      = $pythonExe
-        CRANE_PYTHON_HOME = $appDirectory
-    } -WorkingDirectory $appDirectory -TimeoutMs 120000
+    $importCode = 'import langchain_core, langgraph, langchain_mcp_adapters, langchain_ollama, ollama, mcp, jsonschema, sqlite3; print(1)'
+    $imports = Invoke-CommandChecked -FilePath $pythonExe -Arguments @('-c', $importCode) -EnvironmentVariables $isolatedEnvironment -WorkingDirectory $appDirectory -TimeoutMs 120000
     Assert-CommandSuccess $imports 'packaged Python import check'
-    if ($imports.Stdout.Trim() -ne 'ok') { throw 'Packaged Python dependency imports did not pass.' }
+    if ($imports.Stdout.Trim() -ne '1') { throw 'Packaged Python dependency imports did not pass.' }
 }
 
 function Resolve-Release([string]$source, [string]$localSource, [string]$workDirectory) {
@@ -579,7 +577,7 @@ function Invoke-Install {
         if ($active -eq $targetVersion) {
             if (-not (Test-VersionInstallation $root $targetVersion)) { throw "Active version $targetVersion is incomplete." }
             Write-LifecycleScripts $root $release.ArtifactPaths
-            Add-PathEntry (Join-Path $root 'bin')
+            if (-not $SkipPathUpdate) { Add-PathEntry (Join-Path $root 'bin') }
             Assert-InstallationHealth $root $targetVersion
             Write-Step "CRANE $targetVersion is already installed and healthy."
             return
@@ -596,7 +594,7 @@ function Invoke-Install {
             Remove-VersionPointer $root 'previous.txt'
             Assert-InstallationHealth $root $targetVersion
             Write-LifecycleScripts $root $release.ArtifactPaths
-            Add-PathEntry (Join-Path $root 'bin')
+            if (-not $SkipPathUpdate) { Add-PathEntry (Join-Path $root 'bin') }
         }
         catch {
             Stop-CraneProcesses $root
@@ -638,7 +636,7 @@ function Invoke-Update {
         if ($targetVersion -eq $active) {
             if (-not (Test-VersionInstallation $root $active)) { throw "Active version $active is incomplete." }
             Write-LifecycleScripts $root $release.ArtifactPaths
-            Add-PathEntry (Join-Path $root 'bin')
+            if (-not $SkipPathUpdate) { Add-PathEntry (Join-Path $root 'bin') }
             Assert-InstallationHealth $root $active
             Write-Step "CRANE $active is already installed and healthy."
             return
@@ -655,7 +653,7 @@ function Invoke-Update {
         $currentWasSwitched = $true
         Assert-InstallationHealth $root $targetVersion
         Write-LifecycleScripts $root $release.ArtifactPaths
-        Add-PathEntry (Join-Path $root 'bin')
+        if (-not $SkipPathUpdate) { Add-PathEntry (Join-Path $root 'bin') }
     }
     catch {
         if ($currentWasSwitched) {
@@ -692,7 +690,7 @@ function Invoke-Rollback {
         Assert-InstallationHealth $root $previous
         $agentCmd = Join-Path $root 'bin\agent.cmd'
         if (Test-Path -LiteralPath $agentCmd -PathType Leaf) { Write-Launcher $root }
-        Add-PathEntry (Join-Path $root 'bin')
+        if (-not $SkipPathUpdate) { Add-PathEntry (Join-Path $root 'bin') }
     }
     catch {
         if ($currentWasSwitched) {

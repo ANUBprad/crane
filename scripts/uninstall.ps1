@@ -3,6 +3,7 @@ param(
     [switch]$RemoveData,
     [string]$Confirm = '',
     [string]$InstallRoot = $env:CRANE_INSTALL_ROOT,
+    [switch]$SkipPathUpdate,
     [switch]$InternalCopy
 )
 
@@ -24,6 +25,7 @@ if (-not $InternalCopy -and -not [string]::IsNullOrWhiteSpace($PSCommandPath) -a
     if ($RemoveData) { $forward += '-RemoveData' }
     if (-not [string]::IsNullOrWhiteSpace($Confirm)) { $forward += @('-Confirm', $Confirm) }
     if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) { $forward += @('-InstallRoot', $InstallRoot) }
+    if ($SkipPathUpdate) { $forward += '-SkipPathUpdate' }
     try {
         & $copy @forward -InternalCopy
         $exitCode = $LASTEXITCODE
@@ -188,7 +190,7 @@ $pathEntries = @((Join-Path $root 'bin'))
 if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     $pathEntries += (Join-Path $env:LOCALAPPDATA 'Programs\CRANE\bin')
 }
-Remove-PathEntries $pathEntries
+if (-not $SkipPathUpdate) { Remove-PathEntries $pathEntries }
 
 if ($RemoveData) {
     if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {

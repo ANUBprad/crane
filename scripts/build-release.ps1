@@ -42,7 +42,12 @@ function Remove-Directory([string]$path) {
 
 Assert-IsWindowsX64
 $repoRoot = Get-RepoRoot
-$outputRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutputRoot))
+if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
+    $outputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
+}
+else {
+    $outputRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutputRoot))
+}
 $releaseDir = Join-Path $outputRoot $Version
 $stagingRoot = Join-Path $outputRoot 'staging'
 $stage = Join-Path $stagingRoot ("build-{0}-{1}" -f $Version, [guid]::NewGuid().ToString('N'))
@@ -56,7 +61,11 @@ if (-not $Commit) {
     if ($LASTEXITCODE -ne 0) { throw 'Could not read the git commit.' }
 }
 $buildDate = (& git -C $repoRoot show -s --format=%cI HEAD).Trim()
-if (-not $GoVersion) { $GoVersion = (& go version).Trim() }
+if (-not $GoVersion) {
+    $rawGoVersion = (& go version).Trim()
+    $GoVersion = ($rawGoVersion -split '\s+')[2]
+    if (-not $GoVersion) { throw 'Could not read the Go version.' }
+}
 if (-not $PythonEmbedZip) {
     $PythonEmbedZip = Join-Path $stagingRoot ("python-{0}-embed-amd64.zip" -f $PythonVersion)
     if (-not (Test-Path -LiteralPath $PythonEmbedZip)) {
@@ -85,7 +94,7 @@ Expand-Archive -LiteralPath $PythonEmbedZip -DestinationPath $pythonDir -Force
 New-Item -ItemType Directory -Path $sitePackages -Force | Out-Null
 $pyMajorMinor = ($PythonVersion -split '\.')[0] + ($PythonVersion -split '\.')[1]
 $pthPath = Join-Path $pythonDir "python$pyMajorMinor._pth"
-@("python$pyMajorMinor.zip", '.', 'Lib\site-packages', 'import site') | Set-Content -LiteralPath $pthPath -Encoding ASCII
+@("python$pyMajorMinor.zip", '.', '..\app', 'Lib\site-packages', 'import site') | Set-Content -LiteralPath $pthPath -Encoding ASCII
 
 Write-Step 'Installing pinned production Python dependencies'
 & python -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --require-hashes --target $sitePackages -r (Join-Path $repoRoot 'requirements.lock.txt')
@@ -120,17 +129,17 @@ $savedPythonPath = $env:PYTHONPATH
 $savedCranePython = $env:CRANE_PYTHON
 $savedCraneHome = $env:CRANE_PYTHON_HOME
 try {
-    $env:PYTHONPATH = (Join-Path $stage 'runtime\app')
-    $env:CRANE_PYTHON = $pythonExe
-    $env:CRANE_PYTHON_HOME = $env:PYTHONPATH
+    $env:PYTHONPATH = $null
+    $env:CRANE_PYTHON = $null
+    $env:CRANE_PYTHON_HOME = $null
     $healthText = & $pythonExe -m crane.python_runtime --health
     if ($LASTEXITCODE -ne 0) { throw 'Packaged Python health check failed.' }
     $health = $healthText | ConvertFrom-Json
     if ($health.status -ne 'healthy') { throw 'Packaged Python health response was not healthy.' }
 
-    $importCode = 'import langchain_core, langgraph, langchain_mcp_adapters, langchain_ollama, ollama, mcp, jsonschema, sqlite3; print("ok")'
+    $importCode = 'import langchain_core, langgraph, langchain_mcp_adapters, langchain_ollama, ollama, mcp, jsonschema, sqlite3; print(1)'
     $importResult = & $pythonExe -c $importCode
-    if ($LASTEXITCODE -ne 0 -or $importResult.Trim() -ne 'ok') { throw 'Packaged Python dependency import check failed.' }
+    if ($LASTEXITCODE -ne 0 -or $importResult.Trim() -ne '1') { throw 'Packaged Python dependency import check failed.' }
 
     $versionText = & (Join-Path $stage 'agent.exe') --version
     if ($LASTEXITCODE -ne 0 -or $versionText -notmatch [regex]::Escape($Version)) {
