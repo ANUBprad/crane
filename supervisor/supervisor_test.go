@@ -112,6 +112,61 @@ func TestSupervisorStop(t *testing.T) {
 	s.Stop() // should not panic
 }
 
+func TestMCPSubmissionContextAndToolResultPersistence(t *testing.T) {
+	store, err := persistence.NewStore(filepath.Join(t.TempDir(), "crane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	sup := NewWithStore(store)
+
+	server := persistence.MCPServerRecord{
+		ID: "demo", Name: "Demo", Transport: "stdio", Command: "python",
+		Args: []string{"server.py"}, Env: map[string]string{"CRANE_MCP_REGION": "private"},
+		Enabled: true, ConnectTimeoutSeconds: 5, InvocationTimeoutSeconds: 20,
+	}
+	if err := store.UpsertMCPServer(server); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := persistence.ApprovalFingerprint("demo", "delete_test_record", map[string]any{"id": "one"})
+	request := persistence.ApprovalRequestRecord{
+		ID: "approval-1", ServerID: "demo", ToolName: "delete_test_record",
+		Arguments: json.RawMessage(`{"id":"one"}`), Fingerprint: fingerprint,
+	}
+	if err := store.CreateApprovalRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DecideApprovalRequest("approval-1", "granted", "local-user"); err != nil {
+		t.Fatal(err)
+	}
+
+	servers, grants, err := sup.mcpSubmissionContext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers[0].Env["CRANE_MCP_REGION"] != "private" {
+		t.Fatalf("MCP submission context = %#v", servers)
+	}
+	if len(grants) != 1 || grants[0] != fingerprint {
+		t.Fatalf("approval grants = %#v", grants)
+	}
+
+	if _, err := store.CreateTask("mcp-task", "queued", "use a tool"); err != nil {
+		t.Fatal(err)
+	}
+	frame := []byte(`{"version":"0.1.0","type":"tool_result","task_id":"mcp-task","invocation_id":"inv-mcp-1","server_id":"demo","server_name":"Demo","tool_name":"get_test_echo","arguments":{"value":"token=abc123"},"result":{"text":"ok"},"policy_decision":"allowed","duration_ms":4,"status":"succeeded"}`)
+	if sup.handleProtocolFrame("mcp-task", &runningTask{id: "mcp-task", done: make(chan struct{})}, frame) {
+		t.Fatal("tool_result frame ended the task")
+	}
+	invocations, err := store.ListMCPInvocations(10)
+	if err != nil || len(invocations) != 1 {
+		t.Fatalf("ListMCPInvocations() = %#v, %v", invocations, err)
+	}
+	if strings.Contains(string(invocations[0].Arguments), "abc123") {
+		t.Fatalf("tool_result leaked a secret: %s", invocations[0].Arguments)
+	}
+}
+
 // TestVersion verifies the Version() function returns the expected version string.
 func TestVersion(t *testing.T) {
 	ver := Version()

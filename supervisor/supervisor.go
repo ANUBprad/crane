@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"crane/mcpruntime"
 	"crane/persistence"
 	"crane/python_protocol"
 )
@@ -435,13 +436,21 @@ func (s *Supervisor) executeTask(id, input string, checkpoint []byte, resume boo
 		s.activeMu.Unlock()
 	}()
 
+	servers, grants, err := s.mcpSubmissionContext()
+	if err != nil {
+		cancel()
+		_ = task.finish(s, "failed", "", "unable to load MCP execution context", nil)
+		return
+	}
 	submission := python_protocol.TaskSubmission{
-		Message:    python_protocol.Message{Version: python_protocol.ProtocolVersion, Type: python_protocol.TypeTaskSubmission},
-		TaskID:     id,
-		Input:      input,
-		Resume:     resume,
-		Checkpoint: checkpoint,
-		TimeoutMs:  taskExecutionTimeout.Milliseconds(),
+		Message:          python_protocol.Message{Version: python_protocol.ProtocolVersion, Type: python_protocol.TypeTaskSubmission},
+		TaskID:           id,
+		Input:            input,
+		Resume:           resume,
+		Checkpoint:       checkpoint,
+		TimeoutMs:        taskExecutionTimeout.Milliseconds(),
+		MCPServers:       servers,
+		GrantedApprovals: grants,
 	}
 	if err := task.send(submission); err != nil {
 		cancel()
@@ -488,6 +497,43 @@ func (s *Supervisor) executeTask(id, input string, checkpoint []byte, resume boo
 	}
 	_ = stdin.Close()
 	task.finish(s, "failed", `{"code":"runtime_exited"}`, "Python runtime exited before a terminal result", nil)
+}
+
+// mcpSubmissionContext supplies the task child with enabled server configs and
+// exact approval grants. Environment values travel only on this private
+// process boundary; they are never written to task events or API responses.
+func (s *Supervisor) mcpSubmissionContext() ([]python_protocol.MCPServerConfigMessage, []string, error) {
+	records, err := s.store.ListMCPServers()
+	if err != nil {
+		return nil, nil, err
+	}
+	servers := make([]python_protocol.MCPServerConfigMessage, 0, len(records))
+	for _, record := range records {
+		if !record.Enabled || len(servers) >= 32 {
+			continue
+		}
+		servers = append(servers, python_protocol.MCPServerConfigMessage{
+			ServerID:                 record.ID,
+			Name:                     record.Name,
+			Transport:                record.Transport,
+			Command:                  record.Command,
+			Args:                     append([]string{}, record.Args...),
+			Env:                      record.Env,
+			URL:                      record.URL,
+			Enabled:                  record.Enabled,
+			ConnectTimeoutSeconds:    record.ConnectTimeoutSeconds,
+			InvocationTimeoutSeconds: record.InvocationTimeoutSeconds,
+			AllowRemoteEndpoint:      record.AllowRemoteEndpoint,
+		})
+	}
+	grants, err := s.store.GrantedApprovalFingerprints()
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(grants) > 128 {
+		grants = grants[:128]
+	}
+	return servers, grants, nil
 }
 
 func (s *Supervisor) pythonCommand(ctx context.Context) *exec.Cmd {
@@ -537,6 +583,23 @@ func (s *Supervisor) handleProtocolFrame(id string, task *runningTask, frame []b
 		if state.State == "running" {
 			_, _ = s.store.TransitionTask(id, "running", "starting", "running")
 		}
+	case python_protocol.TypeToolResult:
+		result, err := python_protocol.DecodeToolResult(frame)
+		if err != nil {
+			s.emitEvent(id, "protocol_error", map[string]any{"code": "invalid_tool_result"})
+			return false
+		}
+		if err := mcpruntime.PersistToolResult(s.store, *result); err != nil {
+			s.emitEvent(id, "mcp_result_persistence_error", map[string]any{"code": "tool_result_not_saved"})
+			return false
+		}
+		s.emitEvent(id, "mcp_tool_result", map[string]any{
+			"invocation_id":   result.InvocationID,
+			"server_id":       result.ServerID,
+			"tool_name":       result.ToolName,
+			"status":          result.Status,
+			"policy_decision": result.PolicyDecision,
+		})
 	case python_protocol.TypeTaskEvent:
 		event, err := python_protocol.DecodeTaskEvent(frame)
 		if err != nil {
