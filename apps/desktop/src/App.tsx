@@ -35,7 +35,7 @@ function App() {
     <div className="app-shell" data-theme={theme}>
       <aside className={`sidebar ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
         <div className="brand">
-          <img className="brand-logo" src={theme === "dark" ? "/crane-mark-dark.webp" : "/crane-mark-light.webp"} alt="CRANE crane emblem" />
+          <img className="brand-logo" src={theme === "dark" ? "./crane-mark-dark.webp" : "./crane-mark-light.webp"} alt="CRANE crane emblem" />
           {sidebarOpen && <div className="brand-copy"><strong>CRANE</strong><small>EXECUTION RUNTIME</small></div>}
           <button className="icon-button sidebar-toggle" onClick={() => setSidebarOpen(!sidebarOpen)} aria-label="Toggle sidebar"><Menu size={17} /></button>
         </div>

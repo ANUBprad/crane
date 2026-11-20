@@ -1,8 +1,10 @@
-# CRANE
+<div align="center">
+  <img src="apps/desktop/public/crane-mark-dark.webp" alt="CRANE" width="360" />
+</div>
 
-**A headless, offline-first runtime for executing and orchestrating MCP-powered tasks.**
+<p align="center"><strong>CRANE</strong> is a headless, offline-first MCP execution and orchestration runtime for durable, multi-step tasks.</p>
 
-CRANE is designed to accept a task, coordinate authorized tools, run a bounded workflow, persist execution state, handle failures, and return a concise result. It is intended to be a local-first execution layer—not a chatbot, RAG product, or dashboard.
+CRANE accepts a task, coordinates authorized tools, runs a bounded workflow, persists execution state, handles failures, and returns a concise result. It is a local-first execution layer—not a chatbot, RAG product, or dashboard.
 
 > **Project status: early implementation / not production-ready.** The repository contains Go supervisor and persistence packages, a Python runtime, MCP integration code, and a LangGraph workflow engine. The command-line entry point and several cross-process flows are still incomplete. Durable recovery, approval enforcement, Windows behavior, and release packaging must not be considered production-verified yet.
 
@@ -42,6 +44,7 @@ This diagram describes the intended component boundaries. It does not imply that
 
 ```text
 .
+├── apps/desktop/           # Optional Electron + React workspace
 ├── cmd/agent/              # Go CLI entry point
 ├── supervisor/             # Go runtime/process coordination
 ├── persistence/            # SQLite store and task/checkpoint persistence
@@ -135,7 +138,13 @@ The full task-oriented CLI contract is still under development. Do not treat pro
 | [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md) | Engineering and validation rules |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow |
 
-## Optional desktop workspace\n\nAn optional Windows-first desktop client now lives in [`apps/desktop`](apps/desktop). It is an Electron + React application, kept separate from the Go/Python runtime so the CLI remains independently usable. The current commit provides the secure desktop shell and local-first interface; live task submission, status streaming, MCP management and approvals remain unavailable until the Go supervisor exposes the versioned authenticated loopback API. The client does not fabricate runtime state. See the [desktop README](apps/desktop/README.md) for setup and current limits.\n\n## Contributing
+## Optional desktop workspace
+
+The optional [desktop client](apps/desktop/README.md) is an Electron + React workspace for observing executions, MCP servers, approvals and settings. It stays separate from the Go/Python execution core, so the CLI remains fully usable without it.
+
+The current client is a deliberately disconnected shell with a dark-first theme and the CRANE mark in both dark and light themes. It reports an explicit disconnected runtime and shows no executions, MCP connections, health checks or pending approvals until the supervisor exposes its authenticated loopback API. No runtime state is fabricated.
+
+## Contributing
 
 Read [AGENTS.md](AGENTS.md), [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md), and the relevant architecture/product documents before changing code. Keep changes focused, validate the behavior actually changed, preserve user data, and never claim unrun tests or unverified platform support.
 

@@ -31,3 +31,7 @@ Thumbs.db
 
 # Local-only development instructions
 OPENCODE.md
+
+# Desktop build artifacts
+apps/desktop/node_modules/
+apps/desktop/dist/
