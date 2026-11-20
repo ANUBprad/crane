@@ -22,14 +22,18 @@ function Write-Warn([string]$message) {
 if (-not $InternalCopy -and -not [string]::IsNullOrWhiteSpace($PSCommandPath) -and (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)) {
     $copy = Join-Path ([IO.Path]::GetTempPath()) ("crane-uninstall-" + [guid]::NewGuid().ToString('N') + ".ps1")
     Copy-Item -LiteralPath $PSCommandPath -Destination $copy -Force
-    $forward = @()
-    if ($RemoveData) { $forward += '-RemoveData' }
-    if (-not [string]::IsNullOrWhiteSpace($Confirm)) { $forward += @('-Confirm', $Confirm) }
-    if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) { $forward += @('-InstallRoot', $InstallRoot) }
-    if ($SkipPathUpdate) { $forward += '-SkipPathUpdate' }
+    $forward = @{}
+    if ($RemoveData) { $forward['RemoveData'] = $true }
+    if (-not [string]::IsNullOrWhiteSpace($Confirm)) { $forward['Confirm'] = $Confirm }
+    if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) { $forward['InstallRoot'] = $InstallRoot }
+    if ($SkipPathUpdate) { $forward['SkipPathUpdate'] = $true }
+    $forward['InternalCopy'] = $true
     try {
-        & $copy @forward -InternalCopy
-        $exitCode = $LASTEXITCODE
+        & $copy @forward
+        $exitCode = 0
+        if (Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue) {
+            $exitCode = [int]$global:LASTEXITCODE
+        }
     }
     finally {
         Remove-Item -LiteralPath $copy -Force -ErrorAction SilentlyContinue
