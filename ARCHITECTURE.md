@@ -28,9 +28,9 @@ A component existing in source is not, by itself, proof that its full integratio
 
 ## 2.1 Optional desktop client
 
-The desktop workspace is a separate application under `apps/desktop`; it is not part of the execution core and is never required to run CRANE. The initial client uses Electron for the desktop lifecycle and React/TypeScript for presentation. It communicates only through a narrow preload bridge. It must not access SQLite directly, spawn arbitrary shell commands, or bypass Go-owned policy.
+The desktop workspace is a separate application under `apps/desktop`; it is not part of the execution core and is never required to run CRANE. The client uses Electron for the desktop lifecycle and React/TypeScript for presentation. It communicates only through a narrow preload bridge. It does not access SQLite directly, spawn arbitrary shell commands, or bypass Go-owned policy.
 
-The current desktop shell is intentionally disconnected because the supervisor does not yet expose the required authenticated local API. It must display an explicit disconnected state rather than fabricate executions, health, MCP servers or approvals. When the API is implemented, it should be versioned, authenticated, loopback-only by default, and expose task submission, status/results, event streaming, cancellation and approval operations. Closing the desktop window must not stop supervisor-owned tasks.
+The current client reads real `/v1/health`, `/v1/tasks` and `/v1/tasks/{id}` data. The Electron main process retrieves the protected installation token through the trusted `agent api-token` command, holds it in memory, and calls only `127.0.0.1:8787`. The preload exposes only `getAppInfo`, `getHealth`, `getTasks` and `getTask`; the renderer never receives the token or arbitrary HTTP, filesystem, or shell access. Disconnected, recovering and error states are reported explicitly; no health, tasks or status are fabricated. Task submission, event streaming, MCP servers and approvals remain unavailable because the backend API does not expose them. Closing the desktop window must not stop supervisor-owned tasks.
 
 ## 3. Target component view
 
@@ -61,7 +61,7 @@ flowchart TB
     GRAPH <--> PROTO
 ```
 
-The diagram is the intended logical architecture. In the current codebase, the CLI entry point is not yet fully wired to the separate supervisor package, and the full task execution/recovery path still requires behavioral integration testing.
+The diagram is the intended logical architecture. The CLI now starts the real supervisor and authenticated loopback API, but the full task execution/recovery path still requires behavioral integration testing.
 
 ## 4. Component responsibilities
 
@@ -75,9 +75,10 @@ Intended responsibilities:
 - Expose diagnostics without requiring a graphical interface.
 
 Current implementation:
-- A Go entry point exists.
-- The development version flag is present.
-- The current `main.go` still contains placeholder supervisor lifecycle code; task-oriented commands are not yet a complete CLI.
+- Default invocation and `serve` start the supervisor and fixed loopback API.
+- `api-token` provides trusted retrieval, rotation and permanent revocation of the protected installation token.
+- `task create --id ... --input ...` persists a queued task record; raw input is not returned by the API.
+- The full task status/result/cancellation command set is still planned.
 
 ### 4.2 Go supervisor — `supervisor`
 
@@ -90,9 +91,9 @@ Intended responsibilities:
 - Keep execution independent of the submitting terminal.
 
 Current implementation:
-- A supervisor package and Python process-launch/protocol handling code exist.
-- The package is not yet fully integrated into the CLI entry point.
-- Process restart recovery must be demonstrated through a real multi-process test before being considered verified.
+- `Start`, `IsRunning`, `HealthCheck`, `RuntimeAvailable`, `Stop` and `Close` are wired into the CLI and API health checks.
+- `RuntimeAvailable` runs a real bounded `python -m crane.python_runtime --health` probe; `CRANE_PYTHON` and `CRANE_PYTHON_HOME` can select the Python executable and working directory.
+- Process restart recovery and full task/process lifecycle behavior must still be demonstrated through real multi-process tests.
 
 ### 4.3 Python agent runtime — `crane/python_runtime`
 
@@ -163,7 +164,7 @@ SQLite is the default single-machine persistence layer. It is intended to store:
 - Approval records.
 - Migration metadata.
 
-The current Go persistence package includes database initialization and task/checkpoint-related storage methods. Correct transaction semantics, checkpoint round-tripping, restart restoration, and concurrent access must be covered by behavioral tests.
+The current Go persistence package includes database initialization, task/checkpoint storage methods, task ID validation, and API-safe `TaskRecord` list/detail reads that omit raw task input. Correct transaction semantics, checkpoint round-tripping, restart restoration, and concurrent access must still be covered by behavioral tests.
 
 ### 4.8 Versioned protocol — `python_protocol`
 
@@ -177,6 +178,14 @@ Protocol requirements:
 - Ensure one reader owns each pipe.
 - Avoid blocking the process on an unread pipe.
 - Define startup handshake, task submission, task state, approval, cancellation, result, error, and shutdown semantics consistently.
+
+### 4.9 Local authentication — `localauth`
+
+On Windows, a 256-bit random installation token is protected with DPAPI (`CryptProtectData`/`CryptUnprotectData`) and application entropy. The default state file is `%LOCALAPPDATA%\CRANE\auth\token.json`, with a `~/.crane/auth/token.json` fallback. Retrieval is idempotent; rotation permanently records the old token hash as revoked before installing the replacement; revocation leaves no active token. Corrupt or inaccessible state is never silently replaced. Verification uses constant-time comparison and rejects revoked hashes even after rotation.
+
+### 4.10 Local API — `localapi`
+
+The Go-owned API binds only to `127.0.0.1:8787`; there is no host configuration and no all-interface mode. It reloads protected token state on every request, so CLI rotation or revocation affects a running server immediately. Versioned `/v1` endpoints currently provide health and read-only persisted task data. Requests are GET-only with a 1 MiB request bound, strict path/query/body validation, consistent `{"data":...}` / `{"error":...}` JSON envelopes, and `nosniff` responses. Health reports supervisor state, Python runtime probe result, persistence health and overall readiness separately.
 
 ## 5. Task execution flow
 
@@ -263,28 +272,26 @@ See [SECURITY_AND_PRIVACY.md](SECURITY_AND_PRIVACY.md).
 
 ## 9. Process and data layout
 
-Proposed per-user data root on Windows:
+Current per-user data root on Windows:
 
 ```text
 %LOCALAPPDATA%\\CRANE\\
-  config/
-  data/
-    crane.db
-  logs/
-  artifacts/
-  runtimes/
-  downloads/
-  backups/
+  auth\\
+    token.json       # DPAPI-protected blob and revoked token hashes
+  crane.db           # SQLite task state
 ```
 
-Executable/runtime files must be separate from user data so updates and uninstall do not erase task history or configuration.
+On non-Windows hosts the fallback root is `~/.crane/`. The broader `config/`, `logs/`, `artifacts/`, `runtimes/`, `downloads/` and `backups/` layout remains proposed. Executable/runtime files must be separate from user data so updates and uninstall do not erase task history or configuration.
 
 ## 10. Current repository map
 
 ```text
 .
+├── apps/desktop/              # Optional Electron + React workspace
 ├── cmd/agent/                 # Go CLI entry point
 ├── supervisor/                # Go process/supervisor package
+├── localapi/                  # Authenticated loopback API
+├── localauth/                 # DPAPI-protected installation token lifecycle
 ├── persistence/               # SQLite persistence package
 ├── python_protocol/           # Versioned protocol types and parsing
 ├── crane/
@@ -295,7 +302,7 @@ Executable/runtime files must be separate from user data so updates and uninstal
 
 ## 11. Known gaps before production use
 
-- Wire the actual Go supervisor into the CLI.
+- Connect persisted tasks to real Python/LangGraph execution through the Go/Python protocol.
 - Correct and validate Go/Python package imports after repository restructuring.
 - Add a pinned Python dependency manifest and reproducible environment.
 - Prove protocol handshake and bidirectional messages with subprocess tests.

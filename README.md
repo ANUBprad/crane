@@ -6,7 +6,7 @@
 
 CRANE accepts a task, coordinates authorized tools, runs a bounded workflow, persists execution state, handles failures, and returns a concise result. It is a local-first execution layer—not a chatbot, RAG product, or dashboard.
 
-> **Project status: early implementation / not production-ready.** The repository contains Go supervisor and persistence packages, a Python runtime, MCP integration code, and a LangGraph workflow engine. The command-line entry point and several cross-process flows are still incomplete. Durable recovery, approval enforcement, Windows behavior, and release packaging must not be considered production-verified yet.
+> **Project status: early implementation / not production-ready.** The Go CLI can run a supervisor with a fixed loopback API, DPAPI-protected per-installation authentication, real SQLite task reads, and a Python runtime health probe. The optional desktop client reads that real health/task data through a restricted main-process bridge. Durable recovery, full task execution, approval enforcement, MCP lifecycle behavior, Windows packaging, and release readiness remain unverified.
 
 ## What CRANE is being built to do
 
@@ -47,6 +47,8 @@ This diagram describes the intended component boundaries. It does not imply that
 ├── apps/desktop/           # Optional Electron + React workspace
 ├── cmd/agent/              # Go CLI entry point
 ├── supervisor/             # Go runtime/process coordination
+├── localapi/               # Authenticated loopback API
+├── localauth/              # DPAPI-protected installation token lifecycle
 ├── persistence/            # SQLite store and task/checkpoint persistence
 ├── python_protocol/        # Versioned Go/Python message definitions
 ├── crane/
@@ -65,11 +67,14 @@ This diagram describes the intended component boundaries. It does not imply that
 
 | Component | Present in repository | Current confidence |
 |---|---:|---|
-| Go CLI entry point | Yes | Basic version flag; supervisor wiring is incomplete |
-| Go supervisor | Yes | Implementation exists; process lifecycle needs end-to-end validation |
-| SQLite persistence | Yes | Store and checkpoint methods exist; restart recovery is not yet proven end to end |
+| Go CLI entry point | Yes | Runs `serve` by default; supports version, token lifecycle and `task create`; full task command set is planned |
+| Go supervisor | Yes | Start/health/state and Python health probe are wired into the CLI; full task/process lifecycle is unverified |
+| Local authentication | Yes | 256-bit token protected by Windows DPAPI; rotation/revocation tested on Windows |
+| Loopback API | Yes | Authenticated `127.0.0.1:8787`; real health/task reads; no mutation or streaming endpoints |
+| Optional desktop client | Yes | Reads real health/tasks through restricted main-process IPC; MCP/approvals remain unavailable |
+| SQLite persistence | Yes | API-safe task records/list/detail are tested; durable workflow recovery is unproven |
 | Go/Python protocol | Yes | Versioned message structures exist; full protocol behavior needs integration tests |
-| Python runtime | Yes | Runtime modules exist; packaged runtime is not available |
+| Python runtime | Yes | Health probe is implemented; packaged runtime is not available |
 | MCP integration | Yes | Manager, transports, discovery and adapter code exist; live-server behavior needs validation |
 | LangChain adapter | Yes | Present in MCP runtime code; provider configuration is incomplete |
 | LangGraph workflow | Yes | Workflow engine and typed state exist; full execution/recovery guarantees are unverified |
@@ -81,9 +86,9 @@ Do not interpret source presence or a passing unit test as proof of a complete p
 
 ## Current development state
 
-The project has established its initial Go/Python architecture and implementation modules. The next engineering work should prioritize correctness at the boundaries:
+The project has an implemented supervisor/API/desktop read path. The next engineering work should prioritize correctness at the remaining execution boundaries:
 
-1. Wire the CLI to the real supervisor rather than placeholder lifecycle code.
+1. Connect persisted tasks to real LangGraph execution through the Go/Python protocol.
 2. Validate the Go/Python protocol in a real subprocess.
 3. Prove SQLite checkpoint persistence and process-restart restoration with a behavioral integration test.
 4. Validate MCP connections and tool invocation against local test servers.
@@ -106,11 +111,18 @@ go test ./...
 
 These are validation commands, not a claim that the current repository passes them. Run them on the current checkout and report their actual results. Python dependencies are not yet documented in a committed lock/requirements file, so a reproducible Python installation workflow is still outstanding.
 
-The current executable supports a development version query:
+The current executable supports these development commands:
 
 ```powershell
 go run ./cmd/agent --version
+go run ./cmd/agent serve
+go run ./cmd/agent api-token
+go run ./cmd/agent api-token --rotate
+go run ./cmd/agent api-token --revoke
+go run ./cmd/agent task create --id example --input "private task input"
 ```
+
+`serve` starts the supervisor and authenticated loopback API on `127.0.0.1:8787`. `api-token` is a trusted integration boundary: it prints the installation token to stdout only; the token is never passed in an argument, URL, browser storage or renderer API. `api-token --rotate` prints a replacement and permanently revokes the previous token; `api-token --revoke` leaves no active token and writes its status to stderr. Rotation/revocation takes effect in an already-running server because protected state is reloaded on each request.
 
 The full task-oriented CLI contract is still under development. Do not treat proposed commands in the technical specification as implemented commands.
 
@@ -140,9 +152,9 @@ The full task-oriented CLI contract is still under development. Do not treat pro
 
 ## Optional desktop workspace
 
-The optional [desktop client](apps/desktop/README.md) is an Electron + React workspace for observing executions, MCP servers, approvals and settings. It stays separate from the Go/Python execution core, so the CLI remains fully usable without it.
+The optional [desktop client](apps/desktop/README.md) is an Electron + React workspace for observing executions and local runtime health. It stays separate from the Go/Python execution core, so the CLI remains fully usable without it.
 
-The current client is a deliberately disconnected shell with a dark-first theme and the CRANE mark in both dark and light themes. It reports an explicit disconnected runtime and shows no executions, MCP connections, health checks or pending approvals until the supervisor exposes its authenticated loopback API. No runtime state is fabricated.
+The current client reads real health, persisted tasks and task details from the authenticated loopback API. The Electron main process owns token retrieval and API access; the renderer receives only narrow health/task data through the preload bridge. MCP servers, approvals and task submission remain explicitly unavailable because the backend API does not expose them. The client keeps its dark-first theme and the CRANE mark in both dark and light themes, and it never fabricates runtime state.
 
 ## Contributing
 

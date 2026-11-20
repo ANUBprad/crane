@@ -7,6 +7,8 @@ CRANE can invoke tools that modify files, execute commands, access services or a
 ## Trust boundaries
 
 - User/CLI/API input
+- Electron renderer and preload bridge
+- Electron main-process runtime client
 - Go supervisor
 - Python agent runtime
 - LLM provider (local or hosted)
@@ -46,9 +48,12 @@ Destructive, sensitive, privilege-changing and externally consequential actions 
 - Redact sensitive values from errors, traces and diagnostics.
 - Omit secrets from config export by default.
 
+The local API token is 256-bit random. On Windows it is protected with DPAPI and application entropy in `%LOCALAPPDATA%\CRANE\auth\token.json` (or `~/.crane/auth/token.json` off Windows). The trusted `agent api-token` command prints it only on stdout for local integrations; it is never passed as an argument, placed in a URL or browser storage, or exposed through the desktop renderer. API verification is constant time, revoked token hashes are retained permanently, and protected state is reloaded on every request so rotation or revocation takes effect immediately.
+
 ## Network and data egress
 
-- Local API binds to loopback/local IPC by default.
+- The Go local API binds only to `127.0.0.1:8787`; host configuration and all-interface binding are rejected.
+- Every API request requires bearer-token authentication; unauthenticated requests receive a uniform `unauthorized` error.
 - Remote MCP endpoints and hosted LLMs must be explicitly configured.
 - No automatic cloud fallback from local inference.
 - Enforce explicit provider/data policy before hosted inference.
@@ -63,6 +68,8 @@ Destructive, sensitive, privilege-changing and externally consequential actions 
 - Restrict CRANE-managed paths; defend against path traversal and reparse-point surprises.
 - Clean up CRANE-owned children without killing unrelated processes.
 - Apply resource limits where feasible.
+- The desktop renderer has no token, arbitrary HTTP, filesystem, SQLite or shell capability; its preload bridge exposes only health, app-info and read-only task methods.
+- The Electron main process validates task IDs and response shapes before returning data to the renderer.
 
 ## Supply chain and updates
 
@@ -93,3 +100,5 @@ Destructive, sensitive, privilege-changing and externally consequential actions 
 - Path traversal and unsafe executable configuration are rejected.
 - Tampered installer artifacts are rejected.
 - Local-only mode makes no hosted provider requests.
+
+Automated Windows checks cover token lifecycle behavior, constant-time verification inputs, loopback address validation, unauthenticated API rejection, immediate rotation/revocation, request validation, API-safe task reads, and component-specific health reporting.

@@ -23,6 +23,8 @@ Use maintained SDKs/adapters where practical, including the Python MCP SDK and L
 - Runtime ownership, health checks, shutdown and stale-process handling must be explicit.
 - Prefer per-user operation without administrator privileges.
 
+Implemented development behavior: `agent` and `agent serve` start the supervisor and the fixed `127.0.0.1:8787` API. Health uses a bounded `python -m crane.python_runtime --health` probe, with `CRANE_PYTHON` and `CRANE_PYTHON_HOME` overrides for development. Packaged Python remains a target, not a current deliverable.
+
 ## MCP behavior
 
 Initial transports:
@@ -76,20 +78,45 @@ Store large artifacts in CRANE-managed files when appropriate. Validate managed 
 
 ## Desktop client boundary
 
-The optional desktop application is located at `apps/desktop` and uses Electron + React/TypeScript. Keep Electron main-process privileges isolated from the renderer. Enable context isolation, sandboxing and web security; disable Node integration. Expose only narrowly scoped methods through the preload bridge. The renderer must not read SQLite, access arbitrary filesystem paths, or launch shell commands.
+The optional desktop application is located at `apps/desktop` and uses Electron + React/TypeScript. Electron main-process privileges are isolated from the renderer. Context isolation, sandboxing and web security are enabled; Node integration is disabled. The preload bridge exposes only `getAppInfo`, `getHealth`, `getTasks` and `getTask`. The renderer cannot read SQLite, access arbitrary filesystem paths, launch shell commands, receive the installation token, or issue arbitrary HTTP requests.
 
-The desktop client is not permitted to invent runtime status. Until the Go supervisor implements the authenticated local API, the UI must remain visibly disconnected and disable operations that would mutate runtime state. Do not add a cloud relay or telemetry path.
+The main process reads the protected token through the trusted `agent api-token` command, caches it in memory, retries once with a fresh token after `401`, and calls only the fixed loopback API. The desktop client reports real health, persisted tasks, task details, and explicit disconnected/recovering/error states; it never invents runtime status. Task submission, streaming, MCP servers and approvals remain disabled because the backend API does not expose them. Do not add a cloud relay or telemetry path.
 
 ## Local API and IPC
 
-- Local API is for programmatic integration, not public remote access.
-- Bind to loopback or use local IPC by default.
-- Require local authentication for API access.
-- Validate request schemas, sizes and caller permissions.
-- Version the API and test compatibility.
-- Do not treat CORS as access control.
+Implemented v1 behavior:
 
-## CLI contract (proposed)
+- The API binds only to `127.0.0.1:8787`. Host configuration and all-interface binding are rejected.
+- Requests require an `Authorization: Bearer <token>` header. The 256-bit token is stored on Windows with DPAPI and verified in constant time.
+- Protected token state is reloaded on every request, so CLI rotation or revocation affects a running server immediately.
+- Only `GET` is accepted. Query strings, unexpected request bodies, transfer-encoded bodies, malformed task IDs and bodies over 1 MiB are rejected.
+- Responses are JSON with `Content-Type: application/json` and `X-Content-Type-Options: nosniff`. Success uses `{"data":...}`; errors use `{"error":{"code":"...","message":"..."}}`.
+- Error codes include `unauthorized`, `bad_request`, `method_not_allowed`, `not_found`, `request_too_large` and `persistence_unavailable`.
+- Shutdown is bounded and clean. HTTP liveness alone never reports readiness.
+
+Implemented endpoints:
+
+| Method | Path | Result |
+|---|---|---|
+| `GET` | `/v1/health` | API version, supervisor state, separate Python runtime probe, persistence health and overall readiness |
+| `GET` | `/v1/tasks` | Real persisted task records and count |
+| `GET` | `/v1/tasks/{id}` | One real persisted task record |
+
+Raw task input is deliberately omitted from task responses. Task submission, cancellation, event streaming, MCP management and approval operations are not implemented. Do not treat CORS as access control.
+
+## CLI contract (implemented and proposed)
+
+Implemented development commands:
+
+```text
+agent
+agent serve
+agent --version
+agent api-token [--rotate | --revoke]
+agent task create --id <id> --input <text>
+```
+
+The original proposed contract below remains planned:
 
 ```text
 agent
@@ -104,23 +131,20 @@ agent update
 agent uninstall
 ```
 
-Command names/flags are provisional until implemented.
+These proposed command names/flags remain provisional.
 
 ## Configuration layout (proposed)
 
+Current local paths:
+
 ```text
 %LOCALAPPDATA%\\CRANE\\
-  config/
-  data/
-    crane.db
-  logs/
-  artifacts/
-  runtimes/
-  downloads/
-  backups/
+  auth\\
+    token.json       # DPAPI-protected token blob and revoked token hashes
+  crane.db           # SQLite task state
 ```
 
-Keep executable/runtime files separate from user data. Use Windows-protected secret storage or an appropriate OS secret store; never store raw secrets in ordinary config files.
+The broader `config/`, `logs/`, `artifacts/`, `runtimes/`, `downloads/` and `backups/` layout remains proposed. Keep executable/runtime files separate from user data. The installation token uses Windows DPAPI; never store raw secrets in ordinary config files.
 
 ## Error model
 
