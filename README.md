@@ -6,7 +6,7 @@
 
 CRANE accepts a task, coordinates authorized tools, runs a bounded workflow, persists execution state, handles failures, and returns a concise result. It is a local-first execution layer—not a chatbot, RAG product, or dashboard.
 
-> **Project status: working vertical slice, not production-ready.** The Go supervisor durably admits tasks, runs bounded Python/LangGraph workflows, confirms cancellation, persists lifecycle/events/checkpoints/results, and streams real events over authenticated SSE. The optional desktop client submits and cancels tasks through the same restricted main-process bridge. Default execution is offline deterministic local mode; Ollama is explicit and only its unavailable-provider failure path was validated in this checkout. MCP server lifecycle, approval enforcement, packaged Python, signed packaging, and release readiness remain unverified.
+> **Project status: working vertical slice, not production-ready.** The Go supervisor durably admits tasks, runs bounded Python/LangGraph workflows, confirms cancellation, persists lifecycle/events/checkpoints/results, and streams real events over authenticated SSE. The optional desktop client submits and cancels tasks through the same restricted main-process bridge. Default execution is offline deterministic local mode; real Ollama `llama3.2:3b` and MCP stdio/Streamable HTTP paths were validated on Windows. An unsigned PowerShell installer with a private CPython runtime and verified update/rollback/uninstall passed isolated Windows acceptance; signing, a release host, and clean-machine acceptance remain.
 
 ## What CRANE is being built to do
 
@@ -54,6 +54,7 @@ This diagram describes the intended component boundaries. It does not imply that
 ├── crane/
 │   ├── python_runtime/     # Python runtime and LangGraph workflow engine
 │   └── mcp_runtime/        # MCP manager and LangChain tool adapter
+├── scripts/                # Release build, install, uninstall, and acceptance harness
 ├── AGENTS.md               # Repository instructions for coding agents
 ├── ARCHITECTURE.md         # System architecture and boundaries
 ├── PRODUCT_REQUIREMENTS.md # Product scope and requirements
@@ -74,26 +75,27 @@ This diagram describes the intended component boundaries. It does not imply that
 | Optional desktop client | Yes | Submits/cancels tasks and shows live persisted events through restricted main-process IPC; MCP/approvals remain unavailable |
 | SQLite persistence | Yes | Task records/events/checkpoints/results and explicit restart-recovery policies are tested |
 | Go/Python protocol | Yes | Versioned, bounded NDJSON with handshake, submission, cancellation, state, result and error integration coverage |
-| Python runtime | Yes | Runs real LangGraph workflows in a supervisor-owned subprocess; packaged runtime is not available |
-| MCP integration | Yes | Manager, transports, discovery and adapter code exist; live-server behavior needs validation |
+| Python runtime | Yes | Runs real LangGraph workflows in a supervisor-owned subprocess; CPython 3.12.7 and hashed pinned dependencies are packaged and independently health-checked by the installer |
+| MCP integration | Validated | Real stdio and Streamable HTTP sessions, tool discovery, validation, and policy approval were exercised against local servers on Windows |
 | LangChain adapter | Yes | MCP adapter and explicit local/Ollama provider policy exist; no silent hosted fallback |
-| LangGraph workflow | Yes | Real `StateGraph` execution, checkpoints and bounded steps are exercised; MCP/approval nodes remain unavailable |
+| LangGraph workflow | Validated | Real `StateGraph` execution, checkpoints, bounded steps, and MCP/approval paths are exercised on Windows |
 | Ollama provider | Validated | Pinned `langchain-ollama` is installed; real `llama3.2:3b` inference, preflight, diagnostics, invalid-model failure and LangGraph/SQLite persistence are validated on Windows. No fallback is permitted |
-| Installer / signed releases | No | Not available |
-| Production Windows release | No | Acceptance testing and packaging remain |
+| Windows bootstrapper | Yes | Verified PowerShell install/update/rollback/uninstall with SHA-256 checks; explicitly unsigned/unverified manifest state |
+| Signed release / official host | No | No signing certificate or invented download domain; release source is configurable |
+| Production Windows release | Partial | Isolated Windows acceptance passed; clean Windows 10/11 machines and signing remain |
 
 Do not interpret source presence or a passing unit test as proof of a complete production workflow. The current known integration and validation gaps are tracked in [PROJECT_TRACKER.md](PROJECT_TRACKER.md).
 
 ## Current development state
 
-The project now has an end-to-end supervisor/API/desktop task path backed by real Python execution. The next engineering work should prioritize the remaining safety and production boundaries:
+The project now has an end-to-end supervisor/API/desktop task path backed by real Python execution, validated MCP/Ollama behavior, and an unsigned packaged Windows runtime. The next engineering work should prioritize the remaining safety and production boundaries:
 
-1. Validate MCP connections and tool invocation against local test servers.
-2. Implement and verify exact-action approval persistence, denial and restart behavior.
-3. Verify timeouts, concurrency saturation, side-effect ambiguity and cancellation under real MCP tools.
-4. Keep validating additional local models and packaged-runtime behavior. The pinned Ollama provider has completed a real `llama3.2:3b` end-to-end task with no fallback.
-5. Complete a reproducible pinned Python environment and packaged runtime; `requirements.txt` currently pins the Ollama integration only.
-6. Package and test the complete application on Windows before calling it installable.
+1. Validate the packaged runtime on clean Windows 10 and Windows 11 x64 machines and with PowerShell 7.
+2. Add a real signing certificate and controlled official release host.
+3. Verify restart-time replay prevention and side-effect ambiguity against real non-idempotent MCP tools.
+4. Verify timeout, concurrency saturation, and cancellation limits under real external tools.
+5. Test database migration compatibility across packaged upgrades.
+6. Keep validating additional local models with the pinned packaged runtime.
 
 ## Build and validation
 
@@ -119,7 +121,18 @@ npm run typecheck
 npm run build
 ```
 
-These checks were run on Windows 11 x64 on 2026-11-20 and passed for the current task path; exact commands and results are recorded in [PROJECT_TRACKER.md](PROJECT_TRACKER.md). This is not a claim of release acceptance. `requirements.txt` pins `langchain-ollama==1.1.0` and `ollama==0.6.3`; a complete reproducible Python environment and packaged runtime are still outstanding.
+Windows release build and isolated lifecycle acceptance from the repository root:
+
+```powershell
+.\scripts\build-release.ps1 -Version 0.1.0
+.\scripts\build-release.ps1 -Version 0.1.1
+.\scripts\build-release.ps1 -Version 0.1.2
+.\scripts\acceptance-windows.ps1
+```
+
+Generated release trees are written to ignored `build/release/`. Acceptance uses fake local application data and a controlled PATH change that is restored exactly; see [WINDOWS_ACCEPTANCE_TESTS.md](WINDOWS_ACCEPTANCE_TESTS.md).
+
+These checks were run on Windows x64 and passed for the current task path; exact source-tree results are recorded in [PROJECT_TRACKER.md](PROJECT_TRACKER.md). Packaged release validation uses the complete hashed closure in `requirements.lock.txt` and is described in [DISTRIBUTION_AND_INSTALLATION.md](DISTRIBUTION_AND_INSTALLATION.md). Passing checks are not a claim of clean-machine release acceptance.
 
 The current executable supports these development commands:
 
@@ -133,14 +146,26 @@ go run ./cmd/agent task create --id example --input "private task input"
 go run ./cmd/agent doctor
 ```
 
+The packaged launcher adds the user-facing lifecycle contract:
+
+```powershell
+agent run "do the task"
+agent status <task-id>
+agent result <task-id>
+agent cancel <task-id>
+agent doctor
+agent update -source <dir-or-url> [-version <version>]
+agent uninstall
+```
+
 `serve` starts the supervisor and authenticated loopback API on `127.0.0.1:8787`. `api-token` is a trusted integration boundary: it prints the installation token to stdout only; the token is never passed in an argument, URL, browser storage or renderer API. `api-token --rotate` prints a replacement and permanently revokes the previous token; `api-token --revoke` leaves no active token and writes its status to stderr. Rotation/revocation takes effect in an already-running server because protected state is reloaded on each request. `doctor` reports provider, Ollama installation/connectivity, configured model availability and provider initialization state without task text or credentials.
 
-The full task-oriented CLI contract is still under development. Do not treat proposed commands in the technical specification as implemented commands.
+The task-oriented CLI contract above is implemented in the packaged launcher. Lifecycle commands require a packaged installation; they are not available from `go run`.
 
 ## Platform and privacy
 
 - **Initial target:** Windows 10/11 x64.
-- **Current status:** Windows-first design; production Windows acceptance is not complete.
+- **Current status:** Windows-first design; isolated packaging acceptance passed, but clean-machine production acceptance is not complete.
 - Local model and MCP operation is the intended offline path.
 - Hosted model providers and remote MCP servers must be explicitly configured.
 - CRANE must never silently fall back to a hosted model or send local data to a remote service without authorization.
@@ -157,7 +182,7 @@ The full task-oriented CLI contract is still under development. Do not treat pro
 | [DECISIONS.md](DECISIONS.md) | Recorded architecture decisions |
 | [PROJECT_TRACKER.md](PROJECT_TRACKER.md) | Evidence-based implementation status and blockers |
 | [WINDOWS_ACCEPTANCE_TESTS.md](WINDOWS_ACCEPTANCE_TESTS.md) | Windows release acceptance criteria |
-| [DISTRIBUTION_AND_INSTALLATION.md](DISTRIBUTION_AND_INSTALLATION.md) | Planned installer, updates, rollback, and uninstall |
+| [DISTRIBUTION_AND_INSTALLATION.md](DISTRIBUTION_AND_INSTALLATION.md) | Implemented unsigned installer, update, rollback, uninstall, and release layout |
 | [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md) | Engineering and validation rules |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow |
 

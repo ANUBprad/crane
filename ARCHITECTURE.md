@@ -61,7 +61,7 @@ flowchart TB
     GRAPH <--> PROTO
 ```
 
-The diagram reflects the implemented logical architecture. The CLI starts the real supervisor, MCP daemon controller and authenticated loopback API. Task execution, MCP discovery/invocation, approval gating and recovery behavior are covered by real local integration tests; packaging and release acceptance remain separate.
+The diagram reflects the implemented logical architecture. The CLI starts the real supervisor, MCP daemon controller and authenticated loopback API. Task execution, MCP discovery/invocation, approval gating and recovery behavior are covered by real local integration tests. A reproducible unsigned Windows release build and an isolated lifecycle acceptance harness are also implemented; clean-machine and signed-release acceptance remain separate.
 
 ## 4. Component responsibilities
 
@@ -78,7 +78,8 @@ Current implementation:
 - Default invocation and `serve` start the supervisor and fixed loopback API.
 - `api-token` provides trusted retrieval, rotation and permanent revocation of the protected installation token.
 - `task create --id ... --input ...` persists a queued task record; raw input is not returned by the API.
-- The full task status/result/cancellation command set is still planned.
+- `run`, `status`, `result`, and `cancel` provide the durable task command set; `doctor` reports real runtime, SQLite, MCP, Ollama, and installation health.
+- `update` and `uninstall` invoke verified, detached PowerShell lifecycle scripts from a packaged installation.
 
 ### 4.2 Go supervisor — `supervisor`
 
@@ -109,7 +110,7 @@ Current implementation:
 - The Go supervisor starts one short-lived `python -m crane.python_runtime --protocol` child per admitted task, bounded to two concurrent tasks and a 180-second task timeout.
 - Runtime identity, task submission, cancellation, checkpoints, events, results, MCP commands and errors are exchanged as versioned NDJSON over stdin/stdout; stderr is captured separately and bounded.
 - Task submissions carry private MCP server configurations and durable approval fingerprints; environment values are never written to task events, checkpoints or API responses.
-- A reproducible Python dependency manifest and packaged Python runtime are not yet present in the repository.
+- `requirements.lock.txt` pins the production dependency closure with SHA-256 hashes. `scripts/build-release.ps1` packages CPython 3.12.7 with the CRANE app under `runtime\`, and the installer independently verifies packaged health and imports before activating a version.
 
 ### 4.4 LangGraph workflow engine
 
@@ -288,18 +289,37 @@ Default policy:
 
 See [SECURITY_AND_PRIVACY.md](SECURITY_AND_PRIVACY.md).
 
-## 9. Process and data layout
+## 9. Process, installation, and data layout
 
-Current per-user data root on Windows:
+Packaged Windows installation root (separate from user data):
+
+```text
+%LOCALAPPDATA%\\Programs\\CRANE\\
+  bin\\agent.cmd                  # stable launcher
+  bin\\install.ps1
+  bin\\uninstall.ps1
+  versions\\<version>\\agent.exe
+  versions\\<version>\\runtime\\python\\
+  versions\\<version>\\runtime\\app\\
+  current.txt                     # active version pointer
+  previous.txt                    # rollback pointer
+  staging\\                       # transient verified update work
+```
+
+Per-user data root on Windows:
 
 ```text
 %LOCALAPPDATA%\\CRANE\\
-  auth\\
-    token.json       # DPAPI-protected blob and revoked token hashes
-  crane.db           # SQLite task state
+  config\\
+  data\\crane.db                  # SQLite task state
+  auth\\token.json                # DPAPI-protected blob and revoked token hashes
+  logs\\
+  mcp\\
+  tmp\\
+  cache\\
 ```
 
-On non-Windows hosts the fallback root is `~/.crane/`. The broader `config/`, `logs/`, `artifacts/`, `runtimes/`, `downloads/` and `backups/` layout remains proposed. Executable/runtime files must be separate from user data so updates and uninstall do not erase task history or configuration.
+On non-Windows hosts the fallback data root is `~/.crane/`. Updates and uninstall operate only on the installation root; user data is preserved by default. This separation is verified by the isolated Windows acceptance harness.
 
 ## 10. Current repository map
 
@@ -322,7 +342,9 @@ On non-Windows hosts the fallback root is `~/.crane/`. The broader `config/`, `l
 
 - Verify approval denial and restart-time replay prevention against real non-idempotent MCP tools.
 - Verify timeout, concurrency saturation and side-effect ambiguity with real external tools.
-- Add a pinned Python dependency manifest, reproducible environment and packaged runtime.
-- Complete Windows release acceptance, packaging, signing, update, rollback, and uninstall.
+- Validate the packaged installation on clean Windows 10 and Windows 11 x64 machines and with PowerShell 7.
+- Sign the manifest and executable with a real certificate; current release metadata is explicitly unsigned/unverified.
+- Define a controlled official release host and install command; the release source is currently configurable only.
+- Test database migration compatibility across packaged upgrades.
 
-No production installer, official install URL, or Windows release is currently available.
+An unsigned PowerShell installer, private Python runtime, update/rollback/uninstall lifecycle, and an isolated Windows acceptance harness are implemented. No official install URL, signed release, or clean-machine acceptance is currently available.
