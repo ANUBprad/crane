@@ -42,11 +42,30 @@ type CraneTaskList = {
   count: number;
 };
 
+type CraneTaskEvent = {
+  id: string;
+  event: string;
+  data: unknown;
+};
+
+type CraneEventSubscription = {
+  streamId: string;
+  unsubscribe: () => void;
+};
+
 interface Window {
   craneDesktop?: {
     getAppInfo: () => Promise<CraneAppInfo>;
     getHealth: () => Promise<CraneBridgeResult<CraneHealth>>;
     getTasks: () => Promise<CraneBridgeResult<CraneTaskList>>;
     getTask: (id: string) => Promise<CraneBridgeResult<CraneTask>>;
+    submitTask: (id: string, input: string) => Promise<CraneBridgeResult<CraneTask>>;
+    cancelTask: (id: string) => Promise<CraneBridgeResult<CraneTask>>;
+    subscribeTaskEvents: (
+      id: string,
+      cursor: number,
+      onEvent: (event: CraneTaskEvent) => void,
+      onError?: (error: { message: string; kind: string }) => void,
+    ) => Promise<CraneBridgeResult<CraneEventSubscription>>;
   };
 }

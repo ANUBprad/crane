@@ -1,14 +1,100 @@
 package supervisor
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"crane/persistence"
 	"crane/python_protocol"
 )
+
+// TestHelperRuntime runs this test binary as a stand-in Python child process
+// when CRANE_TEST_RUNTIME_HELPER=1. It speaks the same versioned NDJSON
+// protocol as crane.python_runtime without requiring Python in Go unit tests.
+func TestHelperRuntime(t *testing.T) {
+	if os.Getenv("CRANE_TEST_RUNTIME_HELPER") != "1" {
+		return
+	}
+	write := func(message any) {
+		encoded, err := json.Marshal(message)
+		if err != nil {
+			return
+		}
+		_, _ = fmt.Fprintln(os.Stdout, string(encoded))
+	}
+	write(map[string]any{
+		"version": python_protocol.ProtocolVersion, "type": python_protocol.TypeRuntimeIdentity,
+		"runtime_version": "0.1.0", "python_version": "helper", "pid": os.Getpid(),
+	})
+
+	mode := os.Getenv("CRANE_TEST_RUNTIME_MODE")
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64<<10), python_protocol.MaxMessageBytes)
+	for scanner.Scan() {
+		var message struct {
+			Type   string `json:"type"`
+			TaskID string `json:"task_id"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &message) != nil {
+			continue
+		}
+		switch message.Type {
+		case python_protocol.TypeTaskSubmission:
+			if mode == "wait" {
+				write(taskStateMessage(message.TaskID, "running", "executing", false))
+				continue
+			}
+			write(taskStateMessage(message.TaskID, "running", "executing", false))
+			write(map[string]any{
+				"version": python_protocol.ProtocolVersion, "type": python_protocol.TypeTaskEvent,
+				"task_id": message.TaskID, "event_type": "workflow_started",
+				"payload": map[string]any{"provider": "helper"},
+			})
+			write(taskResultMessage(message.TaskID, "succeeded", map[string]any{"response": "helper result"}, ""))
+			return
+		case python_protocol.TypeTaskCancellation:
+			write(taskStateMessage(message.TaskID, "cancelled", "cancelled", true))
+			write(map[string]any{
+				"version": python_protocol.ProtocolVersion, "type": python_protocol.TypeTaskEvent,
+				"task_id": message.TaskID, "event_type": "cancelled",
+				"payload": map[string]any{"reason": "supervisor_request"},
+			})
+			write(taskResultMessage(message.TaskID, "cancelled", nil, "task cancelled by supervisor request"))
+			return
+		}
+	}
+}
+
+func taskStateMessage(id, state, step string, cancelled bool) map[string]any {
+	return map[string]any{
+		"version": python_protocol.ProtocolVersion, "type": python_protocol.TypeTaskState,
+		"task_id": id, "state": state, "current_step": step, "graph_steps": 1,
+		"wall_clock_ms": 1, "result_summary": nil, "failure_reason": nil,
+		"cancelled": cancelled,
+		"checkpoint": map[string]any{
+			"task_id": id, "state": state, "current_step": step,
+			"cancelled": cancelled, "last_tool_side_effect": nil,
+		},
+	}
+}
+
+func taskResultMessage(id, status string, result any, failure string) map[string]any {
+	return map[string]any{
+		"version": python_protocol.ProtocolVersion, "type": python_protocol.TypeTaskResult,
+		"task_id": id, "status": status, "result": result,
+		"result_summary": status, "failure_reason": failure,
+		"graph_steps": 2, "wall_clock_ms": 2, "current_step": status,
+		"checkpoint": map[string]any{"task_id": id, "state": status, "current_step": status},
+	}
+}
 
 // TestNewSupervisor creates a new Supervisor and verifies it is non-nil.
 func TestNewSupervisor(t *testing.T) {
@@ -38,7 +124,7 @@ func TestVersion(t *testing.T) {
 // TestHealthCheck verifies HealthCheck() does not panic.
 func TestHealthCheck(t *testing.T) {
 	err := HealthCheck()
-	// Should not panic; may return an error since implementation is stubbed
+	// Should not panic; may return an error if the default store is unavailable.
 	_ = err
 }
 
@@ -75,8 +161,6 @@ func TestPersistentState_jsonMarshalUnmarshal(t *testing.T) {
 	}
 }
 
-// TestLaunchPythonRuntimeStructure verifies the launchPythonRuntime function
-// has the correct structure for protocol message handling.
 func TestSupervisorLifecycleAndRuntimeProbe(t *testing.T) {
 	store, err := persistence.NewStore(filepath.Join(t.TempDir(), "crane.db"))
 	if err != nil {
@@ -120,22 +204,298 @@ func TestSupervisorLifecycleAndRuntimeProbe(t *testing.T) {
 	}
 }
 
-func TestLaunchPythonRuntimeStructure(t *testing.T) {
-	s := New()
-	if s == nil {
-		t.Fatal("Expected non-nil Supervisor")
+func newHelperSupervisor(t *testing.T, mode string) (*Supervisor, *persistence.Store) {
+	t.Helper()
+	store, err := persistence.NewStore(filepath.Join(t.TempDir(), "crane.db"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
+	s := NewWithStore(store)
+	s.pythonRuntimePath = os.Args[0]
+	s.pythonArgs = []string{"-test.run=^TestHelperRuntime$"}
+	t.Setenv("CRANE_TEST_RUNTIME_HELPER", "1")
+	t.Setenv("CRANE_TEST_RUNTIME_MODE", mode)
+	return s, store
+}
 
-	// Verify the supervisor has a store initialized
-	if s.store == nil {
-		t.Log("Store is nil (may be expected if SQLite not available)")
-		return
+func waitForStatus(t *testing.T, store *persistence.Store, id, status string) persistence.TaskRecord {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		record, err := store.GetTaskRecord(id)
+		if err == nil && record.Status == status {
+			return record
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
+	record, err := store.GetTaskRecord(id)
+	if err != nil {
+		t.Fatalf("GetTaskRecord(%q): %v", id, err)
+	}
+	t.Fatalf("task %q status = %q, want %q", id, record.Status, status)
+	return record
+}
 
-	// Verify persistTaskState method exists and is callable
-	// We test the structure by checking the method signature
-	_ = s.persistTaskState
+func hasEventType(events []persistence.TaskEvent, eventType string) bool {
+	for _, event := range events {
+		if event.Type == eventType {
+			return true
+		}
+	}
+	return false
+}
 
-	// Verify getLatestTaskState function is accessible
-	_, _ = getLatestTaskState(s.store, "dummy-id")
+func TestAdmitTaskExecutesAndPersistsResult(t *testing.T) {
+	s, store := newHelperSupervisor(t, "success")
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+
+	if _, err := s.AdmitTask("exec-task", "do useful work"); err != nil {
+		t.Fatalf("AdmitTask() error = %v", err)
+	}
+	record := waitForStatus(t, store, "exec-task", "succeeded")
+	if record.Result == "" || record.Result != `{"response":"helper result"}` {
+		t.Fatalf("unexpected persisted result: %q", record.Result)
+	}
+	if record.WorkflowRef == "" {
+		t.Fatal("workflow reference was not persisted")
+	}
+	checkpoint, ok := store.GetLatestTaskState("exec-task")
+	if !ok || !json.Valid(checkpoint) {
+		t.Fatalf("checkpoint was not persisted: %s", checkpoint)
+	}
+	events, err := store.GetTaskEventsAfter("exec-task", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"task_admitted", "task_starting", "checkpoint", "workflow_started", "task_finished"} {
+		if !hasEventType(events, required) {
+			t.Fatalf("missing persisted event %q in %#v", required, events)
+		}
+	}
+}
+
+func TestAdmissionRejectsDuplicateTask(t *testing.T) {
+	s, _ := newHelperSupervisor(t, "success")
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	if _, err := s.AdmitTask("duplicate-task", "first"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.AdmitTask("duplicate-task", "second")
+	if !errors.Is(err, persistence.ErrDuplicateTask) {
+		t.Fatalf("duplicate admission error = %v, want ErrDuplicateTask", err)
+	}
+}
+
+func TestCancelTaskConfirmsPythonOutcome(t *testing.T) {
+	s, store := newHelperSupervisor(t, "wait")
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	if _, err := s.AdmitTask("cancel-task", "long running work"); err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, store, "cancel-task", "running")
+	record, err := s.CancelTask("cancel-task")
+	if err != nil {
+		t.Fatalf("CancelTask() error = %v", err)
+	}
+	if record.Status != "cancelled" {
+		t.Fatalf("status after cancel = %q (result=%q error=%q), want cancelled", record.Status, record.Result, record.Error)
+	}
+	events, err := store.GetTaskEventsAfter("cancel-task", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasEventType(events, "cancellation_requested") || !hasEventType(events, "cancelled") {
+		t.Fatalf("cancellation events missing: %#v", events)
+	}
+}
+
+func newRealPythonSupervisor(t *testing.T) (*Supervisor, *persistence.Store) {
+	t.Helper()
+	if _, err := exec.LookPath("python"); err != nil {
+		t.Skip("python is not available on PATH")
+	}
+	root, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := persistence.NewStore(filepath.Join(t.TempDir(), "crane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	s := NewWithStore(store)
+	s.SetPythonRuntime("python")
+	t.Setenv("CRANE_PYTHON_HOME", root)
+	return s, store
+}
+
+func waitForStatusTimeout(t *testing.T, store *persistence.Store, id, status string, timeout time.Duration) persistence.TaskRecord {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		record, err := store.GetTaskRecord(id)
+		if err == nil && record.Status == status {
+			return record
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	record, err := store.GetTaskRecord(id)
+	if err != nil {
+		t.Fatalf("GetTaskRecord(%q): %v", id, err)
+	}
+	t.Fatalf("task %q status = %q, want %q", id, record.Status, status)
+	return record
+}
+
+func TestRealPythonRuntimeExecutesThroughLangGraph(t *testing.T) {
+	s, store := newRealPythonSupervisor(t)
+	t.Setenv("CRANE_MODEL_PROVIDER", "local")
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	if _, err := s.AdmitTask("real-python-task", "Review this repository for execution facts"); err != nil {
+		t.Fatal(err)
+	}
+	record := waitForStatusTimeout(t, store, "real-python-task", "succeeded", 30*time.Second)
+	if !strings.Contains(record.Result, `"execution_mode":"deterministic_local"`) {
+		t.Fatalf("unexpected real Python result: %q", record.Result)
+	}
+	if !strings.Contains(record.Result, `"model_output":null`) {
+		t.Fatalf("deterministic mode invented model output: %q", record.Result)
+	}
+}
+
+func TestRealPythonRuntimeProviderFailureIsExplicit(t *testing.T) {
+	s, store := newRealPythonSupervisor(t)
+	t.Setenv("CRANE_MODEL_PROVIDER", "ollama")
+	t.Setenv("CRANE_MODEL", "")
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	if _, err := s.AdmitTask("provider-failure-task", "This task must not silently fall back"); err != nil {
+		t.Fatal(err)
+	}
+	record := waitForStatusTimeout(t, store, "provider-failure-task", "failed", 30*time.Second)
+	if !strings.Contains(record.Result, `"code":"provider_unavailable"`) {
+		t.Fatalf("unexpected provider failure result: %q", record.Result)
+	}
+	if strings.Contains(record.Result, `"execution_mode":"deterministic_local"`) {
+		t.Fatalf("provider failure silently fell back: %q", record.Result)
+	}
+}
+
+func TestCancelImmediatelyAfterAdmissionStaysCancelled(t *testing.T) {
+	s, store := newHelperSupervisor(t, "wait")
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+
+	ids := make([]string, 0, 10)
+	for i := 0; i < 10; i++ {
+		id := fmt.Sprintf("race-cancel-%d", i)
+		ids = append(ids, id)
+		if _, err := s.AdmitTask(id, "cancel before registration"); err != nil {
+			t.Fatal(err)
+		}
+		record, err := s.CancelTask(id)
+		if err != nil {
+			t.Fatalf("CancelTask(%q) error = %v", id, err)
+		}
+		if record.Status != "cancelled" {
+			t.Fatalf("CancelTask(%q) status = %q, want cancelled", id, record.Status)
+		}
+	}
+	// Give any already-started child time to report a late result; that result
+	// must not overwrite the supervisor's confirmed cancellation.
+	time.Sleep(500 * time.Millisecond)
+	for _, id := range ids {
+		record, err := store.GetTaskRecord(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if record.Status != "cancelled" {
+			t.Fatalf("task %q status drifted to %q after cancellation", id, record.Status)
+		}
+	}
+}
+
+func TestStartupRecoveryPolicies(t *testing.T) {
+	t.Run("queued task resumes", func(t *testing.T) {
+		s, store := newHelperSupervisor(t, "success")
+		if _, err := store.CreateTask("recover-queued", "queued", "work"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Stop()
+		waitForStatus(t, store, "recover-queued", "succeeded")
+	})
+
+	t.Run("ambiguous running task fails safely", func(t *testing.T) {
+		s, store := newHelperSupervisor(t, "success")
+		if _, err := store.CreateTask("recover-ambiguous", "queued", "work"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpdateTaskStatus("recover-ambiguous", "running"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SaveTaskState("recover-ambiguous", []byte(`{"state":"running","current_step":"executing","selected_tool":{"name":"mutation"}}`)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Stop()
+		record := waitForStatus(t, store, "recover-ambiguous", "failed")
+		if record.Result != `{"code":"ambiguous_recovery"}` {
+			t.Fatalf("unexpected recovery result: %q", record.Result)
+		}
+	})
+
+	t.Run("unconfirmed cancellation fails", func(t *testing.T) {
+		s, store := newHelperSupervisor(t, "success")
+		if _, err := store.CreateTask("recover-cancelling", "queued", "work"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpdateTaskStatus("recover-cancelling", "cancelling"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Stop()
+		record := waitForStatus(t, store, "recover-cancelling", "failed")
+		if record.Result != `{"code":"cancellation_unconfirmed"}` {
+			t.Fatalf("unexpected recovery result: %q", record.Result)
+		}
+	})
+
+	t.Run("waiting approval is preserved", func(t *testing.T) {
+		s, store := newHelperSupervisor(t, "success")
+		if _, err := store.CreateTask("recover-approval", "queued", "work"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpdateTaskStatus("recover-approval", "waiting_approval"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Stop()
+		waitForStatus(t, store, "recover-approval", "waiting_approval")
+	})
 }

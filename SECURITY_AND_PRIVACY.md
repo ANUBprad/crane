@@ -68,8 +68,10 @@ The local API token is 256-bit random. On Windows it is protected with DPAPI and
 - Restrict CRANE-managed paths; defend against path traversal and reparse-point surprises.
 - Clean up CRANE-owned children without killing unrelated processes.
 - Apply resource limits where feasible.
-- The desktop renderer has no token, arbitrary HTTP, filesystem, SQLite or shell capability; its preload bridge exposes only health, app-info and read-only task methods.
-- The Electron main process validates task IDs and response shapes before returning data to the renderer.
+- The desktop renderer has no token, arbitrary HTTP, filesystem, SQLite or shell capability; its preload bridge exposes only health, app-info, task read/submit/cancel and stream subscription methods.
+- The Electron main process validates task IDs, task input bounds, event cursors and response shapes before returning data to the renderer, and owns stream lifecycle and cleanup.
+- Task lifecycle decisions remain in Go: admission happens before execution, duplicate IDs are rejected, cancellation must be confirmed, and event-stream disconnects never cancel work.
+- Python execution is explicit: the default local provider returns deterministic workflow facts only, Ollama requires explicit configuration, and unsupported or unavailable providers fail without fallback.
 
 ## Supply chain and updates
 
@@ -101,4 +103,4 @@ The local API token is 256-bit random. On Windows it is protected with DPAPI and
 - Tampered installer artifacts are rejected.
 - Local-only mode makes no hosted provider requests.
 
-Automated Windows checks cover token lifecycle behavior, constant-time verification inputs, loopback address validation, unauthenticated API rejection, immediate rotation/revocation, request validation, API-safe task reads, and component-specific health reporting.
+Automated Windows checks cover token lifecycle behavior, constant-time verification inputs, loopback address validation, unauthenticated API rejection, immediate rotation/revocation, request validation, API-safe task reads, component-specific health reporting, duplicate admission rejection, explicit provider failure, confirmed cancellation, SSE cursor replay, and restart recovery policy.

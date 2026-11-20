@@ -3,7 +3,9 @@ package python_protocol
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -25,7 +27,15 @@ const (
 	TypeInvokeTool       = "invoke_tool"
 	TypeToolResult       = "tool_result"
 	TypeTaskState        = "task_state"
+	TypeTaskSubmission   = "task_submission"
+	TypeTaskCancellation = "task_cancellation"
+	TypeTaskEvent        = "task_event"
+	TypeTaskResult       = "task_result"
+	TypeTaskError        = "task_error"
 )
+
+// MaxMessageBytes bounds one newline-delimited protocol frame.
+const MaxMessageBytes = 1 << 20
 
 // Message is a base protocol message with version and type fields.
 type Message struct {
@@ -54,10 +64,10 @@ type RuntimeIdentity struct {
 // ErrorResponse is a protocol error message.
 type ErrorResponse struct {
 	Message
-	ErrMessage  string `json:"message"`
-	Code        string `json:"code"`
-	RetryAfter  *int   `json:"retry_after,omitempty"`
-	Retryable   bool   `json:"retryable"`
+	ErrMessage string `json:"message"`
+	Code       string `json:"code"`
+	RetryAfter *int   `json:"retry_after,omitempty"`
+	Retryable  bool   `json:"retryable"`
 }
 
 // SuccessResponse is a protocol success message.
@@ -69,8 +79,8 @@ type SuccessResponse struct {
 // RegisterServer is a protocol message for registering an MCP server.
 type RegisterServer struct {
 	Message
-	ServerName   string `json:"server_name"`
-	Transport    string `json:"transport"` // "stdio" or "streamable_http"
+	ServerName   string          `json:"server_name"`
+	Transport    string          `json:"transport"` // "stdio" or "streamable_http"
 	Parameters   json.RawMessage `json:"parameters,omitempty"`
 	Capabilities json.RawMessage `json:"capabilities,omitempty"`
 }
@@ -95,36 +105,87 @@ type DiscoverTools struct {
 // InvokeTool is a protocol message for invoking an MCP tool.
 type InvokeTool struct {
 	Message
-	ServerName string `json:"server_name"`
-	ToolName   string `json:"tool_name"`
+	ServerName string          `json:"server_name"`
+	ToolName   string          `json:"tool_name"`
 	Arguments  json.RawMessage `json:"arguments,omitempty"`
 }
 
 // ToolResult is a protocol message returning tool invocation results.
 type ToolResult struct {
 	Message
-	ServerName string `json:"server_name"`
-	ToolName   string `json:"tool_name"`
-	Success    bool      `json:"success"`
+	ServerName string          `json:"server_name"`
+	ToolName   string          `json:"tool_name"`
+	Success    bool            `json:"success"`
 	Result     json.RawMessage `json:"result,omitempty"`
-	Error      string    `json:"error,omitempty"`
+	Error      string          `json:"error,omitempty"`
 }
 
 // TaskState is a protocol message for persisting workflow checkpoints.
 // The Go supervisor stores this in SQLite and can resume the workflow after restart.
 type TaskState struct {
 	Message
-	TaskId       string `json:"task_id"`
-	State        string `json:"state"`       // TaskState enum value
-	CurrentStep  string `json:"current_step"`
-	GraphSteps   int    `json:"graph_steps"`
-	WallClockMs  int64  `json:"wall_clock_ms"`
-	Result       json.RawMessage `json:"result,omitempty"`
-	ResultSummary string `json:"result_summary,omitempty"`
-	FailureReason string `json:"failure_reason,omitempty"`
-	Cancelled    bool   `json:"cancelled"`
-	ApprovalDecision string `json:"approval_decision,omitempty"`
-	ApprovalId string `json:"approval_id,omitempty"`
+	TaskId           string          `json:"task_id"`
+	State            string          `json:"state"` // TaskState enum value
+	CurrentStep      string          `json:"current_step"`
+	GraphSteps       int             `json:"graph_steps"`
+	WallClockMs      int64           `json:"wall_clock_ms"`
+	Result           json.RawMessage `json:"result,omitempty"`
+	ResultSummary    string          `json:"result_summary,omitempty"`
+	FailureReason    string          `json:"failure_reason,omitempty"`
+	Cancelled        bool            `json:"cancelled"`
+	ApprovalDecision string          `json:"approval_decision,omitempty"`
+	ApprovalId       string          `json:"approval_id,omitempty"`
+	Checkpoint       json.RawMessage `json:"checkpoint,omitempty"`
+}
+
+// TaskSubmission asks the Python runtime to execute one admitted task.
+type TaskSubmission struct {
+	Message
+	TaskID     string          `json:"task_id"`
+	Input      string          `json:"input"`
+	Resume     bool            `json:"resume,omitempty"`
+	Checkpoint json.RawMessage `json:"checkpoint,omitempty"`
+	TimeoutMs  int64           `json:"timeout_ms,omitempty"`
+}
+
+// TaskCancellation propagates a Go-owned cancellation decision to Python.
+type TaskCancellation struct {
+	Message
+	TaskID string `json:"task_id"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// TaskEvent is a real workflow event emitted by Python.
+type TaskEvent struct {
+	Message
+	TaskID    string          `json:"task_id"`
+	EventType string          `json:"event_type"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+}
+
+// TaskResult is the terminal outcome reported by Python. Go never marks a
+// task successful before receiving this message with a succeeded status.
+type TaskResult struct {
+	Message
+	TaskID        string          `json:"task_id"`
+	Status        string          `json:"status"`
+	Result        json.RawMessage `json:"result,omitempty"`
+	ResultSummary string          `json:"result_summary,omitempty"`
+	FailureReason string          `json:"failure_reason,omitempty"`
+	GraphSteps    int             `json:"graph_steps"`
+	WallClockMs   int64           `json:"wall_clock_ms"`
+	CurrentStep   string          `json:"current_step,omitempty"`
+	Checkpoint    json.RawMessage `json:"checkpoint,omitempty"`
+}
+
+// TaskError is an explicit Python-side execution failure.
+type TaskError struct {
+	Message
+	TaskID    string `json:"task_id"`
+	Code      string `json:"code"`
+	Detail    string `json:"message"`
+	Step      string `json:"step,omitempty"`
+	Retryable bool   `json:"retryable,omitempty"`
 }
 
 // Unmarshal parses a raw JSON byte slice into a Message.
@@ -162,7 +223,9 @@ func ValidateType(msgType string) bool {
 	case TypeHealthCheck, TypeShutdownRequest, TypeRuntimeIdentity,
 		TypeErrorResponse, TypeSuccessResponse,
 		TypeRegisterServer, TypeRemoveServer, TypeListServers,
-		TypeDiscoverTools, TypeInvokeTool, TypeToolResult, TypeTaskState:
+		TypeDiscoverTools, TypeInvokeTool, TypeToolResult, TypeTaskState,
+		TypeTaskSubmission, TypeTaskCancellation, TypeTaskEvent,
+		TypeTaskResult, TypeTaskError:
 		return true
 	default:
 		return false
@@ -192,8 +255,8 @@ func PrintError(code, message string, retryable bool, retryAfter *int) {
 			Type:    TypeErrorResponse,
 		},
 		ErrMessage: message,
-		Code:      code,
-		Retryable: retryable,
+		Code:       code,
+		Retryable:  retryable,
 		RetryAfter: retryAfter,
 	}
 	data, _ := json.Marshal(response)
@@ -348,4 +411,148 @@ func ReadTaskState() (*TaskState, error) {
 		return nil, fmt.Errorf("expected task_state, got %s", msg.Type)
 	}
 	return &TaskState{Message: msg}, nil
+}
+
+// NewFrameReader returns a reader sized for the largest legal protocol frame.
+func NewFrameReader(input io.Reader) *bufio.Reader {
+	return bufio.NewReaderSize(input, MaxMessageBytes+1)
+}
+
+// ReadFrame reads one bounded newline-delimited protocol frame. The reader
+// must have been created with NewFrameReader or an equivalent buffer size.
+func ReadFrame(reader *bufio.Reader) ([]byte, error) {
+	line, err := reader.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) {
+		return nil, fmt.Errorf("protocol message exceeds %d bytes", MaxMessageBytes)
+	}
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimRight(string(line), "\r\n")
+	if trimmed == "" {
+		return nil, errors.New("empty protocol message")
+	}
+	if len(trimmed) > MaxMessageBytes {
+		return nil, fmt.Errorf("protocol message exceeds %d bytes", MaxMessageBytes)
+	}
+	return []byte(trimmed), nil
+}
+
+// ValidTaskID mirrors the shared task identifier policy at the process boundary.
+func ValidTaskID(id string) bool {
+	if id == "" || len(id) > 200 {
+		return false
+	}
+	for i, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.', r == ':':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func decodeTyped(data []byte, expected string, target any) error {
+	msg, err := Unmarshal(data)
+	if err != nil {
+		return err
+	}
+	if msg.Type != expected {
+		return fmt.Errorf("expected %s, got %s", expected, msg.Type)
+	}
+	if err := json.Unmarshal(data, target); err != nil {
+		return fmt.Errorf("invalid %s payload: %w", expected, err)
+	}
+	return nil
+}
+
+// DecodeRuntimeIdentity validates a runtime_identity message.
+func DecodeRuntimeIdentity(data []byte) (*RuntimeIdentity, error) {
+	var msg RuntimeIdentity
+	if err := decodeTyped(data, TypeRuntimeIdentity, &msg); err != nil {
+		return nil, err
+	}
+	if msg.RuntimeVersion == "" || msg.PID <= 0 {
+		return nil, errors.New("runtime_identity is missing required fields")
+	}
+	return &msg, nil
+}
+
+// DecodeTaskState validates a task_state checkpoint message.
+func DecodeTaskState(data []byte) (*TaskState, error) {
+	var msg TaskState
+	if err := decodeTyped(data, TypeTaskState, &msg); err != nil {
+		return nil, err
+	}
+	if !ValidTaskID(msg.TaskId) || msg.State == "" || len(msg.Checkpoint) == 0 || !json.Valid(msg.Checkpoint) {
+		return nil, errors.New("task_state is missing required fields")
+	}
+	return &msg, nil
+}
+
+// DecodeTaskEvent validates a workflow event message.
+func DecodeTaskEvent(data []byte) (*TaskEvent, error) {
+	var msg TaskEvent
+	if err := decodeTyped(data, TypeTaskEvent, &msg); err != nil {
+		return nil, err
+	}
+	if !ValidTaskID(msg.TaskID) || msg.EventType == "" {
+		return nil, errors.New("task_event is missing required fields")
+	}
+	if len(msg.Payload) > 0 && !json.Valid(msg.Payload) {
+		return nil, errors.New("task_event payload is not valid JSON")
+	}
+	return &msg, nil
+}
+
+// DecodeTaskResult validates a terminal task_result message.
+func DecodeTaskResult(data []byte) (*TaskResult, error) {
+	var msg TaskResult
+	if err := decodeTyped(data, TypeTaskResult, &msg); err != nil {
+		return nil, err
+	}
+	if !ValidTaskID(msg.TaskID) {
+		return nil, errors.New("task_result has an invalid task identifier")
+	}
+	switch msg.Status {
+	case "succeeded", "failed", "cancelled":
+	default:
+		return nil, fmt.Errorf("task_result has unsupported status %q", msg.Status)
+	}
+	if msg.Result != nil && !json.Valid(msg.Result) {
+		return nil, errors.New("task_result payload is not valid JSON")
+	}
+	if msg.Checkpoint != nil && !json.Valid(msg.Checkpoint) {
+		return nil, errors.New("task_result checkpoint is not valid JSON")
+	}
+	return &msg, nil
+}
+
+// DecodeTaskError validates an explicit task_error message.
+func DecodeTaskError(data []byte) (*TaskError, error) {
+	var msg TaskError
+	if err := decodeTyped(data, TypeTaskError, &msg); err != nil {
+		return nil, err
+	}
+	if !ValidTaskID(msg.TaskID) || msg.Code == "" || msg.Detail == "" {
+		return nil, errors.New("task_error is missing required fields")
+	}
+	return &msg, nil
+}
+
+// DecodeErrorResponse validates an error_response message.
+func DecodeErrorResponse(data []byte) (*ErrorResponse, error) {
+	var msg ErrorResponse
+	if err := decodeTyped(data, TypeErrorResponse, &msg); err != nil {
+		return nil, err
+	}
+	if msg.Code == "" || msg.ErrMessage == "" {
+		return nil, errors.New("error_response is missing required fields")
+	}
+	return &msg, nil
 }

@@ -103,7 +103,7 @@ def state_to_dict(state: WorkflowState) -> Dict[str, Any]:
         "submitted_at": state.submitted_at,
         "started_at": state.started_at,
         "completed_at": state.completed_at,
-        "state": state.state.value,
+        "state": state.state.value if isinstance(state.state, TaskState) else str(state.state),
         "current_step": state.current_step,
         "graph_steps": state.graph_steps,
         "wall_clock_ms": state.wall_clock_ms,
@@ -128,6 +128,86 @@ def state_to_dict(state: WorkflowState) -> Dict[str, Any]:
         "python_runtime_pid": state.python_runtime_pid,
         "supervisor_version": state.supervisor_version,
     }
+
+
+def state_to_checkpoint(state: WorkflowState) -> Dict[str, Any]:
+    """Serialize native Python values for durable checkpoint messages."""
+    return {
+        "task_id": state.task_id,
+        "user_input": state.user_input,
+        "submitted_at": state.submitted_at,
+        "started_at": state.started_at,
+        "completed_at": state.completed_at,
+        "state": state.state.value if isinstance(state.state, TaskState) else str(state.state),
+        "current_step": state.current_step,
+        "graph_steps": state.graph_steps,
+        "wall_clock_ms": state.wall_clock_ms,
+        "available_tools": state.available_tools,
+        "selected_tool": state.selected_tool,
+        "tool_arguments": state.tool_arguments,
+        "tool_result": state.tool_result,
+        "tool_error": state.tool_error,
+        "tool_retry_count": state.tool_retry_count,
+        "approval_required": state.approval_required,
+        "approval_id": state.approval_id,
+        "approval_decision": state.approval_decision,
+        "approval_timestamp": state.approval_timestamp,
+        "checkpoint_identifier": state.checkpoint_identifier,
+        "persistent_state": state.persistent_state,
+        "last_tool_side_effect": state.last_tool_side_effect,
+        "failure_reason": state.failure_reason,
+        "failure_step": state.failure_step,
+        "cancelled": state.cancelled,
+        "result": state.result,
+        "result_summary": state.result_summary,
+        "python_runtime_pid": state.python_runtime_pid,
+        "supervisor_version": state.supervisor_version,
+    }
+
+
+def state_from_checkpoint(data: Dict[str, Any]) -> WorkflowState:
+    """Restore a WorkflowState from a durable checkpoint message."""
+    raw_state = data.get("state", TaskState.QUEUED.value)
+    if isinstance(raw_state, TaskState):
+        restored_state = raw_state
+    else:
+        restored_state = TaskState(str(raw_state))
+    restored = WorkflowState(
+        task_id=str(data.get("task_id", "")),
+        user_input=str(data.get("user_input", "")),
+        submitted_at=float(data.get("submitted_at") or time.time()),
+        started_at=data.get("started_at"),
+        completed_at=data.get("completed_at"),
+        state=restored_state,
+        current_step=str(data.get("current_step") or "initialization"),
+        graph_steps=int(data.get("graph_steps") or 0),
+        wall_clock_ms=int(data.get("wall_clock_ms") or 0),
+        available_tools=list(data.get("available_tools") or []),
+        selected_tool=data.get("selected_tool"),
+        tool_arguments=dict(data.get("tool_arguments") or {}),
+        tool_result=data.get("tool_result"),
+        tool_error=data.get("tool_error"),
+        tool_retry_count=int(data.get("tool_retry_count") or 0),
+        approval_required=bool(data.get("approval_required")),
+        approval_id=data.get("approval_id"),
+        approval_decision=data.get("approval_decision"),
+        approval_timestamp=data.get("approval_timestamp"),
+        checkpoint_identifier=data.get("checkpoint_identifier"),
+        persistent_state=dict(data.get("persistent_state") or {}),
+        last_tool_side_effect=data.get("last_tool_side_effect"),
+        failure_reason=data.get("failure_reason"),
+        failure_step=data.get("failure_step"),
+        cancelled=bool(data.get("cancelled")),
+        result=data.get("result"),
+        result_summary=data.get("result_summary"),
+        python_runtime_pid=data.get("python_runtime_pid"),
+        supervisor_version=str(data.get("supervisor_version") or "0.1.0"),
+    )
+    # A resumed workflow continues from a safe boundary with a fresh clock.
+    restored.submitted_at = time.time()
+    restored.wall_clock_ms = 0
+    restored.completed_at = None
+    return restored
 
 
 def state_from_dict(data: Dict[str, Any]) -> WorkflowState:

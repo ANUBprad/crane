@@ -1,13 +1,24 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity, ArrowUpRight, Bot, Boxes, Check, ChevronDown, CircleHelp, Gauge,
   HardDrive, LayoutDashboard, ListTodo, LockKeyhole, Menu, MoreHorizontal,
-  RefreshCw, Settings2, ShieldCheck, Sun, Moon, Workflow,
+  RefreshCw, Settings2, ShieldCheck, Sun, Moon, Workflow, X,
 } from "lucide-react";
 
 type Section = "Overview" | "Executions" | "MCP servers" | "Approvals" | "Settings";
 type ConnectionState = "checking" | "connected" | "disconnected" | "recovering" | "error";
 type DetailState = "idle" | "loading" | "ready" | "error" | "missing";
+type StreamState = "idle" | "connecting" | "live" | "reconnecting" | "unavailable";
+
+type TaskEventView = {
+  id: number;
+  type: string;
+  timestamp: string;
+  payload: unknown;
+};
+
+const taskIDPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+const maxVisibleEvents = 200;
 
 const navItems: { label: Section; icon: typeof LayoutDashboard; detail: string }[] = [
   { label: "Overview", icon: LayoutDashboard, detail: "Runtime pulse and persisted activity" },
@@ -48,6 +59,44 @@ function formatValue(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function suggestedTaskID(): string {
+  const random = Math.random().toString(36).slice(2, 10);
+  return `task-${Date.now()}-${random}`;
+}
+
+function toEventView(event: CraneTaskEvent): TaskEventView | null {
+  if (event.event === "snapshot") return null;
+  const data = asRecord(event.data);
+  const id = Number(event.id || data?.id);
+  const type = typeof data?.type === "string" ? data.type : event.event;
+  if (!Number.isSafeInteger(id) || id <= 0 || !type) return null;
+  return {
+    id,
+    type,
+    timestamp: typeof data?.timestamp === "string" ? data.timestamp : "",
+    payload: data?.payload ?? null,
+  };
+}
+
+function eventTerminalStatus(event: TaskEventView): string | null {
+  const payload = asRecord(event.payload);
+  const status = payload?.status;
+  return typeof status === "string" && terminalStatuses.has(status) ? status : null;
+}
+
+function streamLabel(state: StreamState): string {
+  if (state === "live") return "LIVE";
+  if (state === "connecting") return "CONNECTING";
+  if (state === "reconnecting") return "RECONNECTING";
+  if (state === "unavailable") return "UNAVAILABLE";
+  return "IDLE";
+}
+
 function App() {
   const [section, setSection] = useState<Section>("Overview");
   const [appInfo, setAppInfo] = useState<CraneAppInfo | null>(null);
@@ -63,6 +112,22 @@ function App() {
   const [detailMessage, setDetailMessage] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [composerID, setComposerID] = useState("");
+  const [composerInput, setComposerInput] = useState("");
+  const [composerError, setComposerError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [actionMessage, setActionMessage] = useState("");
+  const [taskEvents, setTaskEvents] = useState<TaskEventView[]>([]);
+  const [streamState, setStreamState] = useState<StreamState>("idle");
+  const [streamMessage, setStreamMessage] = useState("");
+
+  const activeStreamRef = useRef<CraneEventSubscription | null>(null);
+  const streamTokenRef = useRef(0);
+  const eventCursorRef = useRef(0);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
 
   const bridgeAvailable = Boolean(window.craneDesktop);
   const active = navItems.find((item) => item.label === section) ?? navItems[0];
@@ -104,25 +169,217 @@ function App() {
     return () => window.clearInterval(timer);
   }, [refresh]);
 
-  const selectTask = useCallback(async (id: string) => {
+  const loadTaskDetail = useCallback(async (id: string): Promise<boolean> => {
     const bridge = window.craneDesktop;
-    setSelectedId(id);
-    setDetail(null);
-    setDetailState("loading");
-    setDetailMessage("");
     if (!bridge) {
       setDetailState("error");
       setDetailMessage("The restricted desktop bridge is unavailable.");
-      return;
+      return false;
     }
     const result = await bridge.getTask(id);
     if (!result.ok) {
       setDetailState(result.error.kind === "not_found" ? "missing" : "error");
       setDetailMessage(result.error.message);
-      return;
+      return false;
     }
     setDetail(result.data);
     setDetailState("ready");
+    setDetailMessage("");
+    return true;
+  }, []);
+
+  const stopTaskEvents = useCallback(() => {
+    streamTokenRef.current += 1;
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    const current = activeStreamRef.current;
+    activeStreamRef.current = null;
+    if (current) {
+      try { current.unsubscribe(); } catch { /* cleanup is best-effort */ }
+    }
+    eventCursorRef.current = 0;
+    reconnectAttemptRef.current = 0;
+    setTaskEvents([]);
+    setStreamState("idle");
+    setStreamMessage("");
+  }, []);
+
+  const handleTaskStreamEvent = useCallback((id: string, event: CraneTaskEvent, token: number) => {
+    if (token !== streamTokenRef.current) return;
+    if (event.event === "snapshot") {
+      const task = asRecord(event.data);
+      if (task && task.id === id) {
+        setDetail((current) => {
+          if (current?.id !== id) return current;
+          return {
+            ...current,
+            status: typeof task.status === "string" ? task.status : current.status,
+            result: task.result ?? current.result,
+            error: typeof task.error === "string" ? task.error : current.error,
+            updated_at: typeof task.updated_at === "string" ? task.updated_at : current.updated_at,
+            completed_at: typeof task.completed_at === "string" ? task.completed_at : current.completed_at,
+            has_checkpoint: typeof task.has_checkpoint === "boolean" ? task.has_checkpoint : current.has_checkpoint,
+          };
+        });
+      }
+      return;
+    }
+    const view = toEventView(event);
+    if (!view) return;
+    eventCursorRef.current = Math.max(eventCursorRef.current, view.id);
+    setTaskEvents((current) => {
+      if (current.some((item) => item.id === view.id)) return current;
+      return [...current, view].sort((left, right) => left.id - right.id).slice(-maxVisibleEvents);
+    });
+    if (view.type === "task_finished" || eventTerminalStatus(view)) {
+      void loadTaskDetail(id);
+      void refresh("manual");
+    }
+  }, [loadTaskDetail, refresh]);
+
+  const startTaskEvents = useCallback((id: string) => {
+    const bridge = window.craneDesktop;
+    const token = streamTokenRef.current + 1;
+    streamTokenRef.current = token;
+    reconnectAttemptRef.current = 0;
+    setStreamState(bridge ? "connecting" : "unavailable");
+    setStreamMessage(bridge ? "" : "The restricted desktop bridge is unavailable.");
+    if (!bridge) return;
+
+    const releaseStream = () => {
+      const current = activeStreamRef.current;
+      activeStreamRef.current = null;
+      if (current) {
+        try { current.unsubscribe(); } catch { /* cleanup is best-effort */ }
+      }
+    };
+
+    let connect: () => Promise<void>;
+    const scheduleReconnect = (message: string) => {
+      if (token !== streamTokenRef.current) return;
+      releaseStream();
+      if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+      const attempt = reconnectAttemptRef.current++;
+      const delay = Math.min(5000, 500 * (2 ** attempt));
+      setStreamState("reconnecting");
+      setStreamMessage(message);
+      reconnectTimerRef.current = window.setTimeout(() => void connect(), delay);
+    };
+
+    connect = async () => {
+      if (token !== streamTokenRef.current) return;
+      reconnectTimerRef.current = null;
+      setStreamState((current) => current === "reconnecting" ? current : "connecting");
+      let result: CraneBridgeResult<CraneEventSubscription>;
+      try {
+        result = await bridge.subscribeTaskEvents(
+          id,
+          eventCursorRef.current,
+          (event) => handleTaskStreamEvent(id, event, token),
+          (error) => scheduleReconnect(error.message || "Event stream closed; task continues under the supervisor."),
+        );
+      } catch {
+        scheduleReconnect("Event stream could not be opened; task continues under the supervisor.");
+        return;
+      }
+      if (token !== streamTokenRef.current) {
+        if (result.ok) result.data.unsubscribe();
+        return;
+      }
+      if (!result.ok) {
+        if (result.error.kind === "bad_request") {
+          setStreamState("unavailable");
+          setStreamMessage(result.error.message);
+          return;
+        }
+        scheduleReconnect(result.error.message);
+        return;
+      }
+      activeStreamRef.current = result.data;
+      reconnectAttemptRef.current = 0;
+      setStreamState("live");
+      setStreamMessage("");
+    };
+    void connect();
+  }, [handleTaskStreamEvent]);
+
+  const selectTask = useCallback(async (id: string) => {
+    setSelectedId(id);
+    setDetail(null);
+    setDetailState("loading");
+    setDetailMessage("");
+    setActionMessage("");
+    stopTaskEvents();
+    const loaded = await loadTaskDetail(id);
+    if (loaded) startTaskEvents(id);
+  }, [loadTaskDetail, startTaskEvents, stopTaskEvents]);
+
+  const openComposer = useCallback(() => {
+    setComposerID(suggestedTaskID());
+    setComposerInput("");
+    setComposerError("");
+    setComposerOpen(true);
+  }, []);
+
+  const submitNewTask = useCallback(async () => {
+    const bridge = window.craneDesktop;
+    const id = composerID.trim();
+    if (!bridge || !taskIDPattern.test(id) || !composerInput.trim()) return;
+    setSubmitting(true);
+    setComposerError("");
+    const result = await bridge.submitTask(id, composerInput);
+    setSubmitting(false);
+    if (!result.ok) {
+      setComposerError(result.error.message);
+      return;
+    }
+    setComposerOpen(false);
+    setComposerInput("");
+    setSection("Executions");
+    setSelectedId(result.data.id);
+    setDetail(result.data);
+    setDetailState("ready");
+    setDetailMessage("");
+    setActionMessage("");
+    stopTaskEvents();
+    await refresh("manual");
+    startTaskEvents(result.data.id);
+  }, [composerID, composerInput, refresh, startTaskEvents, stopTaskEvents]);
+
+  const cancelSelectedTask = useCallback(async () => {
+    const bridge = window.craneDesktop;
+    if (!bridge || !selectedId) return;
+    setCancellingId(selectedId);
+    setActionMessage("");
+    const result = await bridge.cancelTask(selectedId);
+    setCancellingId(null);
+    if (!result.ok) {
+      setActionMessage(result.error.message);
+      return;
+    }
+    setDetail(result.data);
+    await refresh("manual");
+  }, [refresh, selectedId]);
+
+  useEffect(() => {
+    if (!composerOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !submitting) setComposerOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [composerOpen, submitting]);
+
+  useEffect(() => () => {
+    streamTokenRef.current += 1;
+    if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+    const current = activeStreamRef.current;
+    activeStreamRef.current = null;
+    if (current) {
+      try { current.unsubscribe(); } catch { /* cleanup is best-effort */ }
+    }
   }, []);
 
   const counts = useMemo(() => ({
@@ -187,7 +444,7 @@ function App() {
             </div>
             <div className="heading-actions">
               <button className="button button-secondary" onClick={() => void refresh("manual")} disabled={busy}><RefreshCw size={15} className={busy ? "spin" : ""} /> {busy ? "Refreshing" : "Refresh"}</button>
-              <button className="button button-primary" disabled title="Task submission is not exposed by the local API">New execution</button>
+              <button className="button button-primary" onClick={openComposer} disabled={!bridgeAvailable || connection !== "connected"} title={!bridgeAvailable ? "Desktop bridge unavailable" : connection !== "connected" ? "Connect the local supervisor first" : "Submit a bounded task through the authenticated supervisor"}>New execution</button>
             </div>
           </div>
 
@@ -218,8 +475,14 @@ function App() {
               detail={detail}
               detailState={detailState}
               detailMessage={detailMessage}
+              events={taskEvents}
+              streamState={streamState}
+              streamMessage={streamMessage}
+              actionMessage={actionMessage}
+              cancelling={cancellingId === selectedId && selectedId !== null}
               onSelect={(id) => void selectTask(id)}
               onRefresh={() => void refresh("manual")}
+              onCancel={() => void cancelSelectedTask()}
               busy={busy}
             />
           )}
@@ -233,6 +496,19 @@ function App() {
           <div><LockKeyhole size={12} /> No cloud fallback <span className="status-separator">·</span> {appInfo ? `v${appInfo.version}` : "Desktop client"}</div>
         </footer>
       </main>
+
+      {composerOpen && (
+        <TaskComposer
+          id={composerID}
+          input={composerInput}
+          error={composerError}
+          submitting={submitting}
+          onIDChange={setComposerID}
+          onInputChange={setComposerInput}
+          onSubmit={() => void submitNewTask()}
+          onClose={() => setComposerOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -313,7 +589,7 @@ function Overview({
           <div className="panel-heading"><div><h3>Runtime facts</h3><p>Reported by the Go supervisor</p></div><Workflow size={17} className="accent-icon" /></div>
           <div className="quick-action static"><span className="quick-icon blue"><LockKeyhole size={16} /></span><span><strong>Authenticated loopback</strong><small>127.0.0.1 · no renderer token access</small></span></div>
           <div className="quick-action static"><span className="quick-icon green"><HardDrive size={16} /></span><span><strong>SQLite-backed history</strong><small>Task data is read, never fabricated</small></span></div>
-          <div className="quick-action static"><span className="quick-icon violet"><Bot size={16} /></span><span><strong>Separate Python probe</strong><small>Runtime health is reported independently</small></span></div>
+          <div className="quick-action static"><span className="quick-icon violet"><Bot size={16} /></span><span><strong>Bounded LangGraph execution</strong><small>One supervisor-owned Python child per task</small></span></div>
         </div>
         <div className="panel privacy-panel"><div className="privacy-icon"><LockKeyhole size={16} /></div><div><strong>Your machine. Your execution.</strong><p>Closing this desktop window does not stop supervisor-owned work.</p></div></div>
       </div>
@@ -332,7 +608,8 @@ function Overview({
 }
 
 function Executions({
-  tasks, connection, selectedId, detail, detailState, detailMessage, onSelect, onRefresh, busy,
+  tasks, connection, selectedId, detail, detailState, detailMessage, events, streamState,
+  streamMessage, actionMessage, cancelling, onSelect, onRefresh, onCancel, busy,
 }: {
   tasks: CraneTask[];
   connection: ConnectionState;
@@ -340,10 +617,18 @@ function Executions({
   detail: CraneTask | null;
   detailState: DetailState;
   detailMessage: string;
+  events: TaskEventView[];
+  streamState: StreamState;
+  streamMessage: string;
+  actionMessage: string;
+  cancelling: boolean;
   onSelect: (id: string) => void;
   onRefresh: () => void;
+  onCancel: () => void;
   busy: boolean;
 }) {
+  const canCancel = Boolean(detail) && !terminalStatuses.has(detail!.status) && detail!.status !== "cancelling";
+
   return <section className="executions-grid">
     <div className="panel task-panel">
       <div className="panel-heading">
@@ -368,14 +653,91 @@ function Executions({
     </div>
 
     <div className="panel detail-panel">
-      <div className="panel-heading"><div><h3>Execution details</h3><p>{selectedId ? selectedId : "Select a task to inspect its persisted state"}</p></div></div>
+      <div className="panel-heading">
+        <div><h3>Execution details</h3><p>{selectedId ? selectedId : "Select a task to inspect its persisted state"}</p></div>
+        {canCancel && <button className="button button-danger" onClick={onCancel} disabled={cancelling}><X size={14} /> {cancelling ? "Cancelling…" : "Cancel task"}</button>}
+      </div>
+      {actionMessage && <div className="action-message" role="alert">{actionMessage}</div>}
       {detailState === "idle" && <DataState icon={Workflow} title="No task selected" body="Choose a persisted execution from the list." />}
       {detailState === "loading" && <DataState icon={Activity} title="Loading task" body="Reading task details from the local supervisor." tone="loading" />}
       {detailState === "missing" && <DataState icon={ListTodo} title="Task not found" body={detailMessage || "This task is no longer present in the store."} tone="error" />}
       {detailState === "error" && <DataState icon={Activity} title="Task details unavailable" body={detailMessage} tone="error" />}
-      {detailState === "ready" && detail && <TaskDetail task={detail} />}
+      {detailState === "ready" && detail && <>
+        <TaskDetail task={detail} />
+        <EventFeed events={events} state={streamState} message={streamMessage} />
+      </>}
     </div>
   </section>;
+}
+
+function EventFeed({
+  events, state, message,
+}: {
+  events: TaskEventView[];
+  state: StreamState;
+  message: string;
+}) {
+  return <div className="event-feed">
+    <div className="event-feed-heading">
+      <div><h4>Live execution events</h4><p>Persisted events streamed by the Go supervisor</p></div>
+      <span className={`stream-chip ${state}`}>{streamLabel(state)}</span>
+    </div>
+    {message && <p className="stream-message">{message}</p>}
+    {events.length === 0 ? (
+      <div className="event-empty">No lifecycle events have been recorded for this task.</div>
+    ) : (
+      <div className="event-list">
+        {events.map((event) => (
+          <div className="event-row" key={event.id}>
+            <span className="event-id">#{event.id}</span>
+            <div className="event-copy"><strong>{event.type}</strong><span>{event.timestamp ? formatTime(event.timestamp) : "Timestamp not recorded"}</span></div>
+            <code>{formatValue(event.payload)}</code>
+          </div>
+        ))}
+      </div>
+    )}
+    {events.length === maxVisibleEvents && <div className="event-truncated">Showing the latest {maxVisibleEvents} events. Full history remains in SQLite.</div>}
+  </div>;
+}
+
+function TaskComposer({
+  id, input, error, submitting, onIDChange, onInputChange, onSubmit, onClose,
+}: {
+  id: string;
+  input: string;
+  error: string;
+  submitting: boolean;
+  onIDChange: (value: string) => void;
+  onInputChange: (value: string) => void;
+  onSubmit: () => void;
+  onClose: () => void;
+}) {
+  const valid = taskIDPattern.test(id.trim()) && Boolean(input.trim());
+  return <div className="modal-backdrop" role="presentation">
+    <section className="composer-modal" role="dialog" aria-modal="true" aria-labelledby="composer-title">
+      <div className="modal-heading">
+        <div><h2 id="composer-title">New execution</h2><p>Admitted durably, then executed by the supervisor-owned Python runtime.</p></div>
+        <button className="icon-button" onClick={onClose} disabled={submitting} aria-label="Close task composer"><X size={17} /></button>
+      </div>
+      <label className="composer-field">
+        <span>TASK ID · 1–200 SAFE CHARACTERS</span>
+        <input value={id} onChange={(event) => onIDChange(event.target.value)} maxLength={200} spellCheck={false} disabled={submitting} aria-label="Task ID" />
+      </label>
+      <label className="composer-field">
+        <span>TASK INPUT · MAX 64 KIB</span>
+        <textarea value={input} onChange={(event) => onInputChange(event.target.value)} placeholder="Describe the work for the local agent to perform…" maxLength={65536} disabled={submitting} aria-label="Task input" />
+      </label>
+      {error && <div className="composer-error" role="alert">{error}</div>}
+      <div className="composer-context"><span><LockKeyhole size={12} /> Authenticated 127.0.0.1</span><span><Workflow size={12} /> No cloud execution</span></div>
+      <div className="modal-footer">
+        <span>Duplicate IDs are rejected before admission.</span>
+        <div className="modal-actions">
+          <button className="button button-secondary" onClick={onClose} disabled={submitting}>Cancel</button>
+          <button className="button button-primary" onClick={onSubmit} disabled={!valid || submitting}>{submitting ? "Submitting…" : "Submit task"}</button>
+        </div>
+      </div>
+    </section>
+  </div>;
 }
 
 function TaskDetail({ task }: { task: CraneTask }) {

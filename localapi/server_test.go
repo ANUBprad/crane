@@ -1,6 +1,7 @@
 package localapi
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
@@ -9,7 +10,9 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,6 +28,78 @@ type testState struct {
 	dbPath     string
 	runtime    RuntimeStatus
 	supervisor atomic.Bool
+	controller *mockController
+}
+
+type mockController struct {
+	store     *persistence.Store
+	mu        sync.Mutex
+	subs      []chan persistence.TaskEvent
+	admitted  chan string
+	cancelled chan string
+}
+
+func newMockController(store *persistence.Store) *mockController {
+	return &mockController{
+		store:     store,
+		admitted:  make(chan string, 8),
+		cancelled: make(chan string, 8),
+	}
+}
+
+func (m *mockController) AdmitTask(id, input string) (persistence.TaskRecord, error) {
+	if _, err := m.store.CreateTask(id, "queued", input); err != nil {
+		return persistence.TaskRecord{}, err
+	}
+	m.admitted <- id
+	return m.store.GetTaskRecord(id)
+}
+
+func (m *mockController) CancelTask(id string) (persistence.TaskRecord, error) {
+	if _, err := m.store.GetTaskRecord(id); err != nil {
+		return persistence.TaskRecord{}, err
+	}
+	if err := m.store.UpdateTaskStatus(id, "cancelled"); err != nil {
+		return persistence.TaskRecord{}, err
+	}
+	m.cancelled <- id
+	return m.store.GetTaskRecord(id)
+}
+
+func (m *mockController) SubscribeTaskEvents(id string, after int64) (<-chan persistence.TaskEvent, func(), error) {
+	replay, err := m.store.GetTaskEventsAfter(id, after, 128)
+	if err != nil {
+		return nil, nil, err
+	}
+	events := make(chan persistence.TaskEvent, 128)
+	for _, event := range replay {
+		events <- event
+	}
+	m.mu.Lock()
+	m.subs = append(m.subs, events)
+	m.mu.Unlock()
+	return events, func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for i, sub := range m.subs {
+			if sub == events {
+				m.subs = append(m.subs[:i], m.subs[i+1:]...)
+				close(sub)
+				return
+			}
+		}
+	}, nil
+}
+
+func (m *mockController) publish(event persistence.TaskEvent) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, sub := range m.subs {
+		select {
+		case sub <- event:
+		default:
+		}
+	}
 }
 
 type apiEnvelope struct {
@@ -74,11 +149,12 @@ func newTestState(t *testing.T) *testState {
 	}
 
 	state := &testState{
-		auth:    auth,
-		store:   store,
-		token:   token,
-		dbPath:  dbPath,
-		runtime: RuntimeStatus{Available: true, Detail: "probe ok"},
+		auth:       auth,
+		store:      store,
+		token:      token,
+		dbPath:     dbPath,
+		runtime:    RuntimeStatus{Available: true, Detail: "probe ok"},
+		controller: newMockController(store),
 	}
 	state.supervisor.Store(true)
 	t.Cleanup(func() { _ = store.Close() })
@@ -87,7 +163,7 @@ func newTestState(t *testing.T) *testState {
 
 func (s *testState) newServer(t *testing.T) *Server {
 	t.Helper()
-	server, err := NewServer(s.auth, s.store, func() RuntimeStatus { return s.runtime }, s.supervisor.Load)
+	server, err := NewServer(s.auth, s.store, func() RuntimeStatus { return s.runtime }, s.supervisor.Load, s.controller)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +495,10 @@ func TestLifecycleShutdownAndAuthenticationAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	restartedState := &testState{auth: auth, store: store, token: restoredToken, runtime: state.runtime}
+	restartedState := &testState{
+		auth: auth, store: store, token: restoredToken, runtime: state.runtime,
+		controller: newMockController(store),
+	}
 	restartedState.supervisor.Store(true)
 	restarted := restartedState.newServer(t)
 	if err := restarted.Start(0); err != nil {
@@ -441,17 +520,17 @@ func TestLifecycleShutdownAndAuthenticationAfterRestart(t *testing.T) {
 }
 
 func TestNewServerRejectsMissingDependencies(t *testing.T) {
-	if _, err := NewServer(nil, nil, nil, nil); err == nil {
+	if _, err := NewServer(nil, nil, nil, nil, nil); err == nil {
 		t.Fatal("expected missing auth manager to fail")
 	}
 	state := newTestState(t)
-	if _, err := NewServer(state.auth, nil, nil, nil); err == nil {
+	if _, err := NewServer(state.auth, nil, nil, nil, nil); err == nil {
 		t.Fatal("expected missing store to fail")
 	}
-	if _, err := NewServer(state.auth, state.store, nil, nil); err != nil {
+	if _, err := NewServer(state.auth, state.store, nil, nil, nil); err != nil {
 		t.Fatalf("optional probes should default to unavailable: %v", err)
 	}
-	server, err := NewServer(state.auth, state.store, nil, nil)
+	server, err := NewServer(state.auth, state.store, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,4 +541,179 @@ func TestNewServerRejectsMissingDependencies(t *testing.T) {
 		t.Fatalf("Shutdown() before Start() error = %v", err)
 	}
 	_ = server.Addr()
+}
+
+type sseEvent struct {
+	id   string
+	name string
+	data string
+}
+
+func readSSEEvent(t *testing.T, reader *bufio.Reader) sseEvent {
+	t.Helper()
+	event := sseEvent{}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read SSE event: %v", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			return event
+		}
+		switch {
+		case strings.HasPrefix(line, "id: "):
+			event.id = strings.TrimPrefix(line, "id: ")
+		case strings.HasPrefix(line, "event: "):
+			event.name = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			event.data = strings.TrimPrefix(line, "data: ")
+		case strings.HasPrefix(line, ":"):
+			// Keep-alive comment.
+		default:
+			t.Fatalf("unexpected SSE line %q", line)
+		}
+	}
+}
+
+func openEventStream(t *testing.T, client *http.Client, baseURL, id, token string) (*http.Response, *bufio.Reader) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/v1/tasks/"+id+"/events?cursor=0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	response, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("event stream status = %d, body = %s", response.StatusCode, body)
+	}
+	if got := response.Header.Get("Content-Type"); got != "text/event-stream" {
+		defer response.Body.Close()
+		t.Fatalf("event stream Content-Type = %q", got)
+	}
+	return response, bufio.NewReader(response.Body)
+}
+
+func TestTaskAdmissionCancellationAndEventStream(t *testing.T) {
+	state := newTestState(t)
+	httpServer := httptest.NewServer(state.newServer(t))
+	defer httpServer.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	status, header, body := apiRequest(t, client, httpServer.URL, http.MethodPost, "/v1/tasks", state.token,
+		[]byte(`{"id":"api-submitted","input":"do useful work"}`))
+	envelope := decodeEnvelope(t, status, header, body)
+	if status != http.StatusCreated {
+		t.Fatalf("task admission status = %d, body = %s", status, body)
+	}
+	var created struct {
+		Task persistence.TaskRecord `json:"task"`
+	}
+	if err := json.Unmarshal(envelope.Data, &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Task.ID != "api-submitted" || created.Task.Status != "queued" {
+		t.Fatalf("unexpected admitted task: %#v", created.Task)
+	}
+	select {
+	case id := <-state.controller.admitted:
+		if id != "api-submitted" {
+			t.Fatalf("controller admitted %q", id)
+		}
+	default:
+		t.Fatal("controller did not receive the admitted task")
+	}
+
+	status, header, body = apiRequest(t, client, httpServer.URL, http.MethodPost, "/v1/tasks", state.token,
+		[]byte(`{"id":"api-submitted","input":"duplicate"}`))
+	envelope = decodeEnvelope(t, status, header, body)
+	if status != http.StatusConflict || envelope.Error.Code != "task_already_exists" {
+		t.Fatalf("duplicate admission: status = %d, body = %s", status, body)
+	}
+
+	status, header, body = apiRequest(t, client, httpServer.URL, http.MethodPost, "/v1/tasks", state.token,
+		[]byte(`{"id":"bad id","input":"work"}`))
+	envelope = decodeEnvelope(t, status, header, body)
+	if status != http.StatusBadRequest {
+		t.Fatalf("invalid admission: status = %d, body = %s", status, body)
+	}
+
+	response, reader := openEventStream(t, client, httpServer.URL, "api-submitted", state.token)
+	snapshot := readSSEEvent(t, reader)
+	if snapshot.name != "snapshot" || !strings.Contains(snapshot.data, `"id":"api-submitted"`) {
+		t.Fatalf("unexpected SSE snapshot: %#v", snapshot)
+	}
+	_ = response.Body.Close()
+
+	select {
+	case id := <-state.controller.cancelled:
+		t.Fatalf("stream disconnect cancelled task %q", id)
+	default:
+	}
+
+	status, header, body = apiRequest(t, client, httpServer.URL, http.MethodPost, "/v1/tasks/api-submitted/cancel", state.token, nil)
+	envelope = decodeEnvelope(t, status, header, body)
+	if status != http.StatusOK {
+		t.Fatalf("cancel status = %d, body = %s", status, body)
+	}
+	select {
+	case id := <-state.controller.cancelled:
+		if id != "api-submitted" {
+			t.Fatalf("controller cancelled %q", id)
+		}
+	default:
+		t.Fatal("controller did not receive the cancellation")
+	}
+}
+
+func TestEventStreamReplaysPersistedEventsWithCursor(t *testing.T) {
+	state := newTestState(t)
+	eventID, err := state.store.AppendTaskEvent("api-running", "task_finished", map[string]any{"status": "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(state.newServer(t))
+	defer httpServer.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	response, reader := openEventStream(t, client, httpServer.URL, "api-running", state.token)
+	snapshot := readSSEEvent(t, reader)
+	if snapshot.name != "snapshot" {
+		t.Fatalf("unexpected snapshot event: %#v", snapshot)
+	}
+	event := readSSEEvent(t, reader)
+	if event.id != strconv.FormatInt(eventID, 10) || event.name != "task_finished" {
+		t.Fatalf("unexpected replayed event: %#v", event)
+	}
+	_ = response.Body.Close()
+
+	req, err := http.NewRequest(http.MethodGet,
+		httpServer.URL+"/v1/tasks/api-running/events?cursor="+strconv.FormatInt(eventID, 10), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+state.token)
+	response, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("cursor stream status = %d", response.StatusCode)
+	}
+	reader = bufio.NewReader(response.Body)
+	_ = readSSEEvent(t, reader)
+	state.controller.publish(persistence.TaskEvent{
+		ID: eventID + 1, TaskID: "api-running", Type: "live_event",
+		Payload: json.RawMessage(`{"ok":true}`),
+	})
+	live := readSSEEvent(t, reader)
+	if live.id != strconv.FormatInt(eventID+1, 10) || live.name != "live_event" {
+		t.Fatalf("unexpected live event: %#v", live)
+	}
 }

@@ -78,9 +78,9 @@ Store large artifacts in CRANE-managed files when appropriate. Validate managed 
 
 ## Desktop client boundary
 
-The optional desktop application is located at `apps/desktop` and uses Electron + React/TypeScript. Electron main-process privileges are isolated from the renderer. Context isolation, sandboxing and web security are enabled; Node integration is disabled. The preload bridge exposes only `getAppInfo`, `getHealth`, `getTasks` and `getTask`. The renderer cannot read SQLite, access arbitrary filesystem paths, launch shell commands, receive the installation token, or issue arbitrary HTTP requests.
+The optional desktop application is located at `apps/desktop` and uses Electron + React/TypeScript. Electron main-process privileges are isolated from the renderer. Context isolation, sandboxing and web security are enabled; Node integration is disabled. The preload bridge exposes only `getAppInfo`, `getHealth`, `getTasks`, `getTask`, `submitTask`, `cancelTask` and `subscribeTaskEvents`. The renderer cannot read SQLite, access arbitrary filesystem paths, launch shell commands, receive the installation token, or issue arbitrary HTTP requests. Event subscriptions are stream-ID bound and unsubscribed when their channel is destroyed.
 
-The main process reads the protected token through the trusted `agent api-token` command, caches it in memory, retries once with a fresh token after `401`, and calls only the fixed loopback API. The desktop client reports real health, persisted tasks, task details, and explicit disconnected/recovering/error states; it never invents runtime status. Task submission, streaming, MCP servers and approvals remain disabled because the backend API does not expose them. Do not add a cloud relay or telemetry path.
+The main process reads the protected token through the trusted `agent api-token` command, caches it in memory, retries once with a fresh token after `401`, and calls only the fixed loopback API. The desktop client reports real health, persisted tasks, task details, submission/cancellation outcomes, replayable live events, and explicit disconnected/recovering/error states; it never invents runtime status. MCP servers and approvals remain unavailable because the backend API does not expose them. Do not add a cloud relay or telemetry path.
 
 ## Local API and IPC
 
@@ -89,9 +89,11 @@ Implemented v1 behavior:
 - The API binds only to `127.0.0.1:8787`. Host configuration and all-interface binding are rejected.
 - Requests require an `Authorization: Bearer <token>` header. The 256-bit token is stored on Windows with DPAPI and verified in constant time.
 - Protected token state is reloaded on every request, so CLI rotation or revocation affects a running server immediately.
-- Only `GET` is accepted. Query strings, unexpected request bodies, transfer-encoded bodies, malformed task IDs and bodies over 1 MiB are rejected.
-- Responses are JSON with `Content-Type: application/json` and `X-Content-Type-Options: nosniff`. Success uses `{"data":...}`; errors use `{"error":{"code":"...","message":"..."}}`.
-- Error codes include `unauthorized`, `bad_request`, `method_not_allowed`, `not_found`, `request_too_large` and `persistence_unavailable`.
+- `GET` is accepted for reads and event streams; `POST` is accepted for task admission and cancellation. Unexpected methods, query strings, request bodies, transfer-encoded bodies, malformed task IDs and bodies over 1 MiB are rejected where they are not part of the endpoint contract.
+- Task admission accepts a strict JSON object `{"id":"...","input":"..."}` with a safe 1–200 character ID and a non-empty input up to 64 KiB. Duplicate IDs are rejected before any task record is created.
+- Cancellation accepts no query string or body and returns the supervisor-confirmed terminal task record.
+- Normal responses are JSON with `Content-Type: application/json` and `X-Content-Type-Options: nosniff`. Success uses `{"data":...}`; errors use `{"error":{"code":"...","message":"..."}}`.
+- Error codes include `unauthorized`, `bad_request`, `method_not_allowed`, `not_found`, `request_too_large`, `persistence_unavailable`, `task_already_exists`, `task_control_unavailable`, `task_admission_unavailable`, `task_cancel_unavailable`, `event_stream_unavailable` and `streaming_unavailable`.
 - Shutdown is bounded and clean. HTTP liveness alone never reports readiness.
 
 Implemented endpoints:
@@ -101,8 +103,11 @@ Implemented endpoints:
 | `GET` | `/v1/health` | API version, supervisor state, separate Python runtime probe, persistence health and overall readiness |
 | `GET` | `/v1/tasks` | Real persisted task records and count |
 | `GET` | `/v1/tasks/{id}` | One real persisted task record |
+| `POST` | `/v1/tasks` | Durable admission; `201` with the queued task, or `409` on duplicate ID |
+| `POST` | `/v1/tasks/{id}/cancel` | Supervisor-confirmed cancellation result |
+| `GET` | `/v1/tasks/{id}/events?cursor=<id>` | Authenticated SSE snapshot followed by persisted/live events; also accepts `Last-Event-ID` |
 
-Raw task input is deliberately omitted from task responses. Task submission, cancellation, event streaming, MCP management and approval operations are not implemented. Do not treat CORS as access control.
+Disconnecting an event stream never cancels a task. Replaying with a cursor returns only event IDs greater than the cursor. Raw task input is deliberately omitted from task responses. MCP management and approval operations are not implemented. Do not treat CORS as access control.
 
 ## CLI contract (implemented and proposed)
 
@@ -145,6 +150,16 @@ Current local paths:
 ```
 
 The broader `config/`, `logs/`, `artifacts/`, `runtimes/`, `downloads/` and `backups/` layout remains proposed. Keep executable/runtime files separate from user data. The installation token uses Windows DPAPI; never store raw secrets in ordinary config files.
+
+Python runtime environment:
+
+| Variable | Purpose |
+|---|---|
+| `CRANE_PYTHON_HOME` | Repository/runtime root used when spawning Python children |
+| `CRANE_PYTHON` | Explicit Python executable override |
+| `CRANE_MODEL_PROVIDER` | `local` (default, deterministic offline facts) or `ollama` |
+| `CRANE_MODEL` | Required local Ollama model name when the provider is `ollama` |
+| `OLLAMA_HOST` | Optional explicit Ollama base URL; no implicit hosted endpoint |
 
 ## Error model
 

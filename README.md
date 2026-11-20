@@ -6,7 +6,7 @@
 
 CRANE accepts a task, coordinates authorized tools, runs a bounded workflow, persists execution state, handles failures, and returns a concise result. It is a local-first execution layer—not a chatbot, RAG product, or dashboard.
 
-> **Project status: early implementation / not production-ready.** The Go CLI can run a supervisor with a fixed loopback API, DPAPI-protected per-installation authentication, real SQLite task reads, and a Python runtime health probe. The optional desktop client reads that real health/task data through a restricted main-process bridge. Durable recovery, full task execution, approval enforcement, MCP lifecycle behavior, Windows packaging, and release readiness remain unverified.
+> **Project status: working vertical slice, not production-ready.** The Go supervisor durably admits tasks, runs bounded Python/LangGraph workflows, confirms cancellation, persists lifecycle/events/checkpoints/results, and streams real events over authenticated SSE. The optional desktop client submits and cancels tasks through the same restricted main-process bridge. Default execution is offline deterministic local mode; Ollama is explicit and only its unavailable-provider failure path was validated in this checkout. MCP server lifecycle, approval enforcement, packaged Python, signed packaging, and release readiness remain unverified.
 
 ## What CRANE is being built to do
 
@@ -67,18 +67,18 @@ This diagram describes the intended component boundaries. It does not imply that
 
 | Component | Present in repository | Current confidence |
 |---|---:|---|
-| Go CLI entry point | Yes | Runs `serve` by default; supports version, token lifecycle and `task create`; full task command set is planned |
-| Go supervisor | Yes | Start/health/state and Python health probe are wired into the CLI; full task/process lifecycle is unverified |
+| Go CLI entry point | Yes | Runs `serve` by default; supports version, token lifecycle and `task create`; the full task command set remains planned |
+| Go supervisor | Yes | Bounded admission, subprocess execution, cancellation, event streaming and restart recovery are wired into the CLI and tested on Windows |
 | Local authentication | Yes | 256-bit token protected by Windows DPAPI; rotation/revocation tested on Windows |
-| Loopback API | Yes | Authenticated `127.0.0.1:8787`; real health/task reads; no mutation or streaming endpoints |
-| Optional desktop client | Yes | Reads real health/tasks through restricted main-process IPC; MCP/approvals remain unavailable |
-| SQLite persistence | Yes | API-safe task records/list/detail are tested; durable workflow recovery is unproven |
-| Go/Python protocol | Yes | Versioned message structures exist; full protocol behavior needs integration tests |
-| Python runtime | Yes | Health probe is implemented; packaged runtime is not available |
+| Loopback API | Yes | Authenticated `127.0.0.1:8787`; health, task list/detail, submit, cancel and cursor-replayable SSE |
+| Optional desktop client | Yes | Submits/cancels tasks and shows live persisted events through restricted main-process IPC; MCP/approvals remain unavailable |
+| SQLite persistence | Yes | Task records/events/checkpoints/results and explicit restart-recovery policies are tested |
+| Go/Python protocol | Yes | Versioned, bounded NDJSON with handshake, submission, cancellation, state, result and error integration coverage |
+| Python runtime | Yes | Runs real LangGraph workflows in a supervisor-owned subprocess; packaged runtime is not available |
 | MCP integration | Yes | Manager, transports, discovery and adapter code exist; live-server behavior needs validation |
-| LangChain adapter | Yes | Present in MCP runtime code; provider configuration is incomplete |
-| LangGraph workflow | Yes | Workflow engine and typed state exist; full execution/recovery guarantees are unverified |
-| Ollama provider | Not yet integrated | Planned |
+| LangChain adapter | Yes | MCP adapter and explicit local/Ollama provider policy exist; no silent hosted fallback |
+| LangGraph workflow | Yes | Real `StateGraph` execution, checkpoints and bounded steps are exercised; MCP/approval nodes remain unavailable |
+| Ollama provider | Implemented (not fully validated) | `langchain-ollama` is not installed in the validated environment; only the explicit unavailable-provider failure path was tested |
 | Installer / signed releases | No | Not available |
 | Production Windows release | No | Acceptance testing and packaging remain |
 
@@ -86,15 +86,14 @@ Do not interpret source presence or a passing unit test as proof of a complete p
 
 ## Current development state
 
-The project has an implemented supervisor/API/desktop read path. The next engineering work should prioritize correctness at the remaining execution boundaries:
+The project now has an end-to-end supervisor/API/desktop task path backed by real Python execution. The next engineering work should prioritize the remaining safety and production boundaries:
 
-1. Connect persisted tasks to real LangGraph execution through the Go/Python protocol.
-2. Validate the Go/Python protocol in a real subprocess.
-3. Prove SQLite checkpoint persistence and process-restart restoration with a behavioral integration test.
-4. Validate MCP connections and tool invocation against local test servers.
-5. Verify approval, cancellation, timeout, and side-effect recovery behavior.
-6. Add and validate local model-provider integration (Ollama) only after the runtime path is reliable.
-7. Package and test the complete application on Windows before calling it installable.
+1. Validate MCP connections and tool invocation against local test servers.
+2. Implement and verify exact-action approval persistence, denial and restart behavior.
+3. Verify timeouts, concurrency saturation, side-effect ambiguity and cancellation under real MCP tools.
+4. Install and validate the pinned Ollama provider dependency against a local model; no fallback is permitted.
+5. Add a reproducible pinned Python environment and packaged runtime.
+6. Package and test the complete application on Windows before calling it installable.
 
 ## Build and validation
 
@@ -107,9 +106,18 @@ go version
 go build ./...
 go vet ./...
 go test ./...
+python -m compileall -q crane
+python -m crane.python_runtime --health
 ```
 
-These are validation commands, not a claim that the current repository passes them. Run them on the current checkout and report their actual results. Python dependencies are not yet documented in a committed lock/requirements file, so a reproducible Python installation workflow is still outstanding.
+Desktop checks from `apps/desktop`:
+
+```powershell
+npm run typecheck
+npm run build
+```
+
+These checks were run on Windows 11 x64 on 2026-11-20 and passed for the current task path; exact commands and results are recorded in [PROJECT_TRACKER.md](PROJECT_TRACKER.md). This is not a claim of release acceptance. Python dependencies are not yet documented in a committed lock/requirements file, so a reproducible Python installation workflow is still outstanding.
 
 The current executable supports these development commands:
 
@@ -152,9 +160,9 @@ The full task-oriented CLI contract is still under development. Do not treat pro
 
 ## Optional desktop workspace
 
-The optional [desktop client](apps/desktop/README.md) is an Electron + React workspace for observing executions and local runtime health. It stays separate from the Go/Python execution core, so the CLI remains fully usable without it.
+The optional [desktop client](apps/desktop/README.md) is an Electron + React workspace for submitting, cancelling and observing executions and local runtime health. It stays separate from the Go/Python execution core, so the CLI remains fully usable without it.
 
-The current client reads real health, persisted tasks and task details from the authenticated loopback API. The Electron main process owns token retrieval and API access; the renderer receives only narrow health/task data through the preload bridge. MCP servers, approvals and task submission remain explicitly unavailable because the backend API does not expose them. The client keeps its dark-first theme and the CRANE mark in both dark and light themes, and it never fabricates runtime state.
+The current client reads real health, persisted tasks and task details, submits and cancels tasks, and displays live persisted events from the authenticated loopback API. The Electron main process owns token retrieval, API and stream lifecycle; the renderer receives only narrow typed methods through the preload bridge and never receives the token or arbitrary HTTP access. MCP servers and approvals remain explicitly unavailable because the backend API does not expose them. The client keeps its dark-first theme and the CRANE mark in both dark and light themes, and it never fabricates runtime state.
 
 ## Contributing
 

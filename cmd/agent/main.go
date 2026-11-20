@@ -67,7 +67,7 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	api, err := localapi.NewServer(auth, sup.Store(), func() localapi.RuntimeStatus {
 		available, detail := sup.RuntimeAvailable()
 		return localapi.RuntimeStatus{Available: available, Detail: detail}
-	}, sup.IsRunning)
+	}, sup.IsRunning, sup)
 	if err != nil {
 		return err
 	}

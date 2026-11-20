@@ -2,11 +2,13 @@ package persistence
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -33,7 +35,13 @@ func DBPath() string {
 // ErrTaskNotFound is returned when a task ID has no persisted record.
 var ErrTaskNotFound = errors.New("task not found")
 
-const maxTaskIDLength = 200
+// ErrDuplicateTask is returned when admissions reuse a stable task identifier.
+var ErrDuplicateTask = errors.New("task already exists")
+
+const (
+	maxTaskIDLength  = 200
+	maxEventsPerTask = 1000
+)
 
 // ValidTaskID restricts task IDs to a safe, portable character set shared by
 // the CLI, persistence boundary and local API paths.
@@ -71,6 +79,15 @@ type TaskRecord struct {
 	WorkflowRef   string `json:"workflow_ref,omitempty"`
 	HasCheckpoint bool   `json:"has_checkpoint"`
 	SchemaVersion string `json:"schema_version,omitempty"`
+}
+
+// TaskEvent is an API-safe, persisted lifecycle or workflow event.
+type TaskEvent struct {
+	ID        int64           `json:"id"`
+	TaskID    string          `json:"task_id"`
+	Timestamp string          `json:"timestamp"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload"`
 }
 
 // NewStore opens the database at path and initializes the schema.
@@ -205,6 +222,9 @@ func (s *Store) CreateTask(id, status, input string) (string, error) {
 		id, now, status, input,
 	)
 	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
+			return "", ErrDuplicateTask
+		}
 		return "", fmt.Errorf("create task %q: %w", id, err)
 	}
 	return id, nil
@@ -335,7 +355,7 @@ func (s *Store) UpdateTaskStatus(id, status string) error {
 		query = "UPDATE tasks SET status = ?, started_at = COALESCE(started_at, ?) WHERE id = ?"
 	case "succeeded", "failed", "cancelled":
 		query = "UPDATE tasks SET status = ?, completed_at = ? WHERE id = ?"
-	case "queued", "running", "waiting_approval":
+	case "queued", "running", "waiting_approval", "cancelling":
 		query = "UPDATE tasks SET status = ? WHERE id = ?"
 		if _, err := s.db.Exec(query, status, id); err != nil {
 			return fmt.Errorf("update task %q status: %w", id, err)
@@ -429,4 +449,175 @@ func (s *Store) GetLatestTaskState(taskID string) ([]byte, bool) {
 		return nil, false
 	}
 	return []byte(snapshot.String), true
+}
+
+// LatestCheckpointVersion returns the newest durable checkpoint version.
+func (s *Store) LatestCheckpointVersion(taskID string) (int, bool) {
+	var version sql.NullInt64
+	err := s.db.QueryRow(
+		"SELECT MAX(version) FROM checkpoints WHERE task_id = ?", taskID,
+	).Scan(&version)
+	if err != nil || !version.Valid {
+		return 0, false
+	}
+	return int(version.Int64), true
+}
+
+// AppendTaskEvent durably records one safe lifecycle event and bounds the
+// retained event history for each task.
+func (s *Store) AppendTaskEvent(taskID, eventType string, payload any) (int64, error) {
+	if !ValidTaskID(taskID) {
+		return 0, errors.New("invalid task identifier")
+	}
+	if eventType == "" || strings.ContainsAny(eventType, "\r\n") {
+		return 0, errors.New("invalid event type")
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("encode task event: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.Exec(
+		"INSERT INTO task_events (task_id, timestamp, type, payload) VALUES (?, ?, ?, ?)",
+		taskID, now, eventType, string(encoded),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("append task event: %w", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("read task event identifier: %w", err)
+	}
+	if _, err := s.db.Exec(`
+		DELETE FROM task_events
+		WHERE task_id = ? AND id NOT IN (
+			SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT ?
+		)`, taskID, taskID, maxEventsPerTask); err != nil {
+		return 0, fmt.Errorf("bound task event history: %w", err)
+	}
+	return id, nil
+}
+
+// GetTaskEventsAfter returns persisted events newer than a cursor.
+func (s *Store) GetTaskEventsAfter(taskID string, after int64, limit int) ([]TaskEvent, error) {
+	if limit <= 0 || limit > maxEventsPerTask {
+		limit = maxEventsPerTask
+	}
+	rows, err := s.db.Query(`
+		SELECT id, task_id, timestamp, type, COALESCE(payload, '{}')
+		FROM task_events WHERE task_id = ? AND id > ? ORDER BY id ASC LIMIT ?`,
+		taskID, after, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list task events: %w", err)
+	}
+	defer rows.Close()
+	events := make([]TaskEvent, 0)
+	for rows.Next() {
+		var event TaskEvent
+		var payload string
+		if err := rows.Scan(&event.ID, &event.TaskID, &event.Timestamp, &event.Type, &payload); err != nil {
+			return nil, fmt.Errorf("scan task event: %w", err)
+		}
+		event.Payload = json.RawMessage(payload)
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate task events: %w", err)
+	}
+	return events, nil
+}
+
+// TransitionTask atomically changes status when its current status is allowed.
+func (s *Store) TransitionTask(id, to string, from ...string) (bool, error) {
+	if len(from) == 0 {
+		return false, errors.New("transition requires at least one source status")
+	}
+	placeholders := make([]string, len(from))
+	args := make([]any, 0, len(from)+2)
+	args = append(args, to, id)
+	for i, status := range from {
+		placeholders[i] = "?"
+		args = append(args, status)
+	}
+	query := fmt.Sprintf(
+		"UPDATE tasks SET status = ? WHERE id = ? AND status IN (%s)",
+		strings.Join(placeholders, ","),
+	)
+	result, err := s.db.Exec(query, args...)
+	if err != nil {
+		return false, fmt.Errorf("transition task %q: %w", id, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read transition result: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// CompleteTask persists a terminal status, result and error atomically.
+func (s *Store) CompleteTask(id, status, result, taskError string) error {
+	switch status {
+	case "succeeded", "failed", "cancelled":
+	default:
+		return fmt.Errorf("unsupported terminal status %q", status)
+	}
+	_, err := s.db.Exec(
+		"UPDATE tasks SET status = ?, result = ?, error = ?, completed_at = ? WHERE id = ?",
+		status, nullableString(result), nullableString(taskError),
+		time.Now().UTC().Format(time.RFC3339Nano), id,
+	)
+	if err != nil {
+		return fmt.Errorf("complete task %q: %w", id, err)
+	}
+	return s.requireTask(id)
+}
+
+func nullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+// SetTaskWorkflowRef records the Python runtime identity that executed a task.
+func (s *Store) SetTaskWorkflowRef(id, ref string) error {
+	_, err := s.db.Exec("UPDATE tasks SET workflow_ref = ? WHERE id = ?", ref, id)
+	if err != nil {
+		return fmt.Errorf("set workflow reference for task %q: %w", id, err)
+	}
+	return s.requireTask(id)
+}
+
+// ListTasksByStatus returns API-safe records in any of the supplied statuses.
+func (s *Store) ListTasksByStatus(statuses ...string) ([]TaskRecord, error) {
+	if len(statuses) == 0 {
+		return []TaskRecord{}, nil
+	}
+	placeholders := make([]string, len(statuses))
+	args := make([]any, len(statuses))
+	for i, status := range statuses {
+		placeholders[i] = "?"
+		args[i] = status
+	}
+	rows, err := s.db.Query(fmt.Sprintf(`
+		SELECT id, COALESCE(created_at, ''), COALESCE(status, ''), COALESCE(input, '')
+		FROM tasks WHERE status IN (%s) ORDER BY created_at ASC, id ASC`, strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list tasks by status: %w", err)
+	}
+	defer rows.Close()
+	records := make([]TaskRecord, 0)
+	for rows.Next() {
+		var record TaskRecord
+		var input string
+		if err := rows.Scan(&record.ID, &record.CreatedAt, &record.Status, &input); err != nil {
+			return nil, fmt.Errorf("scan recoverable task: %w", err)
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate recoverable tasks: %w", err)
+	}
+	return records, nil
 }

@@ -3,6 +3,9 @@ const path = require("node:path");
 const runtime = require("./runtime-client.cjs");
 
 const isDevelopment = !app.isPackaged;
+const STREAM_ID_PATTERN = /^stream-\d+$/;
+const eventStreams = new Map();
+let nextStreamId = 1;
 
 function createWindow() {
   const window = new BrowserWindow({
@@ -40,18 +43,29 @@ function createWindow() {
   }
 }
 
+function errorResult(error) {
+  return {
+    ok: false,
+    error: {
+      message: error instanceof Error ? error.message : "Runtime request failed",
+      kind: error && error.kind ? error.kind : "error",
+    },
+  };
+}
+
 async function invoke(action) {
   try {
     return { ok: true, data: await action() };
   } catch (error) {
-    return {
-      ok: false,
-      error: {
-        message: error instanceof Error ? error.message : "Runtime request failed",
-        kind: error && error.kind ? error.kind : "error",
-      },
-    };
+    return errorResult(error);
   }
+}
+
+function stopEventStream(streamId) {
+  const stream = eventStreams.get(streamId);
+  if (!stream) return;
+  eventStreams.delete(streamId);
+  stream.abort();
 }
 
 ipcMain.handle("crane:app-info", () => ({
@@ -62,6 +76,40 @@ ipcMain.handle("crane:app-info", () => ({
 ipcMain.handle("crane:health", () => invoke(() => runtime.getHealth()));
 ipcMain.handle("crane:tasks", () => invoke(() => runtime.getTasks()));
 ipcMain.handle("crane:task", (_event, id) => invoke(() => runtime.getTask(id)));
+ipcMain.handle("crane:task-submit", (_event, id, input) => invoke(() => runtime.submitTask(id, input)));
+ipcMain.handle("crane:task-cancel", (_event, id) => invoke(() => runtime.cancelTask(id)));
+
+ipcMain.handle("crane:task-events-subscribe", async (event, id, cursor) => {
+  try {
+    const sender = event.sender;
+    const streamId = `stream-${nextStreamId++}`;
+    const stream = await runtime.subscribeTaskEvents(
+      id,
+      cursor,
+      (payload) => {
+        if (!sender.isDestroyed()) sender.send(`crane:task-event:${streamId}`, payload);
+      },
+      (error) => {
+        if (!sender.isDestroyed()) {
+          sender.send(`crane:task-event-error:${streamId}`, errorResult(error).error);
+        }
+      },
+    );
+    eventStreams.set(streamId, stream);
+    sender.once("destroyed", () => stopEventStream(streamId));
+    return { ok: true, data: { streamId } };
+  } catch (error) {
+    return errorResult(error);
+  }
+});
+
+ipcMain.handle("crane:task-events-unsubscribe", (_event, streamId) => {
+  if (typeof streamId !== "string" || !STREAM_ID_PATTERN.test(streamId)) {
+    return errorResult(new Error("Invalid event stream identifier"));
+  }
+  stopEventStream(streamId);
+  return { ok: true, data: { stopped: true } };
+});
 
 app.whenReady().then(() => {
   createWindow();
@@ -71,5 +119,6 @@ app.whenReady().then(() => {
 });
 
 app.on("window-all-closed", () => {
+  for (const streamId of [...eventStreams.keys()]) stopEventStream(streamId);
   if (process.platform !== "darwin") app.quit();
 });
