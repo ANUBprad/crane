@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"crane/persistence"
@@ -25,21 +27,126 @@ type Supervisor struct {
 	shutdownTimeout time.Duration
 	// store is the SQLite persistence layer.
 	store *persistence.Store
+	// started records whether supervisor-owned work may be coordinated.
+	started atomic.Bool
 }
 
-// New creates a new Supervisor with default configuration.
+const runtimeProbeTimeout = 4 * time.Second
+
+// New creates a new Supervisor with the default per-user persistence store.
 func New() *Supervisor {
 	store, err := persistence.NewStore(persistence.DBPath())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to initialize SQLite store: %v\n", err)
 		store = nil
 	}
-	return &Supervisor{
-		// pythonRuntimePath: "",
-		// pythonArgs:        []string{},
-		// shutdownTimeout:   10 * time.Second,
-		store: store,
+	return NewWithStore(store)
+}
+
+// NewWithStore creates a Supervisor around an existing store. It exists so the
+// API and CLI can share one persistence connection.
+func NewWithStore(store *persistence.Store) *Supervisor {
+	return &Supervisor{store: store, shutdownTimeout: 10 * time.Second}
+}
+
+// Start verifies supervisor-owned components and marks the supervisor ready.
+func (s *Supervisor) Start() error {
+	if s == nil || s.store == nil {
+		return errors.New("supervisor persistence store is not initialized")
 	}
+	if err := s.store.HealthCheck(); err != nil {
+		return fmt.Errorf("supervisor store health check: %w", err)
+	}
+	s.started.Store(true)
+	return nil
+}
+
+// IsRunning reports whether the supervisor completed startup and has not
+// begun shutdown. The local API uses it for health, not mere HTTP liveness.
+func (s *Supervisor) IsRunning() bool {
+	return s != nil && s.started.Load()
+}
+
+// Store returns the supervisor-owned persistence store.
+func (s *Supervisor) Store() *persistence.Store {
+	if s == nil {
+		return nil
+	}
+	return s.store
+}
+
+// SetPythonRuntime overrides the Python executable used for health probes.
+func (s *Supervisor) SetPythonRuntime(path string) {
+	if s != nil {
+		s.pythonRuntimePath = path
+	}
+}
+
+// RuntimeAvailable probes the Python agent runtime through its health command.
+// It returns a short, non-sensitive detail suitable for local API responses.
+func (s *Supervisor) RuntimeAvailable() (bool, string) {
+	if !s.IsRunning() {
+		return false, "supervisor is not running"
+	}
+	candidates := []string{s.pythonRuntimePath}
+	if s.pythonRuntimePath == "" {
+		if configured := os.Getenv("CRANE_PYTHON"); configured != "" {
+			candidates = []string{configured}
+		} else {
+			candidates = []string{"python", "py"}
+		}
+	}
+
+	for _, runtimePath := range candidates {
+		if runtimePath == "" {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), runtimeProbeTimeout)
+		cmd := exec.CommandContext(ctx, runtimePath, "-m", "crane.python_runtime", "--health")
+		if home := os.Getenv("CRANE_PYTHON_HOME"); home != "" {
+			cmd.Dir = home
+		}
+		output, err := cmd.Output()
+		cancel()
+		if err != nil {
+			continue
+		}
+		var response struct {
+			Protocol      string `json:"protocol"`
+			Status        string `json:"status"`
+			Version       string `json:"version"`
+			PythonVersion string `json:"python_version"`
+		}
+		if json.Unmarshal(output, &response) != nil {
+			return false, "python runtime returned an invalid health response"
+		}
+		if response.Status != "healthy" || response.Version != python_protocol.ProtocolVersion ||
+			response.Protocol != "crane-agent/"+python_protocol.ProtocolVersion {
+			return false, "python runtime health check did not pass"
+		}
+		detail := "Python"
+		if response.PythonVersion != "" {
+			detail += " " + response.PythonVersion
+		}
+		return true, detail
+	}
+	return false, "python runtime is unavailable"
+}
+
+// HealthCheck verifies that the supervisor is running and its store responds.
+func (s *Supervisor) HealthCheck() error {
+	if !s.IsRunning() {
+		return errors.New("supervisor is not running")
+	}
+	return s.store.HealthCheck()
+}
+
+// Close releases supervisor-owned persistence resources.
+func (s *Supervisor) Close() error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	return s.store.Close()
 }
 
 // launchPythonRuntime launches the Python runtime child process and
@@ -114,19 +221,19 @@ func (s *Supervisor) launchPythonRuntime() error {
 			// using the task_state message type so the Python process
 			// can capture it during startup.
 			msg := map[string]interface{}{
-				"version": python_protocol.ProtocolVersion,
-				"type":    "task_state",
-				"task_id": taskId,
-				"state":   state.State,
-				"current_step": state.CurrentStep,
-				"graph_steps": state.GraphSteps,
-				"wall_clock_ms": state.WallClockMs,
-				"result": state.Result,
-				"result_summary": state.ResultSummary,
-				"failure_reason": state.FailureReason,
-				"cancelled": state.Cancelled,
+				"version":           python_protocol.ProtocolVersion,
+				"type":              "task_state",
+				"task_id":           taskId,
+				"state":             state.State,
+				"current_step":      state.CurrentStep,
+				"graph_steps":       state.GraphSteps,
+				"wall_clock_ms":     state.WallClockMs,
+				"result":            state.Result,
+				"result_summary":    state.ResultSummary,
+				"failure_reason":    state.FailureReason,
+				"cancelled":         state.Cancelled,
 				"approval_decision": state.ApprovalDecision,
-				"approval_id": state.ApprovalId,
+				"approval_id":       state.ApprovalId,
 			}
 			data, _ := json.Marshal(msg)
 			// Send via stdin pipe before workflow begins
@@ -309,10 +416,14 @@ func (s *Supervisor) RequestShutdown() error {
 	return nil
 }
 
-// HealthCheck performs a basic health check of supervisor components.
+// HealthCheck performs a basic health check of the default supervision store.
 func HealthCheck() error {
-	// TODO: implement component health checks
-	return nil
+	store, err := persistence.NewStore(persistence.DBPath())
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	return store.HealthCheck()
 }
 
 // Version returns the current supervisor version.
@@ -322,5 +433,10 @@ func Version() string {
 
 // Stop performs graceful shutdown of the supervisor.
 func (s *Supervisor) Stop() {
+	if s == nil {
+		return
+	}
+	s.started.Store(false)
+	_ = s.RequestShutdown()
 	fmt.Println("CRANE supervisor stopping")
 }

@@ -2,8 +2,11 @@ package supervisor
 
 import (
 	"encoding/json"
+	"os/exec"
+	"path/filepath"
 	"testing"
 
+	"crane/persistence"
 	"crane/python_protocol"
 )
 
@@ -47,12 +50,12 @@ func TestPersistentState_jsonMarshalUnmarshal(t *testing.T) {
 			Version: python_protocol.ProtocolVersion,
 			Type:    python_protocol.TypeTaskState,
 		},
-		TaskId:       "test-struct-1",
-		State:        "running",
-		CurrentStep:  "initialization",
-		GraphSteps:   0,
-		WallClockMs:  0,
-		Cancelled:    false,
+		TaskId:      "test-struct-1",
+		State:       "running",
+		CurrentStep: "initialization",
+		GraphSteps:  0,
+		WallClockMs: 0,
+		Cancelled:   false,
 	}
 	data, err := json.Marshal(state)
 	if err != nil {
@@ -74,6 +77,49 @@ func TestPersistentState_jsonMarshalUnmarshal(t *testing.T) {
 
 // TestLaunchPythonRuntimeStructure verifies the launchPythonRuntime function
 // has the correct structure for protocol message handling.
+func TestSupervisorLifecycleAndRuntimeProbe(t *testing.T) {
+	store, err := persistence.NewStore(filepath.Join(t.TempDir(), "crane.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor := NewWithStore(store)
+	defer supervisor.Close()
+	if supervisor.IsRunning() {
+		t.Fatal("supervisor reported running before Start()")
+	}
+	if err := supervisor.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if !supervisor.IsRunning() {
+		t.Fatal("supervisor did not report running after Start()")
+	}
+	if err := supervisor.HealthCheck(); err != nil {
+		t.Fatalf("HealthCheck() error = %v", err)
+	}
+
+	if _, err := exec.LookPath("python"); err != nil {
+		t.Skip("python is not available on PATH")
+	}
+	root, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CRANE_PYTHON_HOME", root)
+	t.Setenv("CRANE_PYTHON", "python")
+	available, detail := supervisor.RuntimeAvailable()
+	if !available || detail == "" {
+		t.Fatalf("RuntimeAvailable() = %v, %q", available, detail)
+	}
+
+	supervisor.Stop()
+	if supervisor.IsRunning() {
+		t.Fatal("supervisor still reported running after Stop()")
+	}
+	if err := supervisor.HealthCheck(); err == nil {
+		t.Fatal("HealthCheck() succeeded after Stop()")
+	}
+}
+
 func TestLaunchPythonRuntimeStructure(t *testing.T) {
 	s := New()
 	if s == nil {

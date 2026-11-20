@@ -53,6 +53,7 @@ type Server struct {
 	httpSrv    *http.Server
 	listener   net.Listener
 	serveErr   chan error
+	serveDone  chan error
 }
 
 // DefaultPort is the fixed loopback port used by the supervisor and desktop
@@ -113,6 +114,7 @@ func NewServer(
 		runtime:    runtime,
 		supervisor: supervisor,
 		serveErr:   make(chan error, 1),
+		serveDone:  make(chan error, 1),
 	}, nil
 }
 
@@ -137,11 +139,19 @@ func (s *Server) Start(port int) error {
 	}
 	s.listener = listener
 	go func() {
-		if err := s.httpSrv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		err := s.httpSrv.Serve(listener)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			select {
 			case s.serveErr <- err:
 			default:
 			}
+		}
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		select {
+		case s.serveDone <- err:
+		default:
 		}
 	}()
 	return nil
@@ -164,6 +174,10 @@ func (s *Server) ServeErr() error {
 		return nil
 	}
 }
+
+// Done reports when the HTTP server has stopped. It yields nil after a clean
+// shutdown and a non-nil error after an unexpected serve failure.
+func (s *Server) Done() <-chan error { return s.serveDone }
 
 // Shutdown stops accepting requests and closes the listener.
 func (s *Server) Shutdown() error {

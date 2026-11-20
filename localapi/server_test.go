@@ -398,6 +398,9 @@ func TestLifecycleShutdownAndAuthenticationAfterRestart(t *testing.T) {
 	if err := server.ServeErr(); err != nil {
 		t.Fatalf("ServeErr() after clean shutdown = %v", err)
 	}
+	if err := <-server.Done(); err != nil {
+		t.Fatalf("Done() after clean shutdown = %v", err)
+	}
 
 	// Simulate a supervisor restart against the same protected token and DB.
 	auth, err := localauth.NewManager(state.auth.Path())
