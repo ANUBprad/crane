@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($env:CRANE_SKIP_PATH_UPDATE -eq '1') { $SkipPathUpdate = $true }
 
 function Write-Step([string]$message) {
     Write-Host "CRANE uninstall: $message"
