@@ -644,18 +644,11 @@ func runUpdate(args []string, stdout, stderr io.Writer) error {
 	if strings.TrimSpace(*source) == "" {
 		return errors.New("update requires -source or CRANE_RELEASE_SOURCE")
 	}
-	script, err := lifecycleScript("install.ps1")
-	if err != nil {
-		return err
-	}
-	params := []string{
-		"-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive",
-		"-File", script, "-Action", "Update", "-ReleaseSource", *source,
-	}
+	extra := []string{"-Action", "Update", "-ReleaseSource", *source}
 	if *targetVersion != "" {
-		params = append(params, "-Version", *targetVersion)
+		extra = append(extra, "-Version", *targetVersion)
 	}
-	return runLifecycleScript(params, stdout, stderr)
+	return runLifecycleScript("install.ps1", extra, stdout, stderr)
 }
 
 func runUninstall(args []string, stdout, stderr io.Writer) error {
@@ -675,15 +668,11 @@ func runUninstall(args []string, stdout, stderr io.Writer) error {
 	if *removeData && *confirmation != "REMOVE-CRANE-DATA" {
 		return errors.New("--remove-data requires --confirm REMOVE-CRANE-DATA")
 	}
-	script, err := lifecycleScript("uninstall.ps1")
-	if err != nil {
-		return err
-	}
-	params := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-File", script}
+	extra := []string{}
 	if *removeData {
-		params = append(params, "-RemoveData", "-Confirm", "REMOVE-CRANE-DATA")
+		extra = append(extra, "-RemoveData", "-Confirm", "REMOVE-CRANE-DATA")
 	}
-	return runLifecycleScript(params, stdout, stderr)
+	return runLifecycleScript("uninstall.ps1", extra, stdout, stderr)
 }
 
 func lifecycleScript(name string) (string, error) {
@@ -698,15 +687,50 @@ func lifecycleScript(name string) (string, error) {
 	return path, nil
 }
 
-func runLifecycleScript(params []string, stdout, stderr io.Writer) error {
+func runLifecycleScript(name string, extra []string, stdout, stderr io.Writer) error {
 	executable, err := powershellExecutable()
 	if err != nil {
 		return err
 	}
+	script, err := lifecycleScript(name)
+	if err != nil {
+		return err
+	}
+	temporaryDirectory, err := os.MkdirTemp("", "crane-lifecycle-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(temporaryDirectory)
+
+	contents, err := os.ReadFile(script)
+	if err != nil {
+		return err
+	}
+	temporaryScript := filepath.Join(temporaryDirectory, filepath.Base(script))
+	if err := os.WriteFile(temporaryScript, contents, 0700); err != nil {
+		return err
+	}
+
+	params := []string{
+		"-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive",
+		"-File", temporaryScript,
+	}
+	params = append(params, extra...)
 	cmd := exec.Command(executable, params...)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Stdin = nil
+
+	details := runtimeenv.Discover()
+	prefix := "CRANE_INSTALL_ROOT="
+	environment := make([]string, 0, len(os.Environ())+1)
+	for _, entry := range os.Environ() {
+		if strings.EqualFold(strings.SplitN(entry, "=", 2)[0], "CRANE_INSTALL_ROOT") {
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	cmd.Env = append(environment, prefix+details.InstallRoot)
 	return cmd.Run()
 }
 
