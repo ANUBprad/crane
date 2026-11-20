@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$ReleaseRoot = (Join-Path (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path 'build\release')
+    [string]$ReleaseRoot = (Join-Path (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path 'build\release'),
+    [switch]$MinimalEnvironment
 )
 
 # Isolated Windows acceptance harness. It temporarily changes the process
@@ -38,6 +39,24 @@ function Invoke-Native([string]$file, [string[]]$arguments) {
 }
 
 try {
+    $originalProcessPath = $env:Path
+    $processPathBaseline = $env:Path
+    if ($MinimalEnvironment) {
+        $minimalParts = @(
+            (Join-Path $env:WINDIR 'System32'),
+            $env:WINDIR,
+            (Join-Path $env:WINDIR 'System32\Wbem'),
+            (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0')
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_) }
+        $env:Path = ($minimalParts -join ';')
+        $processPathBaseline = $env:Path
+        foreach ($tool in @('go', 'python', 'node', 'npm')) {
+            $found = Get-Command $tool -ErrorAction SilentlyContinue
+            Assert-Step ($null -eq $found) "Minimal environment does not expose $tool on PATH"
+        }
+        Write-Result 'Minimal-environment mode: packaged acceptance is running without go/python/node/npm on PATH'
+    }
+
     $release010 = Join-Path $ReleaseRoot '0.1.0'
     $release011 = Join-Path $ReleaseRoot '0.1.1'
     Assert-Step (Test-Path -LiteralPath (Join-Path $release010 'release-manifest.json')) 'Release 0.1.0 manifest exists'
@@ -206,7 +225,7 @@ try {
     finally { $env:LOCALAPPDATA = $savedLocal }
 
     $originalUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $originalProcessPath = $env:Path
+    $pathProcessBeforePathTest = $env:Path
     $pathTestRoot = Join-Path $testRoot 'Programs\PathTest'
     $pathEntry = Join-Path $pathTestRoot 'bin'
     try {
@@ -223,8 +242,15 @@ try {
     }
     finally {
         [Environment]::SetEnvironmentVariable('Path', $originalUserPath, 'User')
-        $env:Path = $originalProcessPath
+        $env:Path = $pathProcessBeforePathTest
         $env:CRANE_SKIP_PATH_UPDATE = '1'
+    }
+
+    if ($MinimalEnvironment) {
+        foreach ($tool in @('go', 'python', 'node', 'npm')) {
+            $found = Get-Command $tool -ErrorAction SilentlyContinue
+            Assert-Step ($null -eq $found) "Packaged lifecycle completed without $tool on PATH"
+        }
     }
 
     Write-Result 'ACCEPTANCE RESULT: ALL ISOLATED CHECKS PASSED'
@@ -235,4 +261,9 @@ catch {
     Write-Result $_.ScriptStackTrace
     Write-Result $_.Exception.Message
     exit 1
+}
+finally {
+    if ($null -ne $originalProcessPath) {
+        $env:Path = $originalProcessPath
+    }
 }

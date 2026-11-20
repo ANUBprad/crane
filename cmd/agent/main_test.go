@@ -158,3 +158,96 @@ func TestDoctorReportsOllamaConfigurationWithoutTaskData(t *testing.T) {
 		t.Fatalf("doctor output exposed task data: %q", out.String())
 	}
 }
+
+func TestWindowsPowerShellLifecycleHostDetection(t *testing.T) {
+	for _, executable := range []string{
+		`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
+		`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`,
+		"powershell.exe",
+		"powershell",
+	} {
+		if !isWindowsPowerShellHost(executable) {
+			t.Fatalf("expected Windows PowerShell host: %q", executable)
+		}
+	}
+	for _, executable := range []string{
+		`C:\Program Files\PowerShell\7\pwsh.exe`,
+		"pwsh",
+		"pwsh.exe",
+	} {
+		if isWindowsPowerShellHost(executable) {
+			t.Fatalf("did not expect Windows PowerShell host: %q", executable)
+		}
+	}
+}
+
+func TestLifecycleEnvironmentDropsPwshModuleStateForWindowsPowerShell(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("LOCALAPPDATA", root)
+	t.Setenv("PSModulePath", `C:\Users\test\Documents\PowerShell\Modules;C:\Program Files\PowerShell\Modules`)
+	t.Setenv("PSHOME", `C:\Program Files\PowerShell\7`)
+	t.Setenv("POWERSHELL_DISTRIBUTION_CHANNEL", "MSI:Windows 10.0")
+
+	environment := lifecycleEnvironment(`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`)
+	values := make(map[string]string, len(environment))
+	for _, entry := range environment {
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) == 2 {
+			values[strings.ToUpper(parts[0])] = parts[1]
+		}
+	}
+	for _, dropped := range []string{"PSMODULEPATH", "PSHOME", "POWERSHELL_DISTRIBUTION_CHANNEL"} {
+		if _, ok := values[dropped]; ok {
+			t.Fatalf("expected %s to be removed for Windows PowerShell lifecycle commands", dropped)
+		}
+	}
+	if values["CRANE_INSTALL_ROOT"] == "" || values["CRANE_INSTALL_ROOT"] == "stale-root" {
+		t.Fatalf("expected CRANE_INSTALL_ROOT to be set to the discovered install root, got %q", values["CRANE_INSTALL_ROOT"])
+	}
+}
+
+func TestLifecycleEnvironmentPreservesPwshModuleStateForPwsh(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("LOCALAPPDATA", root)
+	const modulePath = `C:\Users\test\Documents\PowerShell\Modules;C:\Program Files\PowerShell\Modules`
+	const psHome = `C:\Program Files\PowerShell\7`
+	t.Setenv("PSModulePath", modulePath)
+	t.Setenv("PSHOME", psHome)
+
+	environment := lifecycleEnvironment(`C:\Program Files\PowerShell\7\pwsh.exe`)
+	values := make(map[string]string, len(environment))
+	for _, entry := range environment {
+		parts := strings.SplitN(entry, "=", 2)
+		if len(parts) == 2 {
+			values[strings.ToUpper(parts[0])] = parts[1]
+		}
+	}
+	if values["PSMODULEPATH"] != modulePath {
+		t.Fatalf("expected PSModulePath to be preserved for pwsh, got %q", values["PSMODULEPATH"])
+	}
+	if values["PSHOME"] != psHome {
+		t.Fatalf("expected PSHOME to be preserved for pwsh, got %q", values["PSHOME"])
+	}
+}
+
+func TestWindowsPowerShellLifecycleEnvironmentRestoresBuiltInCmdlets(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows PowerShell is available only on Windows")
+	}
+	executable, err := powershellExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isWindowsPowerShellHost(executable) {
+		t.Skip("Windows PowerShell is not the lifecycle host on this machine")
+	}
+
+	t.Setenv("PSModulePath", `C:\NoSuchPowerShell7\Modules`)
+	t.Setenv("PSHOME", `C:\NoSuchPowerShell7`)
+	command := exec.Command(executable, "-NoProfile", "-NonInteractive", "-Command", `(Get-Command Get-FileHash).Source`)
+	command.Env = lifecycleEnvironment(executable)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Get-FileHash failed in Windows PowerShell lifecycle environment: %v; output = %s", err, output)
+	}
+}

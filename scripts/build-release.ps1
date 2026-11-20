@@ -5,6 +5,7 @@ param(
     [string]$PythonVersion = '3.12.7',
     [string]$PythonEmbedZip = '',
     [string]$Commit = '',
+    [string]$BuildDate = '',
     [string]$GoVersion = ''
 )
 
@@ -60,7 +61,13 @@ if (-not $Commit) {
     $Commit = (& git -C $repoRoot rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Could not read the git commit.' }
 }
-$buildDate = (& git -C $repoRoot show -s --format=%cI HEAD).Trim()
+if (-not $BuildDate) {
+    $BuildDate = (& git -C $repoRoot show -s --format=%cI $Commit).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($BuildDate)) {
+        throw "Could not read the build date for commit $Commit."
+    }
+}
+$buildDate = $BuildDate
 if (-not $GoVersion) {
     $rawGoVersion = (& go version).Trim()
     $GoVersion = ($rawGoVersion -split '\s+')[2]
@@ -103,12 +110,24 @@ if ($LASTEXITCODE -ne 0) { throw 'Packaged Python dependency installation failed
 Write-Step 'Copying CRANE Python application'
 $appDir = Join-Path $stage 'runtime\app\crane'
 New-Item -ItemType Directory -Path $appDir -Force | Out-Null
-foreach ($package in @('python_runtime', 'mcp_runtime')) {
-    Copy-Item -LiteralPath (Join-Path $repoRoot "crane\$package") -Destination (Join-Path $appDir $package) -Recurse -Force
+$trackedAppFiles = & git -C $repoRoot ls-files -- crane/python_runtime crane/mcp_runtime
+if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate tracked CRANE Python application files.' }
+foreach ($relative in $trackedAppFiles) {
+    $normalized = $relative -replace '/', '\'
+    $name = [IO.Path]::GetFileName($normalized)
+    if ($name -eq '_init__.py') { continue }
+    $source = Join-Path $repoRoot $normalized
+    $destination = Join-Path $appDir ($normalized.Substring('crane\'.Length))
+    $destinationDir = Split-Path -LiteralPath $destination -Parent
+    if (-not (Test-Path -LiteralPath $destinationDir)) {
+        New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
+    }
+    Copy-Item -LiteralPath $source -Destination $destination -Force
 }
 Get-ChildItem -LiteralPath $appDir -Recurse -Directory -Filter '__pycache__' | Remove-Item -Recurse -Force
 Get-ChildItem -LiteralPath $appDir -Recurse -File -Filter 'test_*.py' | Remove-Item -Force
 Get-ChildItem -LiteralPath $appDir -Recurse -File -Filter '*.pyc' | Remove-Item -Force
+Get-ChildItem -LiteralPath $appDir -Recurse -File -Filter '_init__.py' | Remove-Item -Force
 
 $installInfo = [ordered]@{
     schema_version = 1
@@ -153,6 +172,12 @@ finally {
 }
 
 Write-Step 'Creating release artifacts'
+$fixedTimestamp = [datetime]'1980-01-01T00:00:00'
+Get-ChildItem -LiteralPath $stage -Recurse -Force | ForEach-Object {
+    $_.CreationTimeUtc = $fixedTimestamp
+    $_.LastWriteTimeUtc = $fixedTimestamp
+    $_.LastAccessTimeUtc = $fixedTimestamp
+}
 Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\install.ps1') -Destination (Join-Path $releaseDir 'install.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\uninstall.ps1') -Destination (Join-Path $releaseDir 'uninstall.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'requirements.lock.txt') -Destination (Join-Path $releaseDir 'python-requirements.lock.txt') -Force

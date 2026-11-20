@@ -720,7 +720,7 @@ func runLifecycleScript(name string, extra []string, stdout, stderr io.Writer) e
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Stdin = nil
-	cmd.Env = lifecycleEnvironment()
+	cmd.Env = lifecycleEnvironment(executable)
 	return cmd.Run()
 }
 
@@ -760,7 +760,7 @@ func startDetachedUninstall(extra []string, stdout io.Writer) error {
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
-	cmd.Env = lifecycleEnvironment()
+	cmd.Env = lifecycleEnvironment(executable)
 	if err := startDetachedCommand(cmd); err != nil {
 		_ = logFile.Close()
 		return err
@@ -770,16 +770,35 @@ func startDetachedUninstall(extra []string, stdout io.Writer) error {
 	return nil
 }
 
-func lifecycleEnvironment() []string {
+func lifecycleEnvironment(executable string) []string {
 	details := runtimeenv.Discover()
+	windowsPowerShell := isWindowsPowerShellHost(executable)
 	environment := make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
-		if strings.EqualFold(strings.SplitN(entry, "=", 2)[0], "CRANE_INSTALL_ROOT") {
+		key := strings.SplitN(entry, "=", 2)[0]
+		if strings.EqualFold(key, "CRANE_INSTALL_ROOT") {
+			continue
+		}
+		if windowsPowerShell && shouldDropForWindowsPowerShell(key) {
 			continue
 		}
 		environment = append(environment, entry)
 	}
 	return append(environment, "CRANE_INSTALL_ROOT="+details.InstallRoot)
+}
+
+func isWindowsPowerShellHost(executable string) bool {
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(executable)))
+	return base == "powershell.exe" || base == "powershell"
+}
+
+func shouldDropForWindowsPowerShell(key string) bool {
+	switch strings.ToUpper(key) {
+	case "PSMODULEPATH", "PSHOME", "POWERSHELL_DISTRIBUTION_CHANNEL":
+		return true
+	default:
+		return false
+	}
 }
 
 func powershellExecutable() (string, error) {
