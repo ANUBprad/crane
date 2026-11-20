@@ -43,6 +43,70 @@ const (
 	maxEventsPerTask = 1000
 )
 
+// mcpSchema is applied as migration 2 to existing and fresh databases.
+const mcpSchema = `
+CREATE TABLE IF NOT EXISTS mcp_servers (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	transport TEXT NOT NULL,
+	command TEXT NOT NULL DEFAULT '',
+	args TEXT NOT NULL DEFAULT '[]',
+	env TEXT NOT NULL DEFAULT '{}',
+	url TEXT NOT NULL DEFAULT '',
+	enabled INTEGER NOT NULL DEFAULT 1,
+	connect_timeout_seconds REAL NOT NULL DEFAULT 10,
+	invocation_timeout_seconds REAL NOT NULL DEFAULT 30,
+	allow_remote_endpoint INTEGER NOT NULL DEFAULT 0,
+	status TEXT NOT NULL DEFAULT 'registered',
+	last_error TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mcp_tools (
+	server_id TEXT NOT NULL,
+	tool_name TEXT NOT NULL,
+	description TEXT NOT NULL DEFAULT '',
+	input_schema TEXT NOT NULL DEFAULT '{}',
+	annotations TEXT NOT NULL DEFAULT '{}',
+	policy_class TEXT NOT NULL DEFAULT 'approval_required',
+	discovered_at TEXT NOT NULL,
+	PRIMARY KEY (server_id, tool_name),
+	FOREIGN KEY (server_id) REFERENCES mcp_servers(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS mcp_invocations (
+	id TEXT PRIMARY KEY,
+	task_id TEXT NOT NULL DEFAULT '',
+	server_id TEXT NOT NULL,
+	server_name TEXT NOT NULL DEFAULT '',
+	tool_name TEXT NOT NULL,
+	arguments TEXT NOT NULL DEFAULT '{}',
+	status TEXT NOT NULL,
+	result TEXT NOT NULL DEFAULT '{}',
+	error TEXT NOT NULL DEFAULT '',
+	policy_decision TEXT NOT NULL DEFAULT '',
+	duration_ms INTEGER NOT NULL DEFAULT 0,
+	created_at TEXT NOT NULL,
+	completed_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_invocations_task ON mcp_invocations(task_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS mcp_approval_requests (
+	id TEXT PRIMARY KEY,
+	task_id TEXT NOT NULL DEFAULT '',
+	server_id TEXT NOT NULL,
+	tool_name TEXT NOT NULL,
+	arguments TEXT NOT NULL DEFAULT '{}',
+	fingerprint TEXT NOT NULL UNIQUE,
+	status TEXT NOT NULL DEFAULT 'pending',
+	requested_at TEXT NOT NULL,
+	expires_at TEXT NOT NULL,
+	decided_at TEXT NOT NULL DEFAULT '',
+	decided_by TEXT NOT NULL DEFAULT '',
+	decision TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_approvals_status ON mcp_approval_requests(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_mcp_approvals_task ON mcp_approval_requests(task_id, status);
+`
+
 // ValidTaskID restricts task IDs to a safe, portable character set shared by
 // the CLI, persistence boundary and local API paths.
 func ValidTaskID(id string) bool {
@@ -187,6 +251,21 @@ func NewStore(path string) (*Store, error) {
 		time.Now().UTC().Format(time.RFC3339Nano),
 	); err != nil {
 		return fail(fmt.Errorf("record initial schema migration: %w", err))
+	}
+	version, err := (&Store{db: db}).MigrationVersion()
+	if err != nil {
+		return fail(err)
+	}
+	if version < 2 {
+		if _, err := db.Exec(mcpSchema); err != nil {
+			return fail(fmt.Errorf("apply MCP schema migration: %w", err))
+		}
+		if _, err := db.Exec(
+			"INSERT OR REPLACE INTO schema_migrations (version, description, applied_at) VALUES (2, 'mcp lifecycle and approvals', ?)",
+			time.Now().UTC().Format(time.RFC3339Nano),
+		); err != nil {
+			return fail(fmt.Errorf("record MCP schema migration: %w", err))
+		}
 	}
 	if err := db.Ping(); err != nil {
 		return fail(fmt.Errorf("SQLite ping: %w", err))

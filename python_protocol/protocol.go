@@ -26,6 +26,8 @@ const (
 	TypeDiscoverTools    = "discover_tools"
 	TypeInvokeTool       = "invoke_tool"
 	TypeToolResult       = "tool_result"
+	TypeMCPCommand       = "mcp_command"
+	TypeMCPResponse      = "mcp_response"
 	TypeTaskState        = "task_state"
 	TypeTaskSubmission   = "task_submission"
 	TypeTaskCancellation = "task_cancellation"
@@ -110,14 +112,75 @@ type InvokeTool struct {
 	Arguments  json.RawMessage `json:"arguments,omitempty"`
 }
 
-// ToolResult is a protocol message returning tool invocation results.
+// ToolResult is the durable outcome of one MCP tool invocation.
 type ToolResult struct {
 	Message
-	ServerName string          `json:"server_name"`
-	ToolName   string          `json:"tool_name"`
-	Success    bool            `json:"success"`
-	Result     json.RawMessage `json:"result,omitempty"`
-	Error      string          `json:"error,omitempty"`
+	TaskID         string          `json:"task_id"`
+	InvocationID   string          `json:"invocation_id"`
+	ServerID       string          `json:"server_id"`
+	ServerName     string          `json:"server_name"`
+	ToolName       string          `json:"tool_name"`
+	Arguments      json.RawMessage `json:"arguments,omitempty"`
+	Result         json.RawMessage `json:"result,omitempty"`
+	Error          string          `json:"error,omitempty"`
+	PolicyDecision string          `json:"policy_decision,omitempty"`
+	DurationMS     int64           `json:"duration_ms,omitempty"`
+	Status         string          `json:"status,omitempty"`
+}
+
+// MCPServerConfigMessage is the validated server configuration sent to the
+// Python MCP daemon. Environment values are included only on this private
+// process boundary and are never written to API responses, logs or events.
+type MCPServerConfigMessage struct {
+	ServerID                 string            `json:"server_id"`
+	Name                     string            `json:"name"`
+	Transport                string            `json:"transport"`
+	Command                  string            `json:"command,omitempty"`
+	Args                     []string          `json:"args,omitempty"`
+	Env                      map[string]string `json:"env,omitempty"`
+	URL                      string            `json:"url,omitempty"`
+	Enabled                  bool              `json:"enabled"`
+	ConnectTimeoutSeconds    float64           `json:"connect_timeout_seconds,omitempty"`
+	InvocationTimeoutSeconds float64           `json:"invocation_timeout_seconds,omitempty"`
+	AllowRemoteEndpoint      bool              `json:"allow_remote_endpoint,omitempty"`
+}
+
+// MCPCommand asks the long-lived Python MCP daemon to perform one lifecycle or
+// invocation operation.
+type MCPCommand struct {
+	Message
+	CommandID string          `json:"command_id"`
+	Operation string          `json:"operation"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+}
+
+// MCPErrorDetail carries a safe, actionable error from Python to Go.
+type MCPErrorDetail struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// MCPResponse answers one MCPCommand.
+type MCPResponse struct {
+	Message
+	CommandID string          `json:"command_id"`
+	Success   bool            `json:"success"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	Error     *MCPErrorDetail `json:"error,omitempty"`
+}
+
+// ToolInvocation records the exact action and decision for an MCP call.
+type ToolInvocation struct {
+	InvocationID   string          `json:"invocation_id"`
+	TaskID         string          `json:"task_id,omitempty"`
+	ServerID       string          `json:"server_id"`
+	ServerName     string          `json:"server_name,omitempty"`
+	ToolName       string          `json:"tool_name"`
+	Arguments      json.RawMessage `json:"arguments"`
+	Status         string          `json:"status"`
+	PolicyDecision string          `json:"policy_decision,omitempty"`
+	DurationMS     int64           `json:"duration_ms,omitempty"`
+	Error          string          `json:"error,omitempty"`
 }
 
 // TaskState is a protocol message for persisting workflow checkpoints.
@@ -141,11 +204,13 @@ type TaskState struct {
 // TaskSubmission asks the Python runtime to execute one admitted task.
 type TaskSubmission struct {
 	Message
-	TaskID     string          `json:"task_id"`
-	Input      string          `json:"input"`
-	Resume     bool            `json:"resume,omitempty"`
-	Checkpoint json.RawMessage `json:"checkpoint,omitempty"`
-	TimeoutMs  int64           `json:"timeout_ms,omitempty"`
+	TaskID           string                   `json:"task_id"`
+	Input            string                   `json:"input"`
+	Resume           bool                     `json:"resume,omitempty"`
+	Checkpoint       json.RawMessage          `json:"checkpoint,omitempty"`
+	TimeoutMs        int64                    `json:"timeout_ms,omitempty"`
+	MCPServers       []MCPServerConfigMessage `json:"mcp_servers,omitempty"`
+	GrantedApprovals []string                 `json:"granted_approvals,omitempty"`
 }
 
 // TaskCancellation propagates a Go-owned cancellation decision to Python.
@@ -223,9 +288,9 @@ func ValidateType(msgType string) bool {
 	case TypeHealthCheck, TypeShutdownRequest, TypeRuntimeIdentity,
 		TypeErrorResponse, TypeSuccessResponse,
 		TypeRegisterServer, TypeRemoveServer, TypeListServers,
-		TypeDiscoverTools, TypeInvokeTool, TypeToolResult, TypeTaskState,
-		TypeTaskSubmission, TypeTaskCancellation, TypeTaskEvent,
-		TypeTaskResult, TypeTaskError:
+		TypeDiscoverTools, TypeInvokeTool, TypeToolResult, TypeMCPCommand,
+		TypeMCPResponse, TypeTaskState, TypeTaskSubmission, TypeTaskCancellation,
+		TypeTaskEvent, TypeTaskResult, TypeTaskError:
 		return true
 	default:
 		return false
@@ -553,6 +618,154 @@ func DecodeErrorResponse(data []byte) (*ErrorResponse, error) {
 	}
 	if msg.Code == "" || msg.ErrMessage == "" {
 		return nil, errors.New("error_response is missing required fields")
+	}
+	return &msg, nil
+}
+
+func validCommandID(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for i, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.' || r == ':' || r == '/':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validMCPIdentifier(value string) bool {
+	if value == "" || len(value) > 200 {
+		return false
+	}
+	for i, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validFingerprint(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') && !(r >= 'A' && r <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// DecodeMCPCommand validates one Go-to-Python MCP daemon command.
+func DecodeMCPCommand(data []byte) (*MCPCommand, error) {
+	var msg MCPCommand
+	if err := decodeTyped(data, TypeMCPCommand, &msg); err != nil {
+		return nil, err
+	}
+	if !validCommandID(msg.CommandID) {
+		return nil, errors.New("mcp_command has an invalid command identifier")
+	}
+	switch msg.Operation {
+	case "configure", "add_server", "remove_server", "connect", "disconnect",
+		"discover_tools", "invoke_tool", "list_servers", "list_tools",
+		"list_invocations", "clear_invocations":
+	default:
+		return nil, fmt.Errorf("mcp_command has unsupported operation %q", msg.Operation)
+	}
+	if len(msg.Payload) > 0 && !json.Valid(msg.Payload) {
+		return nil, errors.New("mcp_command payload is not valid JSON")
+	}
+	return &msg, nil
+}
+
+// DecodeMCPResponse validates one Python-to-Go MCP daemon response.
+func DecodeMCPResponse(data []byte) (*MCPResponse, error) {
+	var msg MCPResponse
+	if err := decodeTyped(data, TypeMCPResponse, &msg); err != nil {
+		return nil, err
+	}
+	if !validCommandID(msg.CommandID) {
+		return nil, errors.New("mcp_response has an invalid command identifier")
+	}
+	if !msg.Success {
+		if msg.Error == nil || msg.Error.Code == "" || msg.Error.Message == "" {
+			return nil, errors.New("failed mcp_response is missing a safe error")
+		}
+		return &msg, nil
+	}
+	if len(msg.Result) > 0 && !json.Valid(msg.Result) {
+		return nil, errors.New("mcp_response result is not valid JSON")
+	}
+	return &msg, nil
+}
+
+// DecodeToolResult validates a durable MCP tool invocation frame.
+func DecodeToolResult(data []byte) (*ToolResult, error) {
+	var msg ToolResult
+	if err := decodeTyped(data, TypeToolResult, &msg); err != nil {
+		return nil, err
+	}
+	if !ValidTaskID(msg.TaskID) || !validMCPIdentifier(msg.InvocationID) ||
+		!validMCPIdentifier(msg.ServerID) || !validMCPIdentifier(msg.ToolName) {
+		return nil, errors.New("tool_result is missing valid identifiers")
+	}
+	if len(msg.Arguments) > 0 && !json.Valid(msg.Arguments) {
+		return nil, errors.New("tool_result arguments are not valid JSON")
+	}
+	if len(msg.Result) > 0 && !json.Valid(msg.Result) {
+		return nil, errors.New("tool_result payload is not valid JSON")
+	}
+	if msg.DurationMS < 0 {
+		return nil, errors.New("tool_result has a negative duration")
+	}
+	switch msg.Status {
+	case "", "running", "succeeded", "failed", "blocked":
+	default:
+		return nil, fmt.Errorf("tool_result has unsupported status %q", msg.Status)
+	}
+	return &msg, nil
+}
+
+// DecodeTaskSubmission validates a task_submission message including MCP grants.
+func DecodeTaskSubmission(data []byte) (*TaskSubmission, error) {
+	var msg TaskSubmission
+	if err := decodeTyped(data, TypeTaskSubmission, &msg); err != nil {
+		return nil, err
+	}
+	if !ValidTaskID(msg.TaskID) || strings.TrimSpace(msg.Input) == "" || len(msg.Input) > 64<<10 {
+		return nil, errors.New("task_submission is missing required fields")
+	}
+	if len(msg.MCPServers) > 32 || len(msg.GrantedApprovals) > 128 {
+		return nil, errors.New("task_submission MCP fields exceed their bounds")
+	}
+	for _, server := range msg.MCPServers {
+		if !validMCPIdentifier(server.ServerID) || server.Name == "" || len(server.Name) > 128 {
+			return nil, errors.New("task_submission has an invalid MCP server")
+		}
+		switch server.Transport {
+		case "stdio", "streamable_http":
+		default:
+			return nil, errors.New("task_submission has an unsupported MCP transport")
+		}
+	}
+	for _, fingerprint := range msg.GrantedApprovals {
+		if !validFingerprint(fingerprint) {
+			return nil, errors.New("task_submission has an invalid approval fingerprint")
+		}
 	}
 	return &msg, nil
 }
