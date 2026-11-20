@@ -118,7 +118,7 @@ foreach ($relative in $trackedAppFiles) {
     if ($name -eq '_init__.py') { continue }
     $source = Join-Path $repoRoot $normalized
     $destination = Join-Path $appDir ($normalized.Substring('crane\'.Length))
-    $destinationDir = Split-Path -LiteralPath $destination -Parent
+    $destinationDir = [IO.Path]::GetDirectoryName($destination)
     if (-not (Test-Path -LiteralPath $destinationDir)) {
         New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
     }
