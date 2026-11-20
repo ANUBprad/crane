@@ -5,6 +5,7 @@ Only protocol messages are written to stdout. Diagnostics go to stderr.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 from typing import Any, Dict, Optional
@@ -24,6 +25,9 @@ TYPE_TASK_RESULT = "task_result"
 TYPE_TASK_ERROR = "task_error"
 TYPE_ERROR_RESPONSE = "error_response"
 TYPE_SUCCESS_RESPONSE = "success_response"
+TYPE_MCP_COMMAND = "mcp_command"
+TYPE_MCP_RESPONSE = "mcp_response"
+TYPE_TOOL_RESULT = "tool_result"
 
 KNOWN_TYPES = {
     TYPE_HEALTH_CHECK,
@@ -37,9 +41,26 @@ KNOWN_TYPES = {
     TYPE_TASK_ERROR,
     TYPE_ERROR_RESPONSE,
     TYPE_SUCCESS_RESPONSE,
+    TYPE_MCP_COMMAND,
+    TYPE_MCP_RESPONSE,
+    TYPE_TOOL_RESULT,
 }
 
-TASK_ID_PATTERN = None  # compiled lazily to avoid importing re for one check
+MCP_COMMAND_OPERATIONS = {
+    "configure",
+    "add_server",
+    "remove_server",
+    "connect",
+    "disconnect",
+    "discover_tools",
+    "invoke_tool",
+    "list_servers",
+    "list_tools",
+    "list_invocations",
+    "clear_invocations",
+}
+
+_FINGERPRINT_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 
 _WRITE_LOCK = threading.Lock()
 
@@ -113,11 +134,27 @@ def parse_task_submission(message: Dict[str, Any]) -> Dict[str, Any]:
     checkpoint = message.get("checkpoint")
     if checkpoint is not None and not isinstance(checkpoint, dict):
         raise ProtocolError("checkpoint must be an object")
+
+    servers = message.get("mcp_servers") or []
+    if not isinstance(servers, list) or len(servers) > 32:
+        raise ProtocolError("mcp_servers must be a bounded array")
+    if any(not isinstance(item, dict) for item in servers):
+        raise ProtocolError("each MCP server configuration must be an object")
+
+    approvals = message.get("granted_approvals") or []
+    if not isinstance(approvals, list) or len(approvals) > 128:
+        raise ProtocolError("granted_approvals must be a bounded array")
+    for fingerprint in approvals:
+        if not isinstance(fingerprint, str) or not _FINGERPRINT_PATTERN.fullmatch(fingerprint):
+            raise ProtocolError("approval fingerprint is invalid")
+
     return {
         "task_id": task_id,
         "input": user_input,
         "resume": message.get("resume") is True,
         "checkpoint": checkpoint,
+        "mcp_servers": servers,
+        "granted_approvals": approvals,
     }
 
 
@@ -128,6 +165,63 @@ def parse_task_cancellation(message: Dict[str, Any]) -> Dict[str, Any]:
     if not _valid_task_id(task_id):
         raise ProtocolError("invalid task identifier")
     return {"task_id": task_id, "reason": str(message.get("reason") or "cancelled")}
+
+
+def parse_mcp_command(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate a Go-owned MCP daemon command."""
+    if message.get("type") != TYPE_MCP_COMMAND:
+        raise ProtocolError("expected mcp_command")
+    command_id = message.get("command_id")
+    operation = message.get("operation")
+    payload = message.get("payload") or {}
+    if not isinstance(command_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", command_id):
+        raise ProtocolError("invalid MCP command identifier")
+    if operation not in MCP_COMMAND_OPERATIONS:
+        raise ProtocolError("unsupported MCP command operation")
+    if not isinstance(payload, dict):
+        raise ProtocolError("MCP command payload must be an object")
+    return {"command_id": command_id, "operation": operation, "payload": payload}
+
+
+def mcp_response(
+    command_id: str,
+    success: bool,
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    message: Dict[str, Any] = {
+        "type": TYPE_MCP_RESPONSE,
+        "command_id": command_id,
+        "success": success,
+    }
+    if success:
+        message["result"] = result or {}
+    else:
+        message["error"] = error or {"code": "mcp_command_failed", "message": "MCP command failed"}
+    return message
+
+
+def tool_result(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the durable, versioned tool_result frame consumed by Go."""
+    if not isinstance(payload, dict) or not payload.get("invocation_id"):
+        raise ProtocolError("tool_result requires an invocation identifier")
+    task_id = payload.get("task_id") or "mcp-daemon"
+    if not _valid_task_id(task_id):
+        raise ProtocolError("tool_result has an invalid task identifier")
+    return {
+        "type": TYPE_TOOL_RESULT,
+        "task_id": task_id,
+        "invocation_id": str(payload["invocation_id"]),
+        "server_id": str(payload.get("server_id") or ""),
+        "server_name": str(payload.get("server_name") or ""),
+        "tool_name": str(payload.get("tool_name") or ""),
+        "arguments": payload.get("arguments") or {},
+        "result": payload.get("result") or {},
+        "error": str(payload.get("error") or ""),
+        "policy_decision": str(payload.get("policy_decision") or ""),
+        "duration_ms": int(payload.get("duration_ms") or 0),
+        "status": str(payload.get("status") or "succeeded"),
+    }
 
 
 def task_event(task_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

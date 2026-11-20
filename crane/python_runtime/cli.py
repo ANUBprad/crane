@@ -7,6 +7,7 @@ import json
 import logging
 import sys
 
+from crane.python_runtime.mcp_protocol import MCPProtocolRuntime
 from crane.python_runtime.protocol_runtime import ProtocolRuntime
 from crane.python_runtime.provider import collect_diagnostics
 from crane.python_runtime.runtime import Runtime, build_health_response
@@ -27,6 +28,9 @@ def main() -> None:
 
     if len(sys.argv) > 1 and sys.argv[1] == "--protocol":
         raise SystemExit(ProtocolRuntime().run())
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--mcp-protocol":
+        raise SystemExit(MCPProtocolRuntime().run())
 
     raise SystemExit(ProtocolRuntime().run())
 

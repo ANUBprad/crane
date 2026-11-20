@@ -1,370 +1,772 @@
 """CRANE MCP runtime.
 
-Provides MCP server management (stdio and streamable HTTP transports),
-tool discovery, and LangChain adapter integration.
+Real MCP client lifecycle, tool discovery, schema validation and invocation.
+The Python MCP SDK owns the protocol; LangChain MCP Adapters convert discovered
+tools into LangChain tools for the LangGraph workflow.
 """
-__version__ = "0.1.0"
+from __future__ import annotations
 
+import asyncio
+import contextlib
+import hashlib
 import json
 import logging
-import asyncio
 import os
-import sys
+import re
 import time
+import urllib.parse
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-import mcp
-from mcp.client.stdio import stdio_client, StdioServerParameters
+import jsonschema
+from mcp import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
-from mcp.types import (
-    CallToolResult,
-    ListToolsResult,
-    Tool,
-    TextContent,
-    ImageContent,
-    EmbeddedResource,
-)
+from mcp.types import CallToolResult, TextContent, Tool as MCPTool
+
+from crane.python_runtime import protocol
+
+__version__ = "0.2.0"
 
 logger = logging.getLogger("crane.mcp")
 
-# Protocol version compatibility with the Go supervisor
-MCP_PROTOCOL_VERSION = "0.1.0"
-
-# Supported transport types
 TRANSPORT_STDIO = "stdio"
 TRANSPORT_STREAMABLE_HTTP = "streamable_http"
+SUPPORTED_TRANSPORTS = {TRANSPORT_STDIO, TRANSPORT_STREAMABLE_HTTP}
+
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
+DEFAULT_INVOCATION_TIMEOUT_SECONDS = 30.0
+MIN_TIMEOUT_SECONDS = 0.1
+MAX_CONNECT_TIMEOUT_SECONDS = 30.0
+MAX_INVOCATION_TIMEOUT_SECONDS = 300.0
+
+POLICY_ALLOWED = "allowed"
+POLICY_APPROVAL_REQUIRED = "approval_required"
+POLICY_BLOCKED = "blocked"
+
+SERVER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+ENV_KEY_RE = re.compile(r"^CRANE_MCP_[A-Z0-9_]{1,127}$")
+SENSITIVE_ENV_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|CREDENTIAL|API_?KEY|PRIVATE)", re.I)
+DANGEROUS_ARGS_RE = re.compile(r"^(-c|-m|--eval|--exec|-e|--command)$", re.I)
+
+_SAFE_IDENTIFIERS = re.compile(r"^[A-Za-z0-9_.-]{1,200}$")
+_READ_ONLY_VERBS = (
+    "get_", "list_", "read_", "search_", "find_", "status_", "inspect_",
+    "describe_", "fetch_", "echo_", "query_", "check_",
+)
+_CONSEQUENTIAL_WORDS = (
+    "delete", "remove", "destroy", "drop", "write", "update", "create",
+    "send", "post", "publish", "execute", "run_", "command", "shell",
+    "grant", "revoke", "admin", "permission", "payment", "purchase",
+    "secret", "token", "credential", "password", "modify", "set_",
+)
+
+_REDACTION_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)\b(token|secret|password|api[_-]?key|credential)\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,;&}\)]+)"),
+)
 
 
-class MCPServer:
-    """Represents a connected MCP server with its configuration and tools."""
-    
-    def __init__(
-        self,
-        name: str,
-        transport: str,
-        server_id: str,
-        parameters: dict,
-        capabilities: dict,
-        tools: Optional[List[Tool]] = None,
-    ):
-        self.name = name
-        self.transport = transport
-        self.server_id = server_id  # Unique identity, preserved across calls
-        self.parameters = parameters
-        self.capabilities = capabilities
-        self.tools = tools or []
-        self._session: Optional[any] = None
-        self._connected = False
-        self._initialized = False
-        self._last_tool_discovery: Optional[float] = None
-    
-    @property
-    def is_connected(self) -> bool:
-        return self._connected
-    
-    @property
-    def is_initialized(self) -> bool:
-        return self._initialized
-    
-    def to_dict(self) -> dict:
-        """Serialize server state for persistence."""
+class MCPError(RuntimeError):
+    """Safe, actionable MCP configuration or execution error."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def redact(value: Any) -> Any:
+    """Redact likely secrets from data that may reach logs, events or models."""
+    if isinstance(value, dict):
+        result: Dict[str, Any] = {}
+        for key, item in value.items():
+            text_key = str(key).lower()
+            if any(word in text_key for word in ("token", "secret", "password", "credential", "api_key", "apikey", "authorization")):
+                result[key] = "[redacted]"
+            else:
+                result[key] = redact(item)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [redact(item) for item in value]
+    if isinstance(value, str):
+        text = value
+        for pattern in _REDACTION_PATTERNS:
+            text = pattern.sub("[redacted]", text)
+        if len(text) > 8000:
+            text = text[:8000] + "…[truncated]"
+        return text
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return redact(str(value))
+
+
+def canonical_json(value: Any) -> str:
+    """Deterministic JSON used for exact-action approval fingerprints."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def action_fingerprint(server_id: str, tool_name: str, arguments: Dict[str, Any]) -> str:
+    payload = canonical_json({
+        "server_id": server_id,
+        "tool_name": tool_name,
+        "arguments": arguments,
+    })
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    # Avoid an ipaddress dependency in the hot path; only loopback literals are
+    # accepted without explicit remote authorization.
+    return host in {"127.0.0.1", "::1"} or host.startswith("127.")
+
+
+def _parse_timeout(raw: Any, default: float, maximum: float, name: str) -> float:
+    if raw in (None, ""):
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise MCPError("mcp_invalid_configuration", f"{name} must be a number of seconds.") from exc
+    if value < MIN_TIMEOUT_SECONDS or value > maximum:
+        raise MCPError(
+            "mcp_invalid_configuration",
+            f"{name} must be between {MIN_TIMEOUT_SECONDS:g} and {maximum:g} seconds.",
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class MCPServerConfig:
+    """Validated, non-secret-safe MCP server configuration."""
+
+    server_id: str
+    name: str
+    transport: str
+    command: str = ""
+    args: Tuple[str, ...] = ()
+    env: Dict[str, str] = field(default_factory=dict)
+    url: str = ""
+    enabled: bool = True
+    connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
+    invocation_timeout_seconds: float = DEFAULT_INVOCATION_TIMEOUT_SECONDS
+    allow_remote_endpoint: bool = False
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "MCPServerConfig":
+        if not isinstance(raw, dict):
+            raise MCPError("mcp_invalid_configuration", "MCP server configuration must be an object")
+        server_id = str(raw.get("server_id") or raw.get("id") or "").strip()
+        name = str(raw.get("name") or "").strip()
+        transport = str(raw.get("transport") or "").strip().lower()
+        if not SERVER_ID_RE.fullmatch(server_id):
+            raise MCPError("mcp_invalid_configuration", "MCP server id is invalid")
+        if not name or len(name) > 128 or "\n" in name or "\r" in name:
+            raise MCPError("mcp_invalid_configuration", "MCP server name is invalid")
+        if transport not in SUPPORTED_TRANSPORTS:
+            raise MCPError("mcp_invalid_configuration", "MCP transport is not supported")
+
+        command = str(raw.get("command") or "").strip()
+        args_raw = raw.get("args") or []
+        env_raw = raw.get("env") or {}
+        url = str(raw.get("url") or "").strip()
+        allow_remote = raw.get("allow_remote_endpoint") is True
+
+        if transport == TRANSPORT_STDIO:
+            allowed_commands = {
+                item.strip()
+                for item in os.environ.get(
+                    "CRANE_MCP_ALLOWED_COMMANDS", "python,pythonw,node"
+                ).split(",")
+                if item.strip()
+            }
+            if command not in allowed_commands:
+                raise MCPError(
+                    "mcp_executable_not_allowed",
+                    "MCP stdio executable is not on the explicit allowlist",
+                )
+            if not isinstance(args_raw, (list, tuple)) or len(args_raw) > 32:
+                raise MCPError("mcp_invalid_configuration", "MCP stdio arguments are invalid")
+            args: List[str] = []
+            for item in args_raw:
+                if not isinstance(item, str) or not item or len(item) > 1024 or any(ch in item for ch in "\x00\r\n"):
+                    raise MCPError("mcp_invalid_configuration", "MCP stdio arguments are invalid")
+                if DANGEROUS_ARGS_RE.match(item):
+                    raise MCPError(
+                        "mcp_executable_not_allowed",
+                        "MCP stdio arguments may not request inline code execution",
+                    )
+                args.append(item)
+            if not isinstance(env_raw, dict):
+                raise MCPError("mcp_invalid_configuration", "MCP environment configuration is invalid")
+            env: Dict[str, str] = {}
+            for key, value in env_raw.items():
+                if not isinstance(key, str) or not ENV_KEY_RE.fullmatch(key) or SENSITIVE_ENV_RE.search(key):
+                    raise MCPError("mcp_invalid_configuration", "MCP environment variable name is not allowed")
+                if not isinstance(value, str) or len(value) > 1024:
+                    raise MCPError("mcp_invalid_configuration", "MCP environment variable value is invalid")
+                env[key] = value
+        else:
+            if not url:
+                raise MCPError("mcp_invalid_configuration", "MCP HTTP endpoint is required")
+            try:
+                parsed = urllib.parse.urlsplit(url)
+                port = parsed.port
+            except ValueError as exc:
+                raise MCPError("mcp_invalid_configuration", "MCP HTTP endpoint is invalid") from exc
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+                raise MCPError("mcp_invalid_configuration", "MCP HTTP endpoint must be http or https")
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise MCPError("mcp_invalid_configuration", "MCP HTTP endpoint must not contain credentials, query or fragment")
+            if parsed.path not in {"", "/", "/mcp"}:
+                raise MCPError("mcp_invalid_configuration", "MCP HTTP endpoint path is not allowed")
+            if not allow_remote and not _is_loopback_host(parsed.hostname):
+                raise MCPError(
+                    "mcp_remote_endpoint_not_authorized",
+                    "MCP endpoint is not local; explicit remote endpoint authorization is required",
+                )
+            host = parsed.hostname
+            netloc = f"[{host}]" if ":" in host else host
+            if port is not None:
+                netloc += f":{port}"
+            url = f"{parsed.scheme.lower()}://{netloc}{parsed.path or '/mcp'}"
+            args, env = (), {}
+
+        return cls(
+            server_id=server_id,
+            name=name,
+            transport=transport,
+            command=command,
+            args=tuple(args),
+            env=env,
+            url=url,
+            enabled=raw.get("enabled") is not False,
+            connect_timeout_seconds=_parse_timeout(
+                raw.get("connect_timeout_seconds"),
+                DEFAULT_CONNECT_TIMEOUT_SECONDS,
+                MAX_CONNECT_TIMEOUT_SECONDS,
+                "connect_timeout_seconds",
+            ),
+            invocation_timeout_seconds=_parse_timeout(
+                raw.get("invocation_timeout_seconds"),
+                DEFAULT_INVOCATION_TIMEOUT_SECONDS,
+                MAX_INVOCATION_TIMEOUT_SECONDS,
+                "invocation_timeout_seconds",
+            ),
+            allow_remote_endpoint=allow_remote,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize for the Go/Python protocol boundary, including env values."""
         return {
+            "server_id": self.server_id,
             "name": self.name,
             "transport": self.transport,
-            "server_id": self.server_id,
-            "capabilities": self.capabilities,
-            "tool_count": len(self.tools),
-            "connected": self._connected,
+            "command": self.command,
+            "args": list(self.args),
+            "env": dict(self.env),
+            "url": self.url,
+            "enabled": self.enabled,
+            "connect_timeout_seconds": self.connect_timeout_seconds,
+            "invocation_timeout_seconds": self.invocation_timeout_seconds,
+            "allow_remote_endpoint": self.allow_remote_endpoint,
         }
-    
-    @classmethod
-    def from_dict(cls, data: dict) -> "MCPServer":
-        """Deserialize server state from persistence."""
-        server = cls(
-            name=data["name"],
-            transport=data["transport"],
-            server_id=data["server_id"],
-            parameters=data.get("parameters", {}),
-            capabilities=data.get("capabilities", {}),
-        )
-        server._connected = data.get("connected", False)
-        server._initialized = data.get("initialized", False)
-        server._last_tool_discovery = data.get("_last_tool_discovery")
-        return server
+
+    def public_dict(self) -> Dict[str, Any]:
+        """Serialize without environment values for logs, events and APIs."""
+        data = self.to_dict()
+        data["env"] = {}
+        data["environment_keys"] = sorted(self.env)
+        return data
 
 
-class MCPClientManager:
-    """Manages MCP server connections, discovery, and lifecycle."""
-    
-    def __init__(self):
-        self._servers: Dict[str, MCPServer] = {}  # name -> server
-        self._server_lock = asyncio.Lock()
-    
-    async def add_server(
-        self,
-        name: str,
-        transport: str,
-        command: str,
-        args: Optional[List[str]] = None,
-        env: Optional[Dict[str, str]] = None,
-        url: Optional[str] = None,
-    ) -> MCPServer:
-        """Register a new MCP server."""
-        async with self._server_lock:
-            server = MCPServer(
-                name=name,
-                transport=transport,
-                server_id=str(uuid.uuid4()),
-                parameters={
-                    "command": command if transport == TRANSPORT_STDIO else "",
-                    "url": url if transport == TRANSPORT_STREAMABLE_HTTP else "",
-                    "args": args or [],
-                    "env": env or {},
-                },
-                capabilities={},
-            )
-            self._servers[name] = server
-            logger.info(f"Registered MCP server: {name} ({transport})")
-            return server
-    
-    async def remove_server(self, name: str) -> bool:
-        """Remove an MCP server and clean up its connection."""
-        async with self._server_lock:
-            server = self._servers.get(name)
-            if server and server._connected:
-                await self._safe_disconnect(server)
-            self._servers.pop(name, None)
-            logger.info(f"Removed MCP server: {name}")
-            return True
-    
-    async def list_servers(self) -> List[MCPServer]:
-        """List all registered MCP servers."""
-        async with self._server_lock:
-            return list(self._servers.values())
-    
-    async def get_server(self, name: str) -> Optional[MCPServer]:
-        """Get a server by name."""
-        async with self._server_lock:
-            return self._servers.get(name)
-    
-    async def get_all_tools(self) -> Dict[str, MCPServer]:
-        """Get all tools keyed by server name."""
-        async with self._server_lock:
-            result = {}
-            for name, server in self._servers.items():
-                if server.is_connected and server.tools:
-                    result[name] = server
-            return result
-    
-    async def _safe_disconnect(self, server: MCPServer) -> None:
-        """Safely disconnect a server, handling both transport types."""
-        try:
-            if server.transport == TRANSPORT_STDIO and server._session:
-                # stdio_client is an async context manager; we need to exit it
-                if hasattr(server._session, 'aclose'):
-                    await server._session.aclose()
-                elif hasattr(server._session, 'close'):
-                    await server._session.close()
-                server._connected = False
-            elif server.transport == TRANSPORT_STREAMABLE_HTTP and server._session:
-                await server._session._client.aclose()
-                server._connected = False
-        except Exception as e:
-            logger.warning(f"Error disconnecting server {server.name}: {e}")
-            server._connected = False
+@dataclass
+class MCPToolRecord:
+    server_id: str
+    tool: MCPTool
+    policy_class: str
+
+    @property
+    def name(self) -> str:
+        return self.tool.name
+
+    def to_dict(self) -> Dict[str, Any]:
+        annotations = self.tool.annotations.model_dump() if self.tool.annotations else {}
+        return {
+            "server_id": self.server_id,
+            "name": self.tool.name,
+            "description": self.tool.description or "",
+            "input_schema": self.tool.inputSchema,
+            "annotations": annotations,
+            "policy_class": self.policy_class,
+        }
 
 
-mcp_manager = MCPClientManager()
+@dataclass
+class MCPInvocationRecord:
+    invocation_id: str
+    server_id: str
+    server_name: str
+    tool_name: str
+    arguments: Dict[str, Any]
+    status: str
+    started_at: float
+    completed_at: float
+    result_text: str = ""
+    structured_result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    policy_decision: str = POLICY_ALLOWED
+    task_id: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return redact({
+            "invocation_id": self.invocation_id,
+            "task_id": self.task_id,
+            "server_id": self.server_id,
+            "server_name": self.server_name,
+            "tool_name": self.tool_name,
+            "arguments": self.arguments,
+            "status": self.status,
+            "result": {"text": self.result_text, "structured": self.structured_result},
+            "error": self.error,
+            "policy_decision": self.policy_decision,
+            "duration_ms": max(0, int((self.completed_at - self.started_at) * 1000)),
+        })
 
 
-async def _stdio_transport(server: MCPServer) -> any:
-    """Initialize a stdio transport connection to an MCP server."""
-    params = server.parameters
-    server_params = StdioServerParameters(
-        command=params.get("command", ""),
-        args=params.get("args", []),
-        env=params.get("env", {}),
-    )
-    stdio_ctx = stdio_client(server_params)
-    session = await stdio_ctx.__aenter__()
-    server._session = stdio_ctx
-    server._connected = True
-    return session
+class _ManagedServer:
+    def __init__(self, config: MCPServerConfig) -> None:
+        self.config = config
+        self.session: Optional[ClientSession] = None
+        self.stack: Optional[contextlib.AsyncExitStack] = None
+        self.tools: Dict[str, MCPToolRecord] = {}
+        self.connected = False
+        self.last_error: Optional[str] = None
+
+    def clear(self) -> None:
+        self.session = None
+        self.stack = None
+        self.connected = False
 
 
-async def _streamable_http_transport(server: MCPServer) -> any:
-    """Initialize a Streamable HTTP transport connection to an MCP server."""
-    params = server.parameters
-    url = params.get("url", "")
-    if not url:
-        raise ValueError(f"No URL configured for HTTP transport server {server.name}")
-    
-    http_ctx = streamable_http_client(url)
-    session = await http_ctx.__aenter__()
-    server._session = http_ctx
-    server._connected = True
-    return session
+def classify_tool(tool: MCPTool) -> str:
+    """Classify from static tool metadata only; descriptions never grant access."""
+    annotations = tool.annotations
+    if annotations is not None and annotations.readOnlyHint is True:
+        return POLICY_ALLOWED
+    name = tool.name.lower()
+    if annotations is not None and annotations.destructiveHint is True:
+        return POLICY_APPROVAL_REQUIRED
+    if any(word in name for word in _CONSEQUENTIAL_WORDS):
+        return POLICY_APPROVAL_REQUIRED
+    if name.startswith(_READ_ONLY_VERBS) and not any(word in name for word in ("write", "delete", "send", "update")):
+        return POLICY_ALLOWED
+    return POLICY_APPROVAL_REQUIRED
 
 
-async def discover_tools(server: MCPServer) -> List[Tool]:
-    """Discover tools from an MCP server."""
-    async with asyncio.timeout(30):
-        if server.transport == TRANSPORT_STDIO:
-            session = await _stdio_transport(server)
-        elif server.transport == TRANSPORT_STREAMABLE_HTTP:
-            session = await _streamable_http_transport(server)
+def _parse_call_result(result: Any) -> Tuple[str, Optional[Dict[str, Any]], bool]:
+    if not isinstance(result, CallToolResult) or not isinstance(result.content, list):
+        raise MCPError("mcp_malformed_result", "MCP server returned a malformed tool result")
+    parts: List[str] = []
+    for item in result.content:
+        if isinstance(item, TextContent):
+            parts.append(item.text)
+        elif hasattr(item, "model_dump"):
+            # Keep non-text evidence bounded and inspectable without dumping
+            # arbitrary binary data into task history.
+            parts.append(f"[{getattr(item, 'type', 'content')} content omitted]")
         else:
-            raise ValueError(f"Unknown transport: {server.transport}")
-        
-        try:
-            # List tools request
-            request = mcp.ListToolsRequest(
-                headers={},
-                params=mcp.ListToolsParams(
-                    cursor=None,
-                )
+            raise MCPError("mcp_malformed_result", "MCP server returned an unsupported content block")
+    structured = result.structuredContent
+    if structured is not None and not isinstance(structured, dict):
+        raise MCPError("mcp_malformed_result", "MCP server returned malformed structured content")
+    if structured is not None:
+        parts.append(json.dumps(structured, ensure_ascii=False, sort_keys=True))
+    return "\n".join(parts), structured, bool(result.isError)
+
+
+class _PolicyInterceptor:
+    """Adapter interceptor that routes every model tool call through CRANE policy."""
+
+    def __init__(self, manager: "MCPManager", server: _ManagedServer) -> None:
+        self._manager = manager
+        self._server = server
+
+    async def __call__(self, request: Any, handler: Any) -> CallToolResult:
+        del handler  # CRANE owns the actual MCP call so it can persist and gate it.
+        record = await self._manager.invoke(
+            self._server.config.server_id,
+            request.name,
+            request.args or {},
+        )
+        if record.status == "succeeded":
+            return CallToolResult(
+                content=[TextContent(type="text", text=record.result_text or "Tool completed")],
+                structuredContent=record.structured_result,
+                isError=False,
             )
-            result: ListToolsResult = await session.list_tools(request)
-            
-            tools = []
-            for tool in result.tools:
-                langchain_tool = Tool(
-                    name=tool.name,
-                    description=tool.description or "",
-                    # We'll use a wrapper that calls the MCP server
-                    func=lambda name=tool.name, tool_name=server.name: _call_tool_mcp(tool_name, name),
-                    handle_tool_error=True,
-                )
-                tools.append(langchain_tool)
-            
-            server.tools = tools
-            server._last_tool_discovery = time.time()
-            logger.info(f"Discovered {len(tools)} tools from server {server.name}")
-            return tools
-        except Exception as e:
-            logger.error(f"Failed to discover tools from {server.name}: {e}")
-            raise
-        finally:
-            # Don't disconnect after discovery; keep connection alive
-            pass
+        detail = record.error or "MCP tool did not complete"
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"MCP tool failed: {detail}")],
+            isError=True,
+        )
 
 
-async def _call_tool_mcp(server_name: str, tool_name: str, arguments: Optional[dict] = None) -> Any:
-    """Call a tool on a specific MCP server."""
-    server = mcp_manager.get_server(server_name)
-    if server is None or not server._connected:
-        raise RuntimeError(f"MCP server {server_name} not connected")
-    
-    async with asyncio.timeout(30):
-        if server.transport == TRANSPORT_STDIO:
-            session = await _stdio_transport(server)
-        elif server.transport == TRANSPORT_STREAMABLE_HTTP:
-            session = await _streamable_http_transport(server)
-        
+class MCPManager:
+    """Owns MCP sessions, discovery, policy checks and invocation records."""
+
+    def __init__(self, task_id: Optional[str] = None, granted_fingerprints: Optional[Set[str]] = None) -> None:
+        self.task_id = task_id
+        self.granted_fingerprints: Set[str] = set(granted_fingerprints or ())
+        self._servers: Dict[str, _ManagedServer] = {}
+        self._lock = asyncio.Lock()
+        self._invocations: List[MCPInvocationRecord] = []
+
+    def _emit(self, event_type: str, payload: Dict[str, Any]) -> None:
+        protocol.write_stdout(protocol.task_event(
+            self.task_id or "mcp-daemon", event_type, redact(payload)
+        ))
+
+    def _emit_tool_result(self, record: MCPInvocationRecord) -> None:
+        """Emit the exact invocation outcome for durable Go-side persistence."""
+        payload = record.to_dict()
+        protocol.write_stdout(protocol.tool_result({
+            "task_id": self.task_id,
+            "invocation_id": record.invocation_id,
+            "server_id": record.server_id,
+            "server_name": record.server_name,
+            "tool_name": record.tool_name,
+            "arguments": record.arguments,
+            "result": payload["result"],
+            "error": record.error,
+            "policy_decision": record.policy_decision,
+            "duration_ms": payload["duration_ms"],
+            "status": record.status,
+        }))
+
+    def set_context(
+        self,
+        task_id: Optional[str] = None,
+        granted_fingerprints: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Bind the manager to one task and its exact approval grants."""
+        self.task_id = task_id
+        self.granted_fingerprints = set(granted_fingerprints or ())
+
+    def add_config(self, config: MCPServerConfig) -> None:
+        self._servers[config.server_id] = _ManagedServer(config)
+
+    def configs(self) -> List[MCPServerConfig]:
+        return [server.config for server in self._servers.values() if server.config.enabled]
+
+    def tools(self) -> List[MCPToolRecord]:
+        return [tool for server in self._servers.values() for tool in server.tools.values()]
+
+    def server_states(self) -> List[Dict[str, Any]]:
+        """Return API-safe server state without environment values."""
+        return [{
+            "config": server.config.public_dict(),
+            "connected": server.connected,
+            "tool_count": len(server.tools),
+            "last_error": redact(server.last_error),
+        } for server in self._servers.values()]
+
+    def invocations(self) -> List[Dict[str, Any]]:
+        return [record.to_dict() for record in self._invocations]
+
+    def clear_invocations(self) -> None:
+        self._invocations.clear()
+
+    async def connect(self, config: MCPServerConfig) -> List[MCPToolRecord]:
+        async with self._lock:
+            managed = self._servers.get(config.server_id)
+            if managed is None:
+                managed = _ManagedServer(config)
+                self._servers[config.server_id] = managed
+            await self._disconnect_locked(managed)
+            stack = contextlib.AsyncExitStack()
+            try:
+                if config.transport == TRANSPORT_STDIO:
+                    params = StdioServerParameters(
+                        command=config.command,
+                        args=list(config.args),
+                        env={**os.environ, **config.env},
+                    )
+                    read, write = await stack.enter_async_context(stdio_client(params))
+                else:
+                    read, write, _ = await stack.enter_async_context(
+                        streamable_http_client(config.url)
+                    )
+                session = await stack.enter_async_context(ClientSession(
+                    read,
+                    write,
+                    read_timeout_seconds=timedelta(seconds=config.connect_timeout_seconds),
+                ))
+                await session.initialize()
+                managed.stack = stack
+                managed.session = session
+                managed.config = config
+                managed.connected = True
+                managed.last_error = None
+                managed.tools = await self._discover_locked(managed)
+                self._emit("mcp_server_discovery", {
+                    "server_id": config.server_id,
+                    "transport": config.transport,
+                    "tool_count": len(managed.tools),
+                })
+                return list(managed.tools.values())
+            except Exception as exc:  # noqa: BLE001 - normalized at the boundary
+                await stack.aclose()
+                managed.clear()
+                managed.last_error = redact(str(exc))
+                raise self._normalize_error(exc, "mcp_connect_failed") from exc
+
+    async def disconnect(self, server_id: str) -> None:
+        async with self._lock:
+            managed = self._servers.get(server_id)
+            if managed is not None:
+                await self._disconnect_locked(managed)
+
+    async def _disconnect_locked(self, managed: _ManagedServer) -> None:
+        managed.connected = False
+        stack, session = managed.stack, managed.session
+        managed.clear()
+        if stack is not None:
+            with contextlib.suppress(Exception):
+                await stack.aclose()
+        del session
+
+    async def discover(self, server_id: str) -> List[MCPToolRecord]:
+        async with self._lock:
+            managed = self._servers.get(server_id)
+            if managed is None:
+                raise MCPError("mcp_server_not_found", "MCP server is not registered")
+            if not managed.connected or managed.session is None:
+                await self._connect_locked(managed)
+            managed.tools = await self._discover_locked(managed)
+            self._emit("mcp_server_discovery", {
+                "server_id": server_id,
+                "tool_count": len(managed.tools),
+            })
+            return list(managed.tools.values())
+
+    async def _connect_locked(self, managed: _ManagedServer) -> None:
+        config = managed.config
+        stack = contextlib.AsyncExitStack()
         try:
-            # Tool call request
-            request = mcp.CallToolRequest(
-                params=mcp.CallToolParams(
-                    name=tool_name,
-                    arguments=arguments or {},
+            if config.transport == TRANSPORT_STDIO:
+                params = StdioServerParameters(
+                    command=config.command,
+                    args=list(config.args),
+                    env={**os.environ, **config.env},
                 )
+                read, write = await stack.enter_async_context(stdio_client(params))
+            else:
+                read, write, _ = await stack.enter_async_context(streamable_http_client(config.url))
+            session = await stack.enter_async_context(ClientSession(
+                read,
+                write,
+                read_timeout_seconds=timedelta(seconds=config.connect_timeout_seconds),
+            ))
+            await session.initialize()
+        except Exception as exc:  # noqa: BLE001
+            await stack.aclose()
+            managed.clear()
+            managed.last_error = redact(str(exc))
+            raise self._normalize_error(exc, "mcp_connect_failed") from exc
+        managed.stack = stack
+        managed.session = session
+        managed.connected = True
+        managed.last_error = None
+
+    async def _discover_locked(self, managed: _ManagedServer) -> Dict[str, MCPToolRecord]:
+        if managed.session is None:
+            raise MCPError("mcp_not_connected", "MCP server is not connected")
+        tools: Dict[str, MCPToolRecord] = {}
+        cursor: Optional[str] = None
+        for _ in range(100):
+            result = await managed.session.list_tools(cursor=cursor)
+            if result.tools:
+                for tool in result.tools:
+                    if not _SAFE_IDENTIFIERS.fullmatch(tool.name):
+                        logger.warning("Skipping MCP tool with an unsafe name")
+                        continue
+                    tools[tool.name] = MCPToolRecord(
+                        server_id=managed.config.server_id,
+                        tool=tool,
+                        policy_class=classify_tool(tool),
+                    )
+            cursor = result.nextCursor or None
+            if not cursor:
+                break
+        else:
+            raise MCPError("mcp_malformed_result", "MCP tool listing did not terminate")
+        return tools
+
+    async def remove(self, server_id: str) -> None:
+        async with self._lock:
+            managed = self._servers.pop(server_id, None)
+            if managed is not None:
+                await self._disconnect_locked(managed)
+
+    async def close_all(self) -> None:
+        async with self._lock:
+            for managed in list(self._servers.values()):
+                await self._disconnect_locked(managed)
+
+    @staticmethod
+    def _normalize_error(exc: Exception, default_code: str) -> MCPError:
+        if isinstance(exc, MCPError):
+            return exc
+        code = getattr(exc, "code", None)
+        if isinstance(code, str) and code:
+            return MCPError(code, redact(str(exc)))
+        return MCPError(default_code, redact(f"MCP operation failed: {type(exc).__name__}"))
+
+    async def invoke(
+        self,
+        server_id: str,
+        tool_name: str,
+        arguments: Optional[Dict[str, Any]] = None,
+    ) -> MCPInvocationRecord:
+        args = redact(arguments or {})
+        if not isinstance(args, dict):
+            raise MCPError("mcp_invalid_arguments", "MCP tool arguments must be an object")
+        async with self._lock:
+            managed = self._servers.get(server_id)
+            if managed is None:
+                raise MCPError("mcp_server_not_found", "MCP server is not registered")
+            record = MCPInvocationRecord(
+                invocation_id=str(uuid.uuid4()),
+                server_id=server_id,
+                server_name=managed.config.name,
+                tool_name=tool_name,
+                arguments=args,
+                status="running",
+                started_at=time.time(),
+                task_id=self.task_id,
             )
-            result: CallToolResult = await session.call_tool(request)
-            
-            # Return structured result
-            if result.content:
-                # Extract text content
-                text_parts = []
-                for item in result.content:
-                    if hasattr(item, 'text'):
-                        text_parts.append(item.text)
-                    elif hasattr(item, 'type'):
-                        text_parts.append(str(item))
-                    else:
-                        text_parts.append(str(item))
-                return {"text": "\n".join(text_parts), "structured": None}
-            return {"text": "", "structured": None}
-        except mcp.MCPError as e:
-            logger.error(f"MCP error calling {tool_name} on {server_name}: {e}")
-            return {"text": f"Error: {e}", "structured": None}
-        except Exception as e:
-            logger.error(f"Error calling {tool_name} on {server_name}: {e}")
-            return {"text": f"Error: {e}", "structured": None}
+            try:
+                if not managed.connected or managed.session is None:
+                    await self._connect_locked(managed)
+                    managed.tools = await self._discover_locked(managed)
+                tool = managed.tools.get(tool_name)
+                if tool is None:
+                    raise MCPError("mcp_tool_not_found", "MCP tool was not found on this server")
+
+                try:
+                    jsonschema.validate(instance=args, schema=tool.tool.inputSchema)
+                except jsonschema.ValidationError as exc:
+                    raise MCPError("mcp_schema_validation_failed", redact(exc.message)) from exc
+
+                fingerprint = action_fingerprint(server_id, tool_name, args)
+                record.policy_decision = tool.policy_class
+                if tool.policy_class != POLICY_ALLOWED and fingerprint not in self.granted_fingerprints:
+                    record.status = "blocked"
+                    record.policy_decision = POLICY_APPROVAL_REQUIRED
+                    record.error = "This tool requires explicit approval for this exact action"
+                    self._emit("mcp_tool_blocked", record.to_dict())
+                    self._finish(record)
+                    self._emit_tool_result(record)
+                    return record
+
+                assert managed.session is not None
+                result = await asyncio.wait_for(
+                    managed.session.call_tool(
+                        tool_name,
+                        args,
+                        read_timeout_seconds=timedelta(
+                            seconds=managed.config.invocation_timeout_seconds
+                        ),
+                    ),
+                    timeout=managed.config.invocation_timeout_seconds,
+                )
+                text, structured, is_error = _parse_call_result(result)
+                record.result_text = redact(text)
+                record.structured_result = redact(structured) if structured is not None else None
+                record.status = "failed" if is_error else "succeeded"
+                if is_error:
+                    record.error = redact(record.result_text) or "MCP tool reported an error"
+            except Exception as exc:  # noqa: BLE001 - never leak transport internals
+                normalized = self._normalize_error(exc, "mcp_invocation_failed")
+                record.status = "failed"
+                record.error = f"{normalized.code}: {normalized.message}"
+                managed.last_error = record.error
+            self._finish(record)
+            self._emit("mcp_tool_invocation", record.to_dict())
+            self._emit_tool_result(record)
+            return record
+
+    def _finish(self, record: MCPInvocationRecord) -> MCPInvocationRecord:
+        record.completed_at = time.time()
+        self._invocations.append(record)
+        return record
+
+    def langchain_tools(self) -> List[Any]:
+        """Convert discovered MCP tools to policy-aware LangChain tools."""
+        from langchain_mcp_adapters.tools import convert_mcp_tool_to_langchain_tool
+
+        tools: List[Any] = []
+        for server in self._servers.values():
+            if not server.connected or server.session is None:
+                continue
+            prefix = re.sub(r"[^A-Za-z0-9_]", "_", server.config.server_id)
+            for tool in server.tools.values():
+                tools.append(convert_mcp_tool_to_langchain_tool(
+                    server.session,
+                    tool.tool,
+                    server_name=prefix,
+                    tool_name_prefix=True,
+                    tool_interceptors=[_PolicyInterceptor(self, server)],
+                    handle_tool_errors=False,
+                ))
+        return tools
 
 
-def convert_mcp_to_langchain_tools(
-    servers: Dict[str, MCPServer],
-) -> List[Tool]:
-    """Convert discovered MCP tools into LangChain Tool objects."""
-    tools = []
-    for server_name, server in servers.items():
-        for tool in server.tools:
-            # Wrap each MCP tool with server identity preserved
-            wrapped_func = lambda args, sn=server_name, tn=tool.name: _call_tool_mcp(sn, tn, args)
-            langchain_tool = Tool(
-                name=tool.name,
-                description=tool.description or f"MCP tool from {server_name}",
-                func=wrapped_func,
-                handle_tool_error=True,
-            )
-            tools.append(langchain_tool)
-    return tools
+# Global manager used by the one-task-per-process protocol runtime.
+mcp_manager = MCPManager()
 
 
-def get_all_tools() -> Dict[str, List[Tool]]:
-    """Get all tools organized by server."""
-    result = {}
-    for name, server in mcp_manager._servers.items():
-        if server.tools:
-            result[name] = server.tools
-    return result
+def configure_manager(
+    task_id: Optional[str] = None,
+    configs: Optional[Sequence[Dict[str, Any]]] = None,
+    granted_fingerprints: Optional[Sequence[str]] = None,
+) -> MCPManager:
+    """Reset the process-wide manager for one task submission."""
+    global mcp_manager
+    mcp_manager = MCPManager(task_id, set(granted_fingerprints or ()))
+    for raw in configs or []:
+        mcp_manager.add_config(MCPServerConfig.from_dict(raw))
+    return mcp_manager
 
 
-async def initialize_all_servers() -> Dict[str, bool]:
-    """Initialize all registered MCP servers and discover their tools."""
-    results = {}
-    for name, server in mcp_manager._servers.items():
+async def connect_all(manager: Optional[MCPManager] = None) -> Dict[str, bool]:
+    target = manager or mcp_manager
+    results: Dict[str, bool] = {}
+    for config in target.configs():
         try:
-            if not server._initialized:
-                tools = await discover_tools(server)
-                server._initialized = True
-            results[name] = True
-        except Exception as e:
-            logger.error(f"Failed to initialize server {name}: {e}")
-            results[name] = False
+            await target.connect(config)
+            results[config.server_id] = True
+        except MCPError as exc:
+            logger.warning("MCP connect failed for %s (%s)", config.server_id, exc.code)
+            results[config.server_id] = False
     return results
 
 
-# Convenience functions for common operations
-
-async def connect_server(name: str) -> bool:
-    """Connect to a specific MCP server."""
-    server = mcp_manager.get_server(name)
-    if server is None:
-        return False
-    
-    if not server._connected:
-        try:
-            if server.transport == TRANSPORT_STDIO:
-                await _stdio_transport(server)
-            elif server.transport == TRANSPORT_STREAMABLE_HTTP:
-                await _streamable_http_transport(server)
-            logger.info(f"Connected to MCP server: {name}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to server {name}: {e}")
-            return False
-    
-    return server._connected
+async def shutdown_all(manager: Optional[MCPManager] = None) -> None:
+    target = manager or mcp_manager
+    await target.close_all()
 
 
-async def disconnect_server(name: str) -> bool:
-    """Disconnect from a specific MCP server."""
-    server = mcp_manager.get_server(name)
-    if server is None:
-        return False
-    
-    await mcp_manager._safe_disconnect(server)
-    logger.info(f"Disconnected from MCP server: {name}")
-    return True
+__all__ = [
+    "MCPError", "MCPInvocationRecord", "MCPManager", "MCPServerConfig", "MCPToolRecord",
+    "POLICY_ALLOWED", "POLICY_APPROVAL_REQUIRED", "POLICY_BLOCKED",
+    "TRANSPORT_STDIO", "TRANSPORT_STREAMABLE_HTTP",
+    "action_fingerprint", "canonical_json", "classify_tool", "configure_manager",
+    "connect_all", "mcp_manager", "redact", "shutdown_all",
+]
