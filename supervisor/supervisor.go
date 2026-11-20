@@ -22,9 +22,11 @@ const (
 	// Python's first import of the LangGraph stack can take several seconds on
 	// a cold Windows machine or under build load. Keep the probe bounded, but
 	// do not report a healthy runtime as unavailable during that cold start.
-	runtimeProbeTimeout   = 15 * time.Second
-	maxConcurrentTasks    = 2
-	taskExecutionTimeout  = 60 * time.Second
+	runtimeProbeTimeout = 15 * time.Second
+	maxConcurrentTasks  = 2
+	// A locally installed CPU-only chat model can take several minutes to load
+	// and answer its first request. Keep the bound, but allow real inference.
+	taskExecutionTimeout  = 180 * time.Second
 	cancelAckTimeout      = 5 * time.Second
 	processCleanupTimeout = 3 * time.Second
 	maxTaskInputBytes     = 64 << 10

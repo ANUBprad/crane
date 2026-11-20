@@ -85,7 +85,8 @@ class ProviderConfigurationTests(unittest.TestCase):
         self.assertEqual(config.model, provider.DEFAULT_MODEL)
         self.assertEqual(config.base_url, provider.DEFAULT_BASE_URL)
         self.assertEqual(config.connect_timeout_seconds, 5.0)
-        self.assertEqual(config.invoke_timeout_seconds, 45.0)
+        self.assertEqual(config.invoke_timeout_seconds, 180.0)
+        self.assertEqual(config.num_ctx, 4096)
         self.assertFalse(config.allow_remote)
 
     def test_explicit_environment_is_validated(self) -> None:
@@ -94,11 +95,13 @@ class ProviderConfigurationTests(unittest.TestCase):
             "OLLAMA_HOST": "http://127.0.0.1:1234/",
             "CRANE_OLLAMA_CONNECT_TIMEOUT_SECONDS": "1.5",
             "CRANE_OLLAMA_INVOKE_TIMEOUT_SECONDS": "30",
+            "CRANE_OLLAMA_NUM_CTX": "8192",
         })
         self.assertEqual(config.model, "custom:tag")
         self.assertEqual(config.base_url, "http://127.0.0.1:1234")
         self.assertEqual(config.connect_timeout_seconds, 1.5)
         self.assertEqual(config.invoke_timeout_seconds, 30.0)
+        self.assertEqual(config.num_ctx, 8192)
 
     def test_empty_model_is_actionable_configuration_error(self) -> None:
         with self.assertRaises(provider.ProviderError) as raised:
@@ -113,6 +116,17 @@ class ProviderConfigurationTests(unittest.TestCase):
                         "CRANE_OLLAMA_INVOKE_TIMEOUT_SECONDS": value,
                     })
                 self.assertEqual(raised.exception.code, "provider_invalid_configuration")
+
+    def test_invalid_num_ctx_is_rejected(self) -> None:
+        for value in ("0", "-1", "1.5", "abc", str(provider.MAX_NUM_CTX + 1)):
+            with self.subTest(value=value):
+                with self.assertRaises(provider.ProviderError) as raised:
+                    provider.load_ollama_config({"CRANE_OLLAMA_NUM_CTX": value})
+                self.assertEqual(raised.exception.code, "provider_invalid_configuration")
+
+    def test_config_details_report_bounded_context_size(self) -> None:
+        config = provider.load_ollama_config({"CRANE_OLLAMA_NUM_CTX": "2048"})
+        self.assertEqual(config.details()["num_ctx"], 2048)
 
     def test_remote_endpoint_requires_explicit_authorization(self) -> None:
         with self.assertRaises(provider.ProviderError) as raised:
@@ -143,7 +157,24 @@ class ProviderInvocationTests(unittest.TestCase):
         self.assertEqual(chat.kwargs["model"], "crane-test:latest")
         self.assertEqual(chat.kwargs["base_url"], "http://127.0.0.1:11434")
         self.assertEqual(chat.kwargs["temperature"], 0)
-        self.assertEqual(chat.kwargs["client_kwargs"]["timeout"], 45.0)
+        self.assertEqual(chat.kwargs["num_ctx"], 4096)
+        self.assertEqual(chat.kwargs["client_kwargs"]["timeout"], 180.0)
+
+    def test_custom_num_ctx_is_passed_to_chat_ollama(self) -> None:
+        config = provider.load_ollama_config({
+            **OLLAMA_ENV,
+            "CRANE_OLLAMA_NUM_CTX": "2048",
+        })
+        with patch.dict(sys.modules, fake_chat_module()):
+            provider._create_chat_model(config)
+        self.assertEqual(FakeChatOllama.calls[0]["num_ctx"], 2048)
+
+    def test_chat_model_import_does_not_leave_transformers_blocked(self) -> None:
+        config = provider.load_ollama_config(OLLAMA_ENV)
+        with patch.dict(sys.modules, fake_chat_module()):
+            sys.modules.pop("transformers", None)
+            provider._create_chat_model(config)
+            self.assertNotIn("transformers", sys.modules)
 
     def test_missing_dependency_is_actionable(self) -> None:
         config = provider.load_ollama_config(OLLAMA_ENV)

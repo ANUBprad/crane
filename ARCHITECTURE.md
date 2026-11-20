@@ -141,9 +141,9 @@ Provider policy:
 Current implementation:
 - MCP-to-LangChain tool adapter code exists but is not exposed by the current task API.
 - `CRANE_MODEL_PROVIDER=local` is the default and returns deterministic workflow facts without inventing model output. `CRANE_MODEL_PROVIDER=ollama` uses `langchain_ollama.ChatOllama` with the validated `langchain-ollama==1.1.0` integration; an unsupported, unavailable or misconfigured provider fails explicitly with no fallback.
-- Ollama execution first validates configuration, connectivity and the configured model (`CRANE_MODEL`, default `llama3.2:3b`), then invokes `ChatOllama` through the LangGraph worker. Invocation and connection timeouts are configurable; non-loopback `OLLAMA_HOST` values require explicit `CRANE_ALLOW_REMOTE_OLLAMA` authorization. CRANE never downloads model weights automatically.
+- Ollama execution first validates configuration, connectivity and the configured model (`CRANE_MODEL`, default `llama3.2:3b`), then invokes `ChatOllama` through the LangGraph worker with a bounded context size (`CRANE_OLLAMA_NUM_CTX`, default `4096`) and configurable timeouts; non-loopback `OLLAMA_HOST` values require explicit `CRANE_ALLOW_REMOTE_OLLAMA` authorization. CRANE never downloads model weights automatically.
 - `agent doctor` reports installation, connectivity, configured model, model availability and provider initialization state without task text or credentials.
-- Windows validation covered the real dependency, real Ollama preflight/diagnostics and mocked `ChatOllama` invocation through LangGraph and SQLite. A real chat-model invocation was not possible because the local Ollama installation contains only an embedding model.
+- Windows validation covered the real dependency, real Ollama preflight/diagnostics, a real `llama3.2:3b` `ChatOllama` invocation through LangGraph and SQLite, invalid-model failure, persisted lifecycle events and authenticated SSE replay. No fallback occurred.
 
 ### 4.6 MCP manager — `crane/mcp_runtime`
 

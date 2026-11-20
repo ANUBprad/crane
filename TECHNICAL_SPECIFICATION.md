@@ -161,7 +161,8 @@ Python runtime environment:
 | `CRANE_MODEL` | Ollama model name when the provider is `ollama`; defaults to `llama3.2:3b` when unset, while an explicitly empty value is an error |
 | `OLLAMA_HOST` | Optional explicit Ollama base URL; defaults to `http://127.0.0.1:11434`; no implicit hosted endpoint |
 | `CRANE_OLLAMA_CONNECT_TIMEOUT_SECONDS` | Ollama connectivity/model-list timeout; default `5`, maximum `30` |
-| `CRANE_OLLAMA_INVOKE_TIMEOUT_SECONDS` | Ollama chat invocation timeout; default `45`, maximum `300` |
+| `CRANE_OLLAMA_INVOKE_TIMEOUT_SECONDS` | Ollama chat invocation timeout; default `180`, maximum `300` |
+| `CRANE_OLLAMA_NUM_CTX` | Context size passed to `ChatOllama` as `num_ctx`; default `4096`, maximum `131072` |
 | `CRANE_ALLOW_REMOTE_OLLAMA` | Must be truthy to authorize a non-loopback `OLLAMA_HOST`; task text is never sent to a remote endpoint implicitly |
 
 ## Error model

@@ -533,6 +533,12 @@ func TestCancelImmediatelyAfterAdmissionStaysCancelled(t *testing.T) {
 	}
 }
 
+func TestTaskExecutionTimeoutAllowsBoundedLocalInference(t *testing.T) {
+	if taskExecutionTimeout < 180*time.Second || taskExecutionTimeout > 300*time.Second {
+		t.Fatalf("taskExecutionTimeout = %s, want a bounded timeout that allows a cold local model", taskExecutionTimeout)
+	}
+}
+
 func TestStartupRecoveryPolicies(t *testing.T) {
 	t.Run("queued task resumes", func(t *testing.T) {
 		s, store := newHelperSupervisor(t, "success")

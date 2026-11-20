@@ -78,7 +78,7 @@ This diagram describes the intended component boundaries. It does not imply that
 | MCP integration | Yes | Manager, transports, discovery and adapter code exist; live-server behavior needs validation |
 | LangChain adapter | Yes | MCP adapter and explicit local/Ollama provider policy exist; no silent hosted fallback |
 | LangGraph workflow | Yes | Real `StateGraph` execution, checkpoints and bounded steps are exercised; MCP/approval nodes remain unavailable |
-| Ollama provider | Implemented (not fully validated) | Pinned `langchain-ollama` is installed; preflight, diagnostics and mocked LangGraph/SQLite invocation paths are tested on Windows. No real chat-model invocation was possible locally because only an embedding model is installed |
+| Ollama provider | Validated | Pinned `langchain-ollama` is installed; real `llama3.2:3b` inference, preflight, diagnostics, invalid-model failure and LangGraph/SQLite persistence are validated on Windows. No fallback is permitted |
 | Installer / signed releases | No | Not available |
 | Production Windows release | No | Acceptance testing and packaging remain |
 
@@ -91,7 +91,7 @@ The project now has an end-to-end supervisor/API/desktop task path backed by rea
 1. Validate MCP connections and tool invocation against local test servers.
 2. Implement and verify exact-action approval persistence, denial and restart behavior.
 3. Verify timeouts, concurrency saturation, side-effect ambiguity and cancellation under real MCP tools.
-4. Validate the pinned Ollama provider against an installed local chat model; connectivity, model preflight and diagnostics are verified, but no real model invocation was possible locally. No fallback is permitted.
+4. Keep validating additional local models and packaged-runtime behavior. The pinned Ollama provider has completed a real `llama3.2:3b` end-to-end task with no fallback.
 5. Complete a reproducible pinned Python environment and packaged runtime; `requirements.txt` currently pins the Ollama integration only.
 6. Package and test the complete application on Windows before calling it installable.
 

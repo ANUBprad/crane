@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import socket
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,9 +24,11 @@ from typing import Any, Dict, List, Mapping, Optional
 DEFAULT_MODEL = "llama3.2:3b"
 DEFAULT_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
-DEFAULT_INVOKE_TIMEOUT_SECONDS = 45.0
+DEFAULT_INVOKE_TIMEOUT_SECONDS = 180.0
 MAX_CONNECT_TIMEOUT_SECONDS = 30.0
 MAX_INVOKE_TIMEOUT_SECONDS = 300.0
+DEFAULT_NUM_CTX = 4096
+MAX_NUM_CTX = 131072
 OLLAMA_DEPENDENCY = "langchain-ollama==1.1.0"
 _TAGS_RESPONSE_LIMIT = 1 << 20
 
@@ -47,6 +50,7 @@ class OllamaConfig:
     base_url: str
     connect_timeout_seconds: float
     invoke_timeout_seconds: float
+    num_ctx: int
     allow_remote: bool
 
     def details(self) -> Dict[str, Any]:
@@ -55,6 +59,7 @@ class OllamaConfig:
             "base_url": self.base_url,
             "connect_timeout_seconds": self.connect_timeout_seconds,
             "invoke_timeout_seconds": self.invoke_timeout_seconds,
+            "num_ctx": self.num_ctx,
             "remote_endpoint_authorized": self.allow_remote,
         }
 
@@ -73,6 +78,19 @@ def prepare_provider(env: Optional[Mapping[str, str]] = None) -> None:
         preflight_ollama(load_ollama_config(env))
 
 
+def _import_chat_ollama() -> Any:
+    """Import ChatOllama without loading LangChain's unused transformers path."""
+    block_transformers = "transformers" not in sys.modules
+    if block_transformers:
+        sys.modules["transformers"] = None
+    try:
+        from langchain_ollama import ChatOllama  # type: ignore
+        return ChatOllama
+    finally:
+        if block_transformers:
+            sys.modules.pop("transformers", None)
+
+
 def warm_provider(env: Optional[Mapping[str, str]] = None) -> None:
     """Import the configured provider on the caller thread before task work.
 
@@ -84,7 +102,7 @@ def warm_provider(env: Optional[Mapping[str, str]] = None) -> None:
     if selected_provider(env) != "ollama":
         return
     try:
-        from langchain_ollama import ChatOllama  # type: ignore  # noqa: F401
+        _import_chat_ollama()
     except ImportError:
         pass
 
@@ -108,6 +126,24 @@ def _parse_timeout(
         raise ProviderError(
             "provider_invalid_configuration",
             f"{name} must be greater than 0 and at most {maximum:g} seconds.",
+        )
+    return value
+
+
+def _parse_num_ctx(raw: Optional[str]) -> int:
+    if raw is None or not raw.strip():
+        return DEFAULT_NUM_CTX
+    try:
+        value = int(raw.strip())
+    except (TypeError, ValueError) as exc:
+        raise ProviderError(
+            "provider_invalid_configuration",
+            f"CRANE_OLLAMA_NUM_CTX must be a whole number of tokens between 1 and {MAX_NUM_CTX}.",
+        ) from exc
+    if value < 1 or value > MAX_NUM_CTX:
+        raise ProviderError(
+            "provider_invalid_configuration",
+            f"CRANE_OLLAMA_NUM_CTX must be between 1 and {MAX_NUM_CTX} tokens.",
         )
     return value
 
@@ -188,6 +224,7 @@ def load_ollama_config(env: Optional[Mapping[str, str]] = None) -> OllamaConfig:
         DEFAULT_INVOKE_TIMEOUT_SECONDS,
         MAX_INVOKE_TIMEOUT_SECONDS,
     )
+    num_ctx = _parse_num_ctx(values.get("CRANE_OLLAMA_NUM_CTX"))
     allow_remote = _parse_bool(
         "CRANE_ALLOW_REMOTE_OLLAMA",
         values.get("CRANE_ALLOW_REMOTE_OLLAMA"),
@@ -198,7 +235,7 @@ def load_ollama_config(env: Optional[Mapping[str, str]] = None) -> OllamaConfig:
             "ollama_remote_endpoint_not_authorized",
             "OLLAMA_HOST names a non-local endpoint. Set CRANE_ALLOW_REMOTE_OLLAMA=1 only when you explicitly authorize sending task text to that endpoint.",
         )
-    return OllamaConfig(model, base_url, connect_timeout, invoke_timeout, allow_remote)
+    return OllamaConfig(model, base_url, connect_timeout, invoke_timeout, num_ctx, allow_remote)
 
 
 def provider_details(env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
@@ -316,17 +353,18 @@ def preflight_ollama(config: OllamaConfig) -> List[str]:
 
 def _create_chat_model(config: OllamaConfig) -> Any:
     try:
-        from langchain_ollama import ChatOllama  # type: ignore
+        chat_class = _import_chat_ollama()
     except ImportError as exc:
         raise ProviderError(
             "provider_unavailable",
             f"Ollama provider dependency is missing. Install {OLLAMA_DEPENDENCY} or use CRANE_MODEL_PROVIDER=local.",
         ) from exc
     try:
-        return ChatOllama(
+        return chat_class(
             model=config.model,
             base_url=config.base_url,
             temperature=0,
+            num_ctx=config.num_ctx,
             client_kwargs={"timeout": config.invoke_timeout_seconds},
         )
     except Exception as exc:  # noqa: BLE001 - normalize third-party initialization errors
@@ -438,6 +476,8 @@ __all__ = [
     "DEFAULT_CONNECT_TIMEOUT_SECONDS",
     "DEFAULT_INVOKE_TIMEOUT_SECONDS",
     "DEFAULT_MODEL",
+    "DEFAULT_NUM_CTX",
+    "MAX_NUM_CTX",
     "OllamaConfig",
     "OLLAMA_DEPENDENCY",
     "ProviderError",
