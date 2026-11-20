@@ -136,6 +136,8 @@ class ProtocolRuntime:
                         python_runtime_pid=os.getpid(),
                         task_id=current_id,
                         resume_checkpoint=command["checkpoint"] if command["resume"] else None,
+                        mcp_servers=command["mcp_servers"],
+                        granted_approvals=command["granted_approvals"],
                     ),
                 )
             if future is not None:

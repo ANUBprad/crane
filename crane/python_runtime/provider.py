@@ -6,6 +6,7 @@ integration is the only supported provider boundary.
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import math
@@ -31,6 +32,7 @@ DEFAULT_NUM_CTX = 4096
 MAX_NUM_CTX = 131072
 OLLAMA_DEPENDENCY = "langchain-ollama==1.1.0"
 _TAGS_RESPONSE_LIMIT = 1 << 20
+MAX_TOOL_ROUNDS = 4
 
 
 class ProviderError(RuntimeError):
@@ -397,6 +399,106 @@ def _invoke_ollama(user_input: str, env: Optional[Mapping[str, str]] = None) -> 
     }
 
 
+def _tool_output_text(output: Any) -> str:
+    """Normalize LangChain tool output to the text sent back to the model."""
+    if isinstance(output, tuple):
+        output = output[0] if output else ""
+    if isinstance(output, str):
+        return output.strip() or "Tool completed"
+    if isinstance(output, list):
+        parts: List[str] = []
+        for item in output:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        if parts:
+            return "\n".join(parts)
+    try:
+        return json.dumps(output, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(output)
+
+
+async def _invoke_ollama_with_tools(
+    user_input: str,
+    tools: List[Any],
+    env: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """Run a bounded Ollama tool loop using real LangChain MCP tools."""
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+    from crane.mcp_runtime import redact
+
+    config = load_ollama_config(env)
+    preflight_ollama(config)
+    chat_model = _create_chat_model(config)
+    try:
+        bound_model = chat_model.bind_tools(tools)
+    except Exception as exc:  # noqa: BLE001 - normalize provider binding failures
+        raise ProviderError(
+            "provider_tool_binding_failed",
+            "The configured Ollama model could not bind the discovered MCP tools.",
+        ) from exc
+
+    messages: List[Any] = [
+        SystemMessage(content=(
+            "You are CRANE, a headless execution agent. Use the provided MCP tools "
+            "when a task requires a tool action. When a tool is used, base the final "
+            "answer on its actual returned content and do not claim unperformed effects."
+        )),
+        HumanMessage(content=normalize_input(user_input)),
+    ]
+    observed: List[Dict[str, Any]] = []
+    for _ in range(MAX_TOOL_ROUNDS):
+        try:
+            response = await asyncio.to_thread(bound_model.invoke, messages)
+        except Exception as exc:  # noqa: BLE001 - provider errors must be actionable
+            raise ProviderError(
+                "provider_invocation_failed",
+                f"The configured Ollama model {config.model!r} did not complete the tool workflow.",
+            ) from exc
+        calls = list(getattr(response, "tool_calls", None) or [])
+        content = getattr(response, "content", "")
+        content_text = _tool_output_text(content) if content is not None else ""
+        messages.append(AIMessage(content=content_text, tool_calls=calls))
+        if not calls:
+            if not content_text.strip():
+                raise ProviderError("provider_empty_response", "The configured model returned an empty response.")
+            return {
+                "execution_mode": "langchain_ollama_mcp",
+                "provider": "ollama",
+                "model": config.model,
+                "model_output": content_text.strip(),
+                "notice": None,
+                "tool_calls": observed,
+            }
+
+        for call in calls:
+            name = str(call.get("name") or "")
+            args = call.get("args") or {}
+            call_id = str(call.get("id") or name)
+            tool = next((item for item in tools if getattr(item, "name", None) == name), None)
+            if tool is None:
+                tool_text = f"MCP tool {name!r} is not available"
+                messages.append(ToolMessage(content=tool_text, tool_call_id=call_id, status="error"))
+                observed.append(redact({"name": name, "arguments": args, "result": tool_text}))
+                continue
+            try:
+                raw_output = await tool.ainvoke(args)
+                tool_text = _tool_output_text(raw_output)
+                messages.append(ToolMessage(content=tool_text, tool_call_id=call_id))
+            except Exception:  # noqa: BLE001 - never leak transport internals to the model
+                tool_text = "MCP tool call failed"
+                messages.append(ToolMessage(content=tool_text, tool_call_id=call_id, status="error"))
+            observed.append(redact({"name": name, "arguments": args, "result": tool_text}))
+
+    raise ProviderError(
+        "tool_loop_limit",
+        f"The model exceeded the bounded MCP tool loop ({MAX_TOOL_ROUNDS} rounds).",
+    )
+
+
 def invoke(user_input: str, env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     """Execute the configured provider path. No fallback is permitted."""
     provider = selected_provider(env)
@@ -471,6 +573,8 @@ def collect_diagnostics(env: Optional[Mapping[str, str]] = None) -> Dict[str, An
     }
 
 
+invoke_with_tools = _invoke_ollama_with_tools
+
 __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_CONNECT_TIMEOUT_SECONDS",
@@ -485,6 +589,7 @@ __all__ = [
     "deterministic_result",
     "fetch_ollama_models",
     "invoke",
+    "invoke_with_tools",
     "load_ollama_config",
     "model_is_available",
     "normalize_input",

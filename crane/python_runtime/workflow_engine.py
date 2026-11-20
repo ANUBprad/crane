@@ -11,16 +11,24 @@ import os
 import threading
 import time
 import uuid
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from langgraph.graph import END, START, StateGraph
 
+from crane.mcp_runtime import (
+    MCPManager,
+    configure_manager,
+    connect_all,
+    shutdown_all,
+)
 from crane.python_runtime import protocol
 from crane.python_runtime.provider import (
     ProviderError,
     invoke as invoke_provider,
+    invoke_with_tools,
     prepare_provider,
     provider_details,
+    selected_provider,
     warm_provider,
 )
 from crane.python_runtime.workflow_state import (
@@ -155,42 +163,89 @@ async def node_plan(raw: Dict[str, Any]) -> Dict[str, Any]:
     return state_to_checkpoint(state)
 
 
+def _make_node_execute(manager: Optional[MCPManager]) -> Callable[[Dict[str, Any]], Any]:
+    """Build the execute node with one task's private MCP manager."""
+
+    async def node_execute_with_mcp(raw: Dict[str, Any]) -> Dict[str, Any]:
+        state = _as_state(raw)
+        _check_cancelled(state.task_id)
+        state.graph_steps += 1
+        state.current_step = "executing"
+        state.wall_clock_ms = _elapsed_ms(state)
+        tool_count = 0
+        mcp_active = manager is not None and bool(manager.configs())
+        try:
+            tools = []
+            if manager is not None and mcp_active:
+                results = await connect_all(manager)
+                if not all(results.values()):
+                    raise ProviderError(
+                        "mcp_connect_failed",
+                        "One or more configured MCP servers could not be connected",
+                    )
+                tools = manager.langchain_tools()
+                tool_count = len(tools)
+                state.persistent_state["mcp"] = {
+                    "server_count": len(results),
+                    "tool_count": tool_count,
+                }
+                _event(state.task_id, "mcp_tools_discovered", {
+                    "server_count": len(results),
+                    "tool_count": tool_count,
+                })
+
+            prepare_provider()
+            warm_provider()
+            if tools:
+                if selected_provider() != "ollama":
+                    raise ProviderError(
+                        "mcp_tool_provider_required",
+                        "MCP tools require CRANE_MODEL_PROVIDER=ollama with a tool-capable local model",
+                    )
+                output = await invoke_with_tools(state.user_input, tools)
+            else:
+                output = await asyncio.to_thread(invoke_provider, state.user_input)
+            state.result = output
+            state.result_summary = f"Completed with {output.get('execution_mode', 'configured')} execution"
+            state.state = TaskState.SUCCEEDED
+            state.current_step = "succeeded"
+            _event(state.task_id, "provider_result", {
+                "execution_mode": output.get("execution_mode"),
+                "provider": output.get("provider"),
+                "mcp_tool_count": tool_count,
+            })
+        except ProviderError as exc:
+            state.state = TaskState.FAILED
+            state.failure_reason = exc.message
+            state.current_step = "provider_failed"
+            state.result = {"code": exc.code, "message": exc.message}
+            state.result_summary = "Configured provider could not complete the task"
+            _event(state.task_id, "provider_failed", {"code": exc.code})
+        except WorkflowCancelled:
+            raise
+        except Exception:  # noqa: BLE001 - never leak provider internals across the process boundary
+            state.state = TaskState.FAILED
+            state.failure_reason = "Workflow execution failed unexpectedly"
+            state.current_step = "failed_unexpected"
+            state.result_summary = "Workflow execution failed"
+        finally:
+            if mcp_active and manager is not None:
+                try:
+                    async with asyncio.timeout(5):
+                        await shutdown_all(manager)
+                except Exception:  # noqa: BLE001 - shutdown must not mask the task outcome
+                    logger.warning("MCP shutdown did not complete cleanly for task %s", state.task_id)
+        state.wall_clock_ms = _elapsed_ms(state)
+        state.completed_at = time.time()
+        _persist_task_state(state)
+        return state_to_checkpoint(state)
+
+    return node_execute_with_mcp
+
+
 async def node_execute(raw: Dict[str, Any]) -> Dict[str, Any]:
-    state = _as_state(raw)
-    _check_cancelled(state.task_id)
-    state.graph_steps += 1
-    state.current_step = "executing"
-    state.wall_clock_ms = _elapsed_ms(state)
-    try:
-        prepare_provider()
-        warm_provider()
-        output = await asyncio.to_thread(invoke_provider, state.user_input)
-        state.result = output
-        state.result_summary = f"Completed with {output.get('execution_mode', 'configured')} execution"
-        state.state = TaskState.SUCCEEDED
-        state.current_step = "succeeded"
-        _event(state.task_id, "provider_result", {
-            "execution_mode": output.get("execution_mode"),
-            "provider": output.get("provider"),
-        })
-    except ProviderError as exc:
-        state.state = TaskState.FAILED
-        state.failure_reason = exc.message
-        state.current_step = "provider_failed"
-        state.result = {"code": exc.code, "message": exc.message}
-        state.result_summary = "Configured provider could not complete the task"
-        _event(state.task_id, "provider_failed", {"code": exc.code})
-    except WorkflowCancelled:
-        raise
-    except Exception:  # noqa: BLE001 - never leak provider internals across the process boundary
-        state.state = TaskState.FAILED
-        state.failure_reason = "Workflow execution failed unexpectedly"
-        state.current_step = "failed_unexpected"
-        state.result_summary = "Workflow execution failed"
-    state.wall_clock_ms = _elapsed_ms(state)
-    state.completed_at = time.time()
-    _persist_task_state(state)
-    return state_to_checkpoint(state)
+    """Default execute node with no MCP tools, preserved for direct graph use."""
+    return await _make_node_execute(None)(raw)
 
 
 async def node_complete(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -229,11 +284,11 @@ async def node_cancelled(raw: Dict[str, Any]) -> Dict[str, Any]:
     return state_to_checkpoint(state)
 
 
-def compile_workflow() -> Any:
+def compile_workflow(manager: Optional[MCPManager] = None) -> Any:
     graph = StateGraph(WorkflowState)
     graph.add_node("normalize", node_normalize)
     graph.add_node("plan", node_plan)
-    graph.add_node("execute", node_execute)
+    graph.add_node("execute", _make_node_execute(manager))
     graph.add_node("complete", node_complete)
     graph.add_node("fail", node_fail)
     graph.add_node("cancelled", node_cancelled)
@@ -268,11 +323,18 @@ async def execute_task(
     task_id: Optional[str] = None,
     resume_checkpoint: Optional[Dict[str, Any]] = None,
     cancellation: Optional[threading.Event] = None,
+    mcp_servers: Optional[List[Dict[str, Any]]] = None,
+    granted_approvals: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Execute one bounded task through LangGraph and return its final state."""
     resolved_id = task_id or str(uuid.uuid4())
     event = cancellation or threading.Event()
     _register_cancellation(resolved_id, event)
+    manager = configure_manager(
+        task_id=resolved_id,
+        configs=mcp_servers,
+        granted_fingerprints=granted_approvals,
+    )
     try:
         if resume_checkpoint:
             state = state_from_checkpoint(resume_checkpoint)
@@ -288,7 +350,7 @@ async def execute_task(
                 python_runtime_pid=python_runtime_pid,
                 state=TaskState.QUEUED,
             )
-        graph = compile_workflow()
+        graph = compile_workflow(manager)
         raw_result = await graph.ainvoke(
             state_to_checkpoint(state),
             config={"configurable": {"thread_id": resolved_id}},

@@ -467,6 +467,10 @@ class MCPManager:
     def tools(self) -> List[MCPToolRecord]:
         return [tool for server in self._servers.values() for tool in server.tools.values()]
 
+    def server_tools(self, server_id: str) -> Dict[str, MCPToolRecord]:
+        server = self._servers.get(server_id)
+        return dict(server.tools) if server is not None else {}
+
     def server_states(self) -> List[Dict[str, Any]]:
         """Return API-safe server state without environment values."""
         return [{
