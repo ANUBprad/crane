@@ -119,6 +119,7 @@ agent serve
 agent --version
 agent api-token [--rotate | --revoke]
 agent task create --id <id> --input <text>
+agent doctor
 ```
 
 The original proposed contract below remains planned:
@@ -131,7 +132,6 @@ agent result <task-id>
 agent cancel <task-id>
 agent logs <task-id> [--follow] [--verbose]
 agent mcp list
-agent doctor
 agent update
 agent uninstall
 ```
@@ -158,8 +158,11 @@ Python runtime environment:
 | `CRANE_PYTHON_HOME` | Repository/runtime root used when spawning Python children |
 | `CRANE_PYTHON` | Explicit Python executable override |
 | `CRANE_MODEL_PROVIDER` | `local` (default, deterministic offline facts) or `ollama` |
-| `CRANE_MODEL` | Required local Ollama model name when the provider is `ollama` |
-| `OLLAMA_HOST` | Optional explicit Ollama base URL; no implicit hosted endpoint |
+| `CRANE_MODEL` | Ollama model name when the provider is `ollama`; defaults to `llama3.2:3b` when unset, while an explicitly empty value is an error |
+| `OLLAMA_HOST` | Optional explicit Ollama base URL; defaults to `http://127.0.0.1:11434`; no implicit hosted endpoint |
+| `CRANE_OLLAMA_CONNECT_TIMEOUT_SECONDS` | Ollama connectivity/model-list timeout; default `5`, maximum `30` |
+| `CRANE_OLLAMA_INVOKE_TIMEOUT_SECONDS` | Ollama chat invocation timeout; default `45`, maximum `300` |
+| `CRANE_ALLOW_REMOTE_OLLAMA` | Must be truthy to authorize a non-loopback `OLLAMA_HOST`; task text is never sent to a remote endpoint implicitly |
 
 ## Error model
 

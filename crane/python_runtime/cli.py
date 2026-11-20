@@ -3,10 +3,12 @@
 Stdout is reserved for versioned protocol messages in child-process mode.
 Diagnostics always go to stderr.
 """
+import json
 import logging
 import sys
 
 from crane.python_runtime.protocol_runtime import ProtocolRuntime
+from crane.python_runtime.provider import collect_diagnostics
 from crane.python_runtime.runtime import Runtime, build_health_response
 
 
@@ -17,6 +19,10 @@ def main() -> None:
 
     if len(sys.argv) > 1 and sys.argv[1] == "--health":
         print(build_health_response(runtime.version, runtime.python_version))
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--doctor":
+        print(json.dumps(collect_diagnostics(), ensure_ascii=False))
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "--protocol":

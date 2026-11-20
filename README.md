@@ -78,7 +78,7 @@ This diagram describes the intended component boundaries. It does not imply that
 | MCP integration | Yes | Manager, transports, discovery and adapter code exist; live-server behavior needs validation |
 | LangChain adapter | Yes | MCP adapter and explicit local/Ollama provider policy exist; no silent hosted fallback |
 | LangGraph workflow | Yes | Real `StateGraph` execution, checkpoints and bounded steps are exercised; MCP/approval nodes remain unavailable |
-| Ollama provider | Implemented (not fully validated) | `langchain-ollama` is not installed in the validated environment; only the explicit unavailable-provider failure path was tested |
+| Ollama provider | Implemented (not fully validated) | Pinned `langchain-ollama` is installed; preflight, diagnostics and mocked LangGraph/SQLite invocation paths are tested on Windows. No real chat-model invocation was possible locally because only an embedding model is installed |
 | Installer / signed releases | No | Not available |
 | Production Windows release | No | Acceptance testing and packaging remain |
 
@@ -91,8 +91,8 @@ The project now has an end-to-end supervisor/API/desktop task path backed by rea
 1. Validate MCP connections and tool invocation against local test servers.
 2. Implement and verify exact-action approval persistence, denial and restart behavior.
 3. Verify timeouts, concurrency saturation, side-effect ambiguity and cancellation under real MCP tools.
-4. Install and validate the pinned Ollama provider dependency against a local model; no fallback is permitted.
-5. Add a reproducible pinned Python environment and packaged runtime.
+4. Validate the pinned Ollama provider against an installed local chat model; connectivity, model preflight and diagnostics are verified, but no real model invocation was possible locally. No fallback is permitted.
+5. Complete a reproducible pinned Python environment and packaged runtime; `requirements.txt` currently pins the Ollama integration only.
 6. Package and test the complete application on Windows before calling it installable.
 
 ## Build and validation
@@ -107,7 +107,9 @@ go build ./...
 go vet ./...
 go test ./...
 python -m compileall -q crane
+python -m unittest discover -s crane/python_runtime -p 'test_*.py'
 python -m crane.python_runtime --health
+go run ./cmd/agent doctor
 ```
 
 Desktop checks from `apps/desktop`:
@@ -117,7 +119,7 @@ npm run typecheck
 npm run build
 ```
 
-These checks were run on Windows 11 x64 on 2026-11-20 and passed for the current task path; exact commands and results are recorded in [PROJECT_TRACKER.md](PROJECT_TRACKER.md). This is not a claim of release acceptance. Python dependencies are not yet documented in a committed lock/requirements file, so a reproducible Python installation workflow is still outstanding.
+These checks were run on Windows 11 x64 on 2026-11-20 and passed for the current task path; exact commands and results are recorded in [PROJECT_TRACKER.md](PROJECT_TRACKER.md). This is not a claim of release acceptance. `requirements.txt` pins `langchain-ollama==1.1.0` and `ollama==0.6.3`; a complete reproducible Python environment and packaged runtime are still outstanding.
 
 The current executable supports these development commands:
 
@@ -128,9 +130,10 @@ go run ./cmd/agent api-token
 go run ./cmd/agent api-token --rotate
 go run ./cmd/agent api-token --revoke
 go run ./cmd/agent task create --id example --input "private task input"
+go run ./cmd/agent doctor
 ```
 
-`serve` starts the supervisor and authenticated loopback API on `127.0.0.1:8787`. `api-token` is a trusted integration boundary: it prints the installation token to stdout only; the token is never passed in an argument, URL, browser storage or renderer API. `api-token --rotate` prints a replacement and permanently revokes the previous token; `api-token --revoke` leaves no active token and writes its status to stderr. Rotation/revocation takes effect in an already-running server because protected state is reloaded on each request.
+`serve` starts the supervisor and authenticated loopback API on `127.0.0.1:8787`. `api-token` is a trusted integration boundary: it prints the installation token to stdout only; the token is never passed in an argument, URL, browser storage or renderer API. `api-token --rotate` prints a replacement and permanently revokes the previous token; `api-token --revoke` leaves no active token and writes its status to stderr. Rotation/revocation takes effect in an already-running server because protected state is reloaded on each request. `doctor` reports provider, Ollama installation/connectivity, configured model availability and provider initialization state without task text or credentials.
 
 The full task-oriented CLI contract is still under development. Do not treat proposed commands in the technical specification as implemented commands.
 

@@ -16,7 +16,13 @@ from typing import Any, Callable, Dict, Optional
 from langgraph.graph import END, START, StateGraph
 
 from crane.python_runtime import protocol
-from crane.python_runtime.provider import ProviderError, invoke as invoke_provider, provider_details
+from crane.python_runtime.provider import (
+    ProviderError,
+    invoke as invoke_provider,
+    prepare_provider,
+    provider_details,
+    warm_provider,
+)
 from crane.python_runtime.workflow_state import (
     MAX_GRAPH_STEPS,
     MAX_WALL_CLOCK_MS,
@@ -122,9 +128,10 @@ async def node_normalize(raw: Dict[str, Any]) -> Dict[str, Any]:
     state.cancelled = False
     state.state = TaskState.RUNNING
     state.started_at = state.started_at or time.time()
-    state.persistent_state["execution"] = provider_details()
+    details = provider_details()
+    state.persistent_state["execution"] = details
     _persist_task_state(state)
-    _event(state.task_id, "workflow_started", {"provider": provider_details()["name"]})
+    _event(state.task_id, "workflow_started", {"provider": details["name"]})
     return state_to_checkpoint(state)
 
 
@@ -155,6 +162,8 @@ async def node_execute(raw: Dict[str, Any]) -> Dict[str, Any]:
     state.current_step = "executing"
     state.wall_clock_ms = _elapsed_ms(state)
     try:
+        prepare_provider()
+        warm_provider()
         output = await asyncio.to_thread(invoke_provider, state.user_input)
         state.result = output
         state.result_summary = f"Completed with {output.get('execution_mode', 'configured')} execution"

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -388,11 +390,110 @@ func TestRealPythonRuntimeProviderFailureIsExplicit(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := waitForStatusTimeout(t, store, "provider-failure-task", "failed", 30*time.Second)
-	if !strings.Contains(record.Result, `"code":"provider_unavailable"`) {
+	if !strings.Contains(record.Result, `"code":"provider_not_configured"`) {
 		t.Fatalf("unexpected provider failure result: %q", record.Result)
 	}
 	if strings.Contains(record.Result, `"execution_mode":"deterministic_local"`) {
 		t.Fatalf("provider failure silently fell back: %q", record.Result)
+	}
+}
+
+// useFakeLangChainOllama keeps the supervisor integration tests fast while
+// preserving the real provider configuration, LangGraph and SQLite path. The
+// real ChatOllama constructor is covered separately by the Python tests.
+func useFakeLangChainOllama(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	stub := `import os
+
+
+class _Response:
+    def __init__(self, content):
+        self.content = content
+
+
+class ChatOllama:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def invoke(self, prompt):
+        if os.environ.get("CRANE_TEST_FAKE_CHAT_FAILURE") == "1":
+            raise RuntimeError("mocked invocation failure")
+        return _Response("Mocked Ollama response")
+`
+	if err := os.WriteFile(filepath.Join(dir, "langchain_ollama.py"), []byte(stub), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	existing := os.Getenv("PYTHONPATH")
+	if existing == "" {
+		t.Setenv("PYTHONPATH", dir)
+		return
+	}
+	t.Setenv("PYTHONPATH", dir+string(os.PathListSeparator)+existing)
+}
+
+func fakeOllamaServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"models":[{"name":"crane-test:latest"}]}`)
+	}))
+}
+
+func TestRealPythonRuntimeOllamaProviderPersistsModelOutput(t *testing.T) {
+	server := fakeOllamaServer()
+	defer server.Close()
+	s, store := newRealPythonSupervisor(t)
+	t.Setenv("CRANE_MODEL_PROVIDER", "ollama")
+	t.Setenv("CRANE_MODEL", "crane-test:latest")
+	t.Setenv("OLLAMA_HOST", server.URL)
+	useFakeLangChainOllama(t)
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	if _, err := s.AdmitTask("ollama-provider-task", "Return a concise mocked provider response"); err != nil {
+		t.Fatal(err)
+	}
+	record := waitForStatusTimeout(t, store, "ollama-provider-task", "succeeded", 55*time.Second)
+	for _, expected := range []string{
+		`"execution_mode":"langchain_ollama"`,
+		`"provider":"ollama"`,
+		`"model":"crane-test:latest"`,
+		`"model_output":"Mocked Ollama response"`,
+	} {
+		if !strings.Contains(record.Result, expected) {
+			t.Fatalf("persisted result missing %s: %q", expected, record.Result)
+		}
+	}
+}
+
+func TestRealPythonRuntimeOllamaFailurePersistsWithoutFallback(t *testing.T) {
+	server := fakeOllamaServer()
+	defer server.Close()
+	s, store := newRealPythonSupervisor(t)
+	t.Setenv("CRANE_MODEL_PROVIDER", "ollama")
+	t.Setenv("CRANE_MODEL", "crane-test:latest")
+	t.Setenv("OLLAMA_HOST", server.URL)
+	t.Setenv("CRANE_TEST_FAKE_CHAT_FAILURE", "1")
+	useFakeLangChainOllama(t)
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	if _, err := s.AdmitTask("ollama-failure-task", "This task must not silently fall back"); err != nil {
+		t.Fatal(err)
+	}
+	record := waitForStatusTimeout(t, store, "ollama-failure-task", "failed", 55*time.Second)
+	if !strings.Contains(record.Result, `"code":"provider_invocation_failed"`) {
+		t.Fatalf("unexpected Ollama failure result: %q", record.Result)
+	}
+	if strings.Contains(record.Result, `"execution_mode":"deterministic_local"`) ||
+		strings.Contains(record.Result, `"model_output"`) {
+		t.Fatalf("Ollama failure fell back or invented output: %q", record.Result)
 	}
 }
 

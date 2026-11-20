@@ -22,9 +22,9 @@ This tracker reports repository evidence, not intended design. A source file bei
 | Durable checkpoint persistence | Done (verified) | Checkpoint write and restart recovery policies are covered by supervisor tests; approval recovery is not implemented |
 | Approval workflow | Partial | State fields and policy classification exist; exact-action persistence, denial and restart behavior are not exposed by the API/UI |
 | Cancellation and side-effect safety | Partial | Confirmed cancellation, cancellation-before-registration race and protocol ack are tested on Windows; real MCP side-effect replay remains unverified |
-| Ollama local provider | Implemented (not fully verified) | `CRANE_MODEL_PROVIDER=ollama` uses `langchain_ollama.ChatOllama`; `langchain-ollama` is not installed, so only the explicit unavailable-provider failure path was tested |
+| Ollama local provider | Implemented (not fully verified) | `CRANE_MODEL_PROVIDER=ollama` uses pinned `langchain-ollama==1.1.0`/`ChatOllama`; config, preflight, diagnostics and mocked LangGraph/SQLite invocation paths are tested. No real chat-model invocation was possible locally |
 | No-cloud-fallback / data-egress enforcement | Done (verified) | Default local mode never invents model output; unsupported/unavailable providers fail explicitly with no fallback |
-| Structured logs and diagnostics | Partial | Basic logging and bounded stderr exist; redaction, correlation, and user-facing diagnostics need completion |
+| Structured logs and diagnostics | Partial | Basic logging, bounded stderr and `agent doctor` provider diagnostics exist; redaction and correlation need completion |
 | Windows runtime packaging | Not started | No bundled Python runtime or release package |
 | Windows bootstrap installer | Not started | No official distribution endpoint or signed artifacts |
 | Update, rollback, and uninstall | Not started | Requires release/installer implementation |
@@ -37,8 +37,8 @@ This tracker reports repository evidence, not intended design. A source file bei
 1. Exercise MCP stdio and Streamable HTTP with actual local test servers and connect discovered tools to the graph through policy.
 2. Implement and verify exact-action approval persistence, denial, and restart recovery.
 3. Verify timeout, concurrency saturation, and side-effect ambiguity with real external tools.
-4. Install and validate `langchain-ollama` against a local model; the provider code is present but the dependency is not available in this environment.
-5. Establish a pinned Python dependency manifest, reproducible installation workflow and packaged runtime.
+4. Validate an end-to-end Ollama task against a locally installed chat model; connectivity, model preflight and diagnostics are verified, but the local Ollama installation has only an embedding model.
+5. Expand `requirements.txt` into a reproducible Python environment and packaged runtime; the Ollama integration dependencies are pinned but the complete runtime is not.
 6. Complete Windows release acceptance, packaging, signing, update, rollback and uninstall.
 
 ## Validation evidence (Windows)
@@ -51,16 +51,18 @@ go build ./...
 go vet ./...
 go test ./... -count=3
 python -m compileall -q crane
+python -m unittest discover -s crane/python_runtime -p 'test_*.py'
 python -m crane.python_runtime --health
-python -c "import importlib.util; print('langchain_ollama', bool(importlib.util.find_spec('langchain_ollama')))"
+go run ./cmd/agent doctor
 ```
 
 Results:
 
 - `gofmt`, `go build ./...`, `go vet ./...` and `python -m compileall -q crane`: no output, exit 0.
-- `go test ./... -count=3`: passed all packages; `cmd/agent 0.669s`, `localapi 2.763s`, `localauth 0.189s`, `persistence 1.035s`, `supervisor 27.067s`, `python_protocol` has no test files.
+- `go test ./... -count=3`: passed all packages; `cmd/agent 52.789s`, `localapi 14.279s`, `localauth 0.440s`, `persistence 6.368s`, `supervisor 54.735s`, `python_protocol` has no test files.
+- Python provider/workflow tests: `Ran 19 tests in 0.467s ... OK`, covering configuration, preflight, initialization, mocked `ChatOllama` success/failure, LangGraph/SQLite persistence and diagnostics without task data.
 - Python health: `{"protocol": "crane-agent/0.1.0", "status": "healthy", "version": "0.1.0", "python_version": "3.12.7"}`.
-- Ollama dependency check: `langchain_ollama False`. Only the explicit unavailable-provider failure path was exercised.
+- Real Ollama preflight: Ollama `0.40.16` is installed and reachable at `http://127.0.0.1:11434`; `agent doctor` reports configured model `llama3.2:3b` as unavailable and the provider as initializable. The local model list contains only `nomic-embed-text:latest`, so no real chat-model invocation was performed.
 - Cancellation race regression: `go test ./supervisor -run 'TestCancelImmediatelyAfterAdmissionStaysCancelled|TestCancelTaskConfirmsPythonOutcome' -count=3 -v` passed all six runs.
 
 Desktop checks from `apps/desktop`:

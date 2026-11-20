@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -78,5 +79,39 @@ func TestRunAPITokenLifecycleAndTaskCreate(t *testing.T) {
 	}
 	if _, err := filepath.Abs(root); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDoctorReportsOllamaConfigurationWithoutTaskData(t *testing.T) {
+	if _, err := exec.LookPath("python"); err != nil {
+		t.Skip("python is not available on PATH")
+	}
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CRANE_PYTHON", "python")
+	t.Setenv("CRANE_PYTHON_HOME", root)
+	t.Setenv("CRANE_MODEL_PROVIDER", "ollama")
+	t.Setenv("CRANE_MODEL", "doctor-model:latest")
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:1")
+	t.Setenv("CRANE_OLLAMA_CONNECT_TIMEOUT_SECONDS", "0.1")
+
+	var out, errOut bytes.Buffer
+	if err := run([]string{"doctor"}, &out, &errOut); err != nil {
+		t.Fatalf("doctor error = %v; stderr = %q", err, errOut.String())
+	}
+	for _, expected := range []string{
+		"Provider: ollama",
+		"Configured model: doctor-model:latest",
+		"Ollama reachable: no",
+		"ollama_unavailable",
+	} {
+		if !strings.Contains(out.String(), expected) {
+			t.Fatalf("doctor output missing %q: %q", expected, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "private input") {
+		t.Fatalf("doctor output exposed task data: %q", out.String())
 	}
 }

@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"crane/localapi"
 	"crane/localauth"
@@ -39,6 +44,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runAPIToken(args[1:], stdout, stderr)
 	case "task":
 		return runTask(args[1:], stdout, stderr)
+	case "doctor":
+		return runDoctor(args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -186,4 +193,86 @@ func runTaskCreate(args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "created task %s\n", created)
 	return nil
+}
+
+type doctorReport struct {
+	Status   string `json:"status"`
+	Provider string `json:"provider"`
+	Ollama   struct {
+		Installed             bool   `json:"installed"`
+		BaseURL               string `json:"base_url"`
+		Reachable             bool   `json:"reachable"`
+		ConfiguredModel       string `json:"configured_model"`
+		ModelAvailable        bool   `json:"model_available"`
+		AvailableModelCount   int    `json:"available_model_count"`
+		ProviderInitializable bool   `json:"provider_initializable"`
+	} `json:"ollama"`
+	Issues []struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"issues"`
+}
+
+func runDoctor(args []string, stdout, stderr io.Writer) error {
+	if len(args) != 0 {
+		return errors.New("doctor accepts no arguments")
+	}
+	report, err := collectDoctorReport()
+	if err != nil {
+		return err
+	}
+	yesNo := func(value bool) string {
+		if value {
+			return "yes"
+		}
+		return "no"
+	}
+	fmt.Fprintln(stdout, "CRANE doctor")
+	fmt.Fprintf(stdout, "Provider: %s\n", report.Provider)
+	fmt.Fprintf(stdout, "Ollama installed: %s\n", yesNo(report.Ollama.Installed))
+	fmt.Fprintf(stdout, "Ollama endpoint: %s\n", report.Ollama.BaseURL)
+	fmt.Fprintf(stdout, "Ollama reachable: %s\n", yesNo(report.Ollama.Reachable))
+	fmt.Fprintf(stdout, "Configured model: %s\n", report.Ollama.ConfiguredModel)
+	fmt.Fprintf(stdout, "Configured model available: %s\n", yesNo(report.Ollama.ModelAvailable))
+	fmt.Fprintf(stdout, "LangChain Ollama provider initializes: %s\n", yesNo(report.Ollama.ProviderInitializable))
+	if report.Ollama.AvailableModelCount > 0 {
+		fmt.Fprintf(stdout, "Local models reported: %d\n", report.Ollama.AvailableModelCount)
+	}
+	if len(report.Issues) > 0 {
+		fmt.Fprintln(stdout, "Issues and notes:")
+		for _, issue := range report.Issues {
+			fmt.Fprintf(stdout, "  - [%s] %s\n", issue.Code, issue.Message)
+		}
+	}
+	return nil
+}
+
+func collectDoctorReport() (doctorReport, error) {
+	candidates := []string{}
+	if configured := strings.TrimSpace(os.Getenv("CRANE_PYTHON")); configured != "" {
+		candidates = append(candidates, configured)
+	} else {
+		candidates = append(candidates, "python", "py")
+	}
+	for _, runtimePath := range candidates {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		cmd := exec.CommandContext(ctx, runtimePath, "-m", "crane.python_runtime", "--doctor")
+		if home := os.Getenv("CRANE_PYTHON_HOME"); home != "" {
+			cmd.Dir = home
+		}
+		output, err := cmd.Output()
+		cancel()
+		if err != nil {
+			continue
+		}
+		var report doctorReport
+		if json.Unmarshal(output, &report) != nil {
+			continue
+		}
+		if report.Provider == "" {
+			continue
+		}
+		return report, nil
+	}
+	return doctorReport{}, errors.New("could not collect Python runtime diagnostics")
 }
