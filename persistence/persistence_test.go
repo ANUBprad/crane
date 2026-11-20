@@ -1,6 +1,7 @@
 package persistence
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -77,5 +78,40 @@ func TestListTasks(t *testing.T) {
 	}
 	if len(tasks) != 1 || tasks[0][0] != "task-list" {
 		t.Fatalf("unexpected tasks: %#v", tasks)
+	}
+}
+
+func TestTaskRecordsForAPI(t *testing.T) {
+	store := newTestStore(t)
+	if _, err := store.CreateTask("api-task", "queued", "private input"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateTaskStatus("api-task", "running"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTaskState("api-task", []byte(`{"state":"running"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := store.ListTaskRecords()
+	if err != nil {
+		t.Fatalf("ListTaskRecords() error = %v", err)
+	}
+	if len(records) != 1 || records[0].ID != "api-task" || records[0].Status != "running" {
+		t.Fatalf("unexpected records: %#v", records)
+	}
+	if !records[0].HasCheckpoint || records[0].UpdatedAt == "" {
+		t.Fatalf("checkpoint metadata missing: %#v", records[0])
+	}
+
+	record, err := store.GetTaskRecord("api-task")
+	if err != nil {
+		t.Fatalf("GetTaskRecord() error = %v", err)
+	}
+	if record.ID != "api-task" || record.CreatedAt == "" || record.UpdatedAt == "" {
+		t.Fatalf("unexpected task detail: %#v", record)
+	}
+	if _, err := store.GetTaskRecord("missing"); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("GetTaskRecord(missing) error = %v, want ErrTaskNotFound", err)
 	}
 }

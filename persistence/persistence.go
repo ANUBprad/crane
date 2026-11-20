@@ -30,9 +30,47 @@ func DBPath() string {
 	return filepath.Join(dataRoot(), "crane.db")
 }
 
+// ErrTaskNotFound is returned when a task ID has no persisted record.
+var ErrTaskNotFound = errors.New("task not found")
+
+const maxTaskIDLength = 200
+
+// ValidTaskID restricts task IDs to a safe, portable character set shared by
+// the CLI, persistence boundary and local API paths.
+func ValidTaskID(id string) bool {
+	if id == "" || len(id) > maxTaskIDLength {
+		return false
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.', r == ':':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // Store is the SQLite persistence implementation.
 type Store struct {
 	db *sql.DB
+}
+
+// TaskRecord is the API-safe view of a persisted task. Raw task input is
+// deliberately omitted.
+type TaskRecord struct {
+	ID            string `json:"id"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+	StartedAt     string `json:"started_at,omitempty"`
+	CompletedAt   string `json:"completed_at,omitempty"`
+	Status        string `json:"status"`
+	Result        string `json:"result,omitempty"`
+	Error         string `json:"error,omitempty"`
+	WorkflowRef   string `json:"workflow_ref,omitempty"`
+	HasCheckpoint bool   `json:"has_checkpoint"`
+	SchemaVersion string `json:"schema_version,omitempty"`
 }
 
 // NewStore opens the database at path and initializes the schema.
@@ -206,6 +244,86 @@ func (s *Store) ListTasks() ([][]string, error) {
 		return nil, fmt.Errorf("iterate tasks: %w", err)
 	}
 	return tasks, nil
+}
+
+// GetTaskRecord retrieves the API-safe detail view of one persisted task.
+func (s *Store) GetTaskRecord(id string) (TaskRecord, error) {
+	var record TaskRecord
+	var checkpointAt string
+	err := s.db.QueryRow(`
+		SELECT t.id,
+		       COALESCE(t.created_at, ''),
+		       COALESCE(t.started_at, ''),
+		       COALESCE(t.completed_at, ''),
+		       COALESCE(t.status, ''),
+		       COALESCE(t.result, ''),
+		       COALESCE(t.error, ''),
+		       COALESCE(t.workflow_ref, ''),
+		       COALESCE(t.schema_version, ''),
+		       COALESCE((SELECT MAX(timestamp) FROM checkpoints WHERE task_id = t.id), '')
+		FROM tasks t WHERE t.id = ?`, id,
+	).Scan(
+		&record.ID, &record.CreatedAt, &record.StartedAt, &record.CompletedAt,
+		&record.Status, &record.Result, &record.Error, &record.WorkflowRef,
+		&record.SchemaVersion, &checkpointAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TaskRecord{}, ErrTaskNotFound
+	}
+	if err != nil {
+		return TaskRecord{}, fmt.Errorf("get task record %q: %w", id, err)
+	}
+	record.HasCheckpoint = checkpointAt != ""
+	record.UpdatedAt = latestTimestamp(record.CreatedAt, record.StartedAt, record.CompletedAt, checkpointAt)
+	return record, nil
+}
+
+// ListTaskRecords returns API-safe task summaries, newest first.
+func (s *Store) ListTaskRecords() ([]TaskRecord, error) {
+	rows, err := s.db.Query(`
+		SELECT t.id,
+		       COALESCE(t.created_at, ''),
+		       COALESCE(t.started_at, ''),
+		       COALESCE(t.completed_at, ''),
+		       COALESCE(t.status, ''),
+		       COALESCE(t.workflow_ref, ''),
+		       COALESCE(t.schema_version, ''),
+		       COALESCE((SELECT MAX(timestamp) FROM checkpoints WHERE task_id = t.id), '')
+		FROM tasks t
+		ORDER BY COALESCE(t.created_at, '') DESC, t.id`)
+	if err != nil {
+		return nil, fmt.Errorf("list task records: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]TaskRecord, 0)
+	for rows.Next() {
+		var record TaskRecord
+		var checkpointAt string
+		if err := rows.Scan(
+			&record.ID, &record.CreatedAt, &record.StartedAt, &record.CompletedAt,
+			&record.Status, &record.WorkflowRef, &record.SchemaVersion, &checkpointAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan task record: %w", err)
+		}
+		record.HasCheckpoint = checkpointAt != ""
+		record.UpdatedAt = latestTimestamp(record.CreatedAt, record.StartedAt, record.CompletedAt, checkpointAt)
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate task records: %w", err)
+	}
+	return records, nil
+}
+
+func latestTimestamp(values ...string) string {
+	latest := ""
+	for _, value := range values {
+		if value > latest {
+			latest = value
+		}
+	}
+	return latest
 }
 
 // UpdateTaskStatus updates a task and sets lifecycle timestamps where applicable.

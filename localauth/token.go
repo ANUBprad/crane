@@ -315,10 +315,6 @@ func (m *Manager) persistLocked(state tokenFile) error {
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return fmt.Errorf("write installation token state: %w", err)
 	}
-	if err := os.Remove(m.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("replace installation token state: %w", err)
-	}
 	if err := os.Rename(tmp, m.path); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("install token state: %w", err)
