@@ -30,7 +30,7 @@ A component existing in source is not, by itself, proof that its full integratio
 
 The desktop workspace is a separate application under `apps/desktop`; it is not part of the execution core and is never required to run CRANE. The client uses Electron for the desktop lifecycle and React/TypeScript for presentation. It communicates only through a narrow preload bridge. It does not access SQLite directly, spawn arbitrary shell commands, or bypass Go-owned policy.
 
-The current client reads real `/v1/health`, `/v1/tasks` and `/v1/tasks/{id}` data, submits tasks through `POST /v1/tasks`, cancels through `POST /v1/tasks/{id}/cancel`, and streams persisted events through authenticated SSE. The Electron main process retrieves the protected installation token through the trusted `agent api-token` command, holds it in memory, and calls only `127.0.0.1:8787`. The preload exposes `getAppInfo`, `getHealth`, `getTasks`, `getTask`, `submitTask`, `cancelTask` and `subscribeTaskEvents`; the renderer never receives the token or arbitrary HTTP, filesystem, or shell access. Disconnected, recovering and error states are reported explicitly; no health, tasks, events or status are fabricated. MCP servers and approvals remain unavailable because the backend API does not expose them. Closing the desktop window must not stop supervisor-owned tasks.
+The current client reads real `/v1/health`, `/v1/tasks` and `/v1/tasks/{id}` data, submits tasks through `POST /v1/tasks`, cancels through `POST /v1/tasks/{id}/cancel`, and streams persisted events through authenticated SSE. The Electron main process retrieves the protected installation token through the trusted `agent api-token` command, holds it in memory, and calls only `127.0.0.1:8787`. The preload exposes `getAppInfo`, `getHealth`, `getTasks`, `getTask`, `submitTask`, `cancelTask` and `subscribeTaskEvents`; the renderer never receives the token or arbitrary HTTP, filesystem, or shell access. Disconnected, recovering and error states are reported explicitly; no health, tasks, events or status are fabricated. MCP management and approval routes are exposed by the authenticated loopback API, but the desktop renderer does not yet provide MCP management screens. Closing the desktop window must not stop supervisor-owned tasks.
 
 ## 3. Target component view
 
@@ -61,7 +61,7 @@ flowchart TB
     GRAPH <--> PROTO
 ```
 
-The diagram is the intended logical architecture. The CLI now starts the real supervisor and authenticated loopback API, but the full task execution/recovery path still requires behavioral integration testing.
+The diagram reflects the implemented logical architecture. The CLI starts the real supervisor, MCP daemon controller and authenticated loopback API. Task execution, MCP discovery/invocation, approval gating and recovery behavior are covered by real local integration tests; packaging and release acceptance remain separate.
 
 ## 4. Component responsibilities
 
@@ -93,7 +93,8 @@ Intended responsibilities:
 Current implementation:
 - `Start`, `IsRunning`, `HealthCheck`, `RuntimeAvailable`, `Stop` and `Close` are wired into the CLI and API health checks.
 - `RuntimeAvailable` runs a real bounded `python -m crane.python_runtime --health` probe; `CRANE_PYTHON` and `CRANE_PYTHON_HOME` can select the Python executable and working directory.
-- Process restart recovery and full task/process lifecycle behavior must still be demonstrated through real multi-process tests.
+- The supervisor owns a long-lived Python MCP daemon, forwards enabled MCP server configurations and exact durable approval grants in `task_submission`, and persists `tool_result` frames from both the daemon and task children.
+- Process restart recovery and task lifecycle behavior are covered by real multi-process Go tests.
 
 ### 4.3 Python agent runtime — `crane/python_runtime`
 
@@ -105,8 +106,9 @@ Responsibilities:
 - Emit structured state and result messages to Go.
 
 Current implementation:
-- The Go supervisor starts one short-lived `python -m crane.python_runtime --protocol` child per admitted task, bounded to two concurrent tasks and a 60-second task timeout.
-- Runtime identity, task submission, cancellation, checkpoints, events, results and errors are exchanged as versioned NDJSON over stdin/stdout; stderr is captured separately and bounded.
+- The Go supervisor starts one short-lived `python -m crane.python_runtime --protocol` child per admitted task, bounded to two concurrent tasks and a 180-second task timeout.
+- Runtime identity, task submission, cancellation, checkpoints, events, results, MCP commands and errors are exchanged as versioned NDJSON over stdin/stdout; stderr is captured separately and bounded.
+- Task submissions carry private MCP server configurations and durable approval fingerprints; environment values are never written to task events, checkpoints or API responses.
 - A reproducible Python dependency manifest and packaged Python runtime are not yet present in the repository.
 
 ### 4.4 LangGraph workflow engine
@@ -123,7 +125,9 @@ The workflow engine is intended to:
 Current implementation:
 - A real `StateGraph` workflow engine executes admitted tasks through an async graph with bounded steps, wall-clock time and cancellation checks.
 - Typed checkpoints are emitted at graph boundaries, persisted by Go, and passed back to a replacement Python child only when startup recovery decides the checkpoint is safe to resume.
-- MCP tool nodes and approval restoration are not connected to the local API; consequential side-effect replay cannot yet be validated against real tools.
+- The execute node discovers MCP tools, converts them through LangChain adapters, and calls a bounded local Ollama tool loop when a tool-capable model is configured.
+- Consequential tools are blocked unless an exact durable approval fingerprint matches the attempted action; blocked and approved outcomes are emitted as durable `tool_result` frames.
+- Read-only and consequential tool behavior is tested against a real local MCP server; restart-time replay of non-idempotent tool effects remains outside the verified path.
 
 ### 4.5 LangChain and model providers
 
@@ -139,11 +143,12 @@ Provider policy:
 - Provider selection and data-egress authorization must be enforced outside model-generated instructions.
 
 Current implementation:
-- MCP-to-LangChain tool adapter code exists but is not exposed by the current task API.
+- Discovered MCP tools are converted with `langchain-mcp-adapters==0.3.2` and invoked through a CRANE policy interceptor; the adapter never bypasses policy or persistence.
 - `CRANE_MODEL_PROVIDER=local` is the default and returns deterministic workflow facts without inventing model output. `CRANE_MODEL_PROVIDER=ollama` uses `langchain_ollama.ChatOllama` with the validated `langchain-ollama==1.1.0` integration; an unsupported, unavailable or misconfigured provider fails explicitly with no fallback.
 - Ollama execution first validates configuration, connectivity and the configured model (`CRANE_MODEL`, default `llama3.2:3b`), then invokes `ChatOllama` through the LangGraph worker with a bounded context size (`CRANE_OLLAMA_NUM_CTX`, default `4096`) and configurable timeouts; non-loopback `OLLAMA_HOST` values require explicit `CRANE_ALLOW_REMOTE_OLLAMA` authorization. CRANE never downloads model weights automatically.
+- With MCP tools present, Ollama uses a bounded tool loop (`bind_tools`, real tool invocations, tool-result messages, at most four rounds) and returns only the model's final answer grounded in those results.
 - `agent doctor` reports installation, connectivity, configured model, model availability and provider initialization state without task text or credentials.
-- Windows validation covered the real dependency, real Ollama preflight/diagnostics, a real `llama3.2:3b` `ChatOllama` invocation through LangGraph and SQLite, invalid-model failure, persisted lifecycle events and authenticated SSE replay. No fallback occurred.
+- Windows validation covered the real dependency, real Ollama preflight/diagnostics, a real `llama3.2:3b` `ChatOllama` invocation through LangGraph and SQLite, invalid-model failure, persisted lifecycle events, authenticated SSE replay, and a real Ollama-to-MCP tool invocation. No fallback occurred.
 
 ### 4.6 MCP manager — `crane/mcp_runtime`
 
@@ -157,8 +162,10 @@ Intended responsibilities:
 - Route invocations through policy-approved paths.
 
 Current implementation:
-- MCP manager, transport, discovery, and LangChain adapter code are present.
-- Live local MCP-server integration and transport lifecycle behavior still require end-to-end validation.
+- The Python SDK owns real stdio and Streamable HTTP sessions with explicit initialize, paginated tool discovery, JSON Schema validation, bounded invocations and same-task shutdown.
+- Tool trust is derived from static annotations and safe names only; descriptions and model output cannot grant permission.
+- Stdio executables are allowlisted, inline-code arguments are rejected, environment keys are constrained, and environment values remain private to the process boundary.
+- Real local MCP servers are exercised for success, policy block, exact approval grant, both transports, and task-submission integration.
 
 ### 4.7 SQLite persistence — `persistence`
 
@@ -169,7 +176,7 @@ SQLite is the default single-machine persistence layer. It is intended to store:
 - Approval records.
 - Migration metadata.
 
-The current Go persistence package includes database initialization, durable admission with duplicate rejection, task IDs, lifecycle transitions, bounded event history, checkpoint storage, terminal results, API-safe `TaskRecord` list/detail reads that omit raw task input, and startup recovery queries. Checkpoint round-tripping and restart recovery policies are covered by supervisor tests; approval records and migration metadata are not implemented.
+The current Go persistence package includes database initialization, durable admission with duplicate rejection, task IDs, lifecycle transitions, bounded event history, checkpoint storage, terminal results, API-safe `TaskRecord` list/detail reads that omit raw task input, and startup recovery queries. It also stores MCP server configurations, discovered tools/schemas, invocation records with redacted arguments/results, exact-action approval requests and decisions. Checkpoint round-tripping, restart recovery policies and MCP/approval persistence are covered by Go tests; migration metadata is not implemented.
 
 ### 4.8 Versioned protocol — `python_protocol`
 
@@ -184,7 +191,7 @@ Protocol requirements:
 - Avoid blocking the process on an unread pipe.
 - Define startup handshake, task submission, task state, approval, cancellation, result, error, and shutdown semantics consistently.
 
-Current protocol version is `0.1.0`. Implemented task message types are `task_submission`, `task_cancellation`, `task_state`, `task_event`, `task_result` and `task_error`, alongside runtime identity, health and legacy command messages. Frames are size-bounded and decoded by one owning reader per pipe; Go never waits for a child before stdout is fully drained.
+Current protocol version is `0.1.0`. Implemented task message types are `task_submission`, `task_cancellation`, `task_state`, `task_event`, `task_result`, `task_error` and `tool_result`, alongside runtime identity, health, `mcp_command` and `mcp_response`. Task submissions carry private MCP configurations and durable approval fingerprints. Frames are size-bounded and decoded by one owning reader per pipe; Go never waits for a child before stdout is fully drained.
 
 ### 4.9 Local authentication — `localauth`
 
@@ -192,7 +199,7 @@ On Windows, a 256-bit random installation token is protected with DPAPI (`CryptP
 
 ### 4.10 Local API — `localapi`
 
-The Go-owned API binds only to `127.0.0.1:8787`; there is no host configuration and no all-interface mode. It reloads protected token state on every request, so CLI rotation or revocation affects a running server immediately. Versioned `/v1` endpoints provide health, task list/detail, durable admission, cancellation and authenticated SSE event replay. Requests use a 1 MiB request bound and a 64 KiB task-input bound, with strict path/query/body validation, consistent `{"data":...}` / `{"error":...}` JSON envelopes, and `nosniff` responses. Health reports supervisor state, Python runtime probe result, persistence health and overall readiness separately.
+The Go-owned API binds only to `127.0.0.1:8787`; there is no host configuration and no all-interface mode. It reloads protected token state on every request, so CLI rotation or revocation affects a running server immediately. Versioned `/v1` endpoints provide health, task list/detail, durable admission, cancellation, authenticated SSE event replay, and MCP status/server/connect/disconnect/discover/tools/invoke/invocations/approvals management. MCP responses expose environment key names only, never values. Requests use a 1 MiB request bound and a 64 KiB task-input bound, with strict path/query/body validation, consistent `{"data":...}` / `{"error":...}` JSON envelopes, and `nosniff` responses. Health reports supervisor state, Python runtime probe result, persistence health and overall readiness separately.
 
 ## 5. Task execution flow
 
@@ -226,7 +233,7 @@ sequenceDiagram
     Sup->>DB: Confirm cancelled terminal state
 ```
 
-MCP discovery/invocation and approval routing remain intended graph nodes; the current local API and desktop UI do not expose them. The verified path was exercised with real Go and Python processes on Windows.
+With MCP servers configured, the supervisor injects their private configurations and durable approval grants into the task submission. The Python graph connects real MCP sessions, converts tools through LangChain, and lets the configured local Ollama model invoke them. Each invocation is policy checked, persisted and emitted as a `tool_result` frame. Consequential actions remain blocked until an exact approval is granted through the authenticated API. The verified path was exercised with real Go and Python processes on Windows, including a real `llama3.2:3b` Ollama tool call to a local MCP server.
 
 ## 6. Task lifecycle
 
@@ -265,7 +272,7 @@ Required behavior:
 
 Do not claim exactly-once execution. External tools may perform a side effect even if CRANE loses the response. Use idempotency keys or operation records where supported; otherwise treat uncertain outcomes as requiring reconciliation.
 
-**Current verification status:** the supervisor persists checkpoints, events and terminal results from real Python subprocess frames, and startup recovery is tested: queued tasks resume, safe running/starting checkpoints resume, ambiguous in-flight work fails with `ambiguous_recovery`, `waiting_approval` is preserved, and unconfirmed cancellation fails with `cancellation_unconfirmed`. Approval restoration and replay prevention against real non-idempotent MCP tools remain unvalidated because those nodes are not connected. See [PROJECT_TRACKER.md](PROJECT_TRACKER.md).
+**Current verification status:** the supervisor persists checkpoints, events and terminal results from real Python subprocess frames, and startup recovery is tested: queued tasks resume, safe running/starting checkpoints resume, ambiguous in-flight work fails with `ambiguous_recovery`, `waiting_approval` is preserved, and unconfirmed cancellation fails with `cancellation_unconfirmed`. Exact-action approval records and grants are persisted and enforced against real MCP tools, including block-then-approve-then-invoke. Restart-time replay prevention for already executed non-idempotent tool effects remains unvalidated. See [PROJECT_TRACKER.md](PROJECT_TRACKER.md).
 
 ## 8. Security and policy boundary
 
@@ -313,10 +320,8 @@ On non-Windows hosts the fallback root is `~/.crane/`. The broader `config/`, `l
 
 ## 11. Known gaps before production use
 
-- Validate MCP stdio and Streamable HTTP against real local test servers and connect them to the graph through policy.
-- Implement and verify exact-action approval persistence, denial, and restart recovery.
+- Verify approval denial and restart-time replay prevention against real non-idempotent MCP tools.
 - Verify timeout, concurrency saturation and side-effect ambiguity with real external tools.
-- Install and validate the pinned Ollama provider dependency against a local model; never fall back implicitly.
 - Add a pinned Python dependency manifest, reproducible environment and packaged runtime.
 - Complete Windows release acceptance, packaging, signing, update, rollback, and uninstall.
 
