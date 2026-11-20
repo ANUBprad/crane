@@ -289,10 +289,10 @@ function Save-RemoteFile([string]$source, [string]$name, [string]$destination) {
     Invoke-WebRequest -Uri $url -OutFile $destination -UseBasicParsing -TimeoutSec 120
 }
 
-function Resolve-SourcePath([string]$source, [string]$name, [string]$localSource) {
-    if ($localSource) {
-        $path = [IO.Path]::GetFullPath((Join-Path $localSource $name))
-        $prefix = (Normalize-PathForCompare $localSource) + '\'
+function Resolve-SourcePath([string]$source, [string]$name, [bool]$isLocal) {
+    if ($isLocal) {
+        $path = [IO.Path]::GetFullPath((Join-Path $source $name))
+        $prefix = (Normalize-PathForCompare $source) + '\'
         if (-not (Normalize-PathForCompare $path).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Artifact path escapes the release source: $name"
         }
@@ -453,19 +453,19 @@ function Assert-StagedPayload([object]$manifest, [string]$stagedDirectory) {
     if ($imports.Stdout.Trim() -ne '1') { throw 'Packaged Python dependency imports did not pass.' }
 }
 
-function Resolve-Release([string]$source, [string]$localSource, [string]$workDirectory) {
-    if (-not $localSource -and $source -notmatch '^https?://') { throw "-ReleaseSource must be an existing directory or an http(s) URL." }
+function Resolve-Release([string]$source, [bool]$isLocal, [string]$workDirectory) {
+    if (-not $isLocal -and $source -notmatch '^https?://') { throw "-ReleaseSource must be an existing directory or an http(s) URL." }
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-    $manifestPath = Resolve-SourcePath $source 'release-manifest.json' $localSource
+    $manifestPath = Resolve-SourcePath $source 'release-manifest.json' $isLocal
     $manifest = Read-Manifest $manifestPath
-    $checksumsPath = Resolve-SourcePath $source 'SHA256SUMS.txt' $localSource
+    $checksumsPath = Resolve-SourcePath $source 'SHA256SUMS.txt' $isLocal
     Assert-Checksums $manifest $checksumsPath
 
     $artifactPaths = @{}
     foreach ($artifact in $manifest.artifacts) {
         $name = [string](Get-Field $artifact 'name')
-        $path = Resolve-SourcePath $source $name $localSource
+        $path = Resolve-SourcePath $source $name $isLocal
         Assert-Artifact $artifact $path
         $artifactPaths[(Get-Field $artifact 'kind')] = $path
     }
