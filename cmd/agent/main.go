@@ -16,6 +16,7 @@ import (
 
 	"crane/localapi"
 	"crane/localauth"
+	"crane/mcpruntime"
 	"crane/persistence"
 	"crane/supervisor"
 )
@@ -63,6 +64,12 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	defer sup.Close()
 	defer sup.Stop()
 
+	mcp := mcpruntime.New(sup.Store(), mcpruntime.Config{})
+	if err := mcp.Start(); err != nil {
+		return fmt.Errorf("start MCP controller: %w", err)
+	}
+	defer mcp.Close()
+
 	auth, err := localauth.NewManager(localauth.DefaultPath())
 	if err != nil {
 		return err
@@ -78,6 +85,7 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	api.SetMCPController(mcp)
 	if err := api.Start(localapi.DefaultPort()); err != nil {
 		return fmt.Errorf("start local API: %w", err)
 	}

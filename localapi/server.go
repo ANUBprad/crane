@@ -64,6 +64,7 @@ type Server struct {
 	runtime    func() RuntimeStatus
 	supervisor func() bool
 	controller TaskController
+	mcp        MCPController
 	httpSrv    *http.Server
 	listener   net.Listener
 	serveErr   chan error
@@ -298,6 +299,48 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			writeError(w, http.StatusNotFound, "not_found")
 		}
+
+	case path == "/v1/mcp/status":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		if rejectQueryAndBody(w, r) {
+			return
+		}
+		s.handleMCPStatus(w)
+
+	case path == "/v1/mcp/servers":
+		s.handleMCPServers(w, r)
+
+	case strings.HasPrefix(path, "/v1/mcp/servers/"):
+		s.handleMCPServerPath(w, r, strings.TrimPrefix(path, "/v1/mcp/servers/"))
+
+	case path == "/v1/mcp/invoke":
+		s.handleMCPInvoke(w, r)
+
+	case path == "/v1/mcp/invocations":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		if rejectQueryAndBody(w, r) {
+			return
+		}
+		s.handleMCPInvocations(w)
+
+	case path == "/v1/mcp/approvals":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		if rejectQueryAndBody(w, r) {
+			return
+		}
+		s.handleMCPApprovals(w)
+
+	case strings.HasPrefix(path, "/v1/mcp/approvals/"):
+		s.handleMCPApprovalDecision(w, r, strings.TrimPrefix(path, "/v1/mcp/approvals/"))
 
 	default:
 		writeError(w, http.StatusNotFound, "not_found")
