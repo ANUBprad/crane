@@ -112,7 +112,7 @@ function Get-AncestorProcessIds {
     return $ids
 }
 
-function Stop-CraneProcesses([string]$root) {
+function Stop-CraneProcesses([string]$root, [switch]$WaitForAncestors) {
     $ancestors = @(Get-AncestorProcessIds)
     $rootPrefix = (Normalize-PathForCompare $root) + '\'
     $processes = Get-CimInstance -ClassName Win32_Process -Filter "Name = 'agent.exe' OR Name = 'python.exe'" -ErrorAction SilentlyContinue
@@ -131,6 +131,19 @@ function Stop-CraneProcesses([string]$root) {
         }
     }
     Start-Sleep -Milliseconds 500
+
+    if ($WaitForAncestors) {
+        for ($attempt = 0; $attempt -lt 40; $attempt++) {
+            $blocking = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'agent.exe'" -ErrorAction SilentlyContinue | Where-Object {
+                $ancestors -contains [int]$_.ProcessId -and
+                -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and
+                (Normalize-PathForCompare $_.ExecutablePath).StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)
+            })
+            if ($blocking.Count -eq 0) { return }
+            Start-Sleep -Milliseconds 250
+        }
+        Write-Warn 'A CRANE CLI process still holds an installed executable; retry uninstall if file removal fails.'
+    }
 }
 
 function Assert-NoReparsePoints([string]$path) {
@@ -173,7 +186,7 @@ Write-Step "Installation root: $root"
 
 if (Test-Path -LiteralPath $root -PathType Container) {
     Assert-NoReparsePoints $root
-    Stop-CraneProcesses $root
+    Stop-CraneProcesses $root -WaitForAncestors
     foreach ($name in @('bin', 'versions', 'staging')) {
         Remove-KnownDirectory (Join-Path $root $name)
     }

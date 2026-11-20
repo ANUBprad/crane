@@ -9,13 +9,17 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func startDetachedCommand(cmd *exec.Cmd) error {
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP,
+	}
+	return cmd.Start()
+}
+
 func startDetachedServe(executable string) error {
 	cmd := exec.Command(executable, "serve")
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP,
-	}
-	return cmd.Start()
+	return startDetachedCommand(cmd)
 }

@@ -672,7 +672,7 @@ func runUninstall(args []string, stdout, stderr io.Writer) error {
 	if *removeData {
 		extra = append(extra, "-RemoveData", "-Confirm", "REMOVE-CRANE-DATA")
 	}
-	return runLifecycleScript("uninstall.ps1", extra, stdout, stderr)
+	return startDetachedUninstall(extra, stdout)
 }
 
 func lifecycleScript(name string) (string, error) {
@@ -720,9 +720,58 @@ func runLifecycleScript(name string, extra []string, stdout, stderr io.Writer) e
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Stdin = nil
+	cmd.Env = lifecycleEnvironment()
+	return cmd.Run()
+}
 
+func startDetachedUninstall(extra []string, stdout io.Writer) error {
+	executable, err := powershellExecutable()
+	if err != nil {
+		return err
+	}
+	script, err := lifecycleScript("uninstall.ps1")
+	if err != nil {
+		return err
+	}
+	contents, err := os.ReadFile(script)
+	if err != nil {
+		return err
+	}
+	temporaryDirectory, err := os.MkdirTemp("", "crane-uninstall-")
+	if err != nil {
+		return err
+	}
+	temporaryScript := filepath.Join(temporaryDirectory, filepath.Base(script))
+	if err := os.WriteFile(temporaryScript, contents, 0700); err != nil {
+		return err
+	}
+	logPath := filepath.Join(temporaryDirectory, "uninstall.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return err
+	}
+
+	params := []string{
+		"-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive",
+		"-File", temporaryScript,
+	}
+	params = append(params, extra...)
+	cmd := exec.Command(executable, params...)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Stdin = nil
+	cmd.Env = lifecycleEnvironment()
+	if err := startDetachedCommand(cmd); err != nil {
+		_ = logFile.Close()
+		return err
+	}
+	_ = logFile.Close()
+	fmt.Fprintf(stdout, "CRANE uninstall started (log: %s).\n", logPath)
+	return nil
+}
+
+func lifecycleEnvironment() []string {
 	details := runtimeenv.Discover()
-	prefix := "CRANE_INSTALL_ROOT="
 	environment := make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
 		if strings.EqualFold(strings.SplitN(entry, "=", 2)[0], "CRANE_INSTALL_ROOT") {
@@ -730,8 +779,7 @@ func runLifecycleScript(name string, extra []string, stdout, stderr io.Writer) e
 		}
 		environment = append(environment, entry)
 	}
-	cmd.Env = append(environment, prefix+details.InstallRoot)
-	return cmd.Run()
+	return append(environment, "CRANE_INSTALL_ROOT="+details.InstallRoot)
 }
 
 func powershellExecutable() (string, error) {
