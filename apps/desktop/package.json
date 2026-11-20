@@ -6,6 +6,7 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:127.0.0.1:5173 && electron .\"",
+    "prebuild": "go build -o ../../agent.exe ../../cmd/agent",
     "build": "tsc --noEmit && vite build",
     "desktop:build": "npm run build && electron-builder --win nsis",
     "preview": "vite preview --host 127.0.0.1",
@@ -36,6 +37,7 @@
     "asar": true,
     "directories": { "output": "release" },
     "files": ["dist/**/*", "electron/**/*", "package.json"],
+    "extraResources": [{ "from": "../../agent.exe", "to": "agent.exe" }],
     "win": {
       "target": [{ "target": "nsis", "arch": ["x64"] }]
     },
