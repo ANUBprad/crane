@@ -104,7 +104,7 @@ $pthPath = Join-Path $pythonDir "python$pyMajorMinor._pth"
 @("python$pyMajorMinor.zip", '.', '..\app', 'Lib\site-packages', 'import site') | Set-Content -LiteralPath $pthPath -Encoding ASCII
 
 Write-Step 'Installing pinned production Python dependencies'
-& python -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --require-hashes --target $sitePackages -r (Join-Path $repoRoot 'requirements.lock.txt')
+& python -m pip install --disable-pip-version-check --no-deps --no-compile --only-binary=:all: --require-hashes --target $sitePackages -r (Join-Path $repoRoot 'requirements.lock.txt')
 if ($LASTEXITCODE -ne 0) { throw 'Packaged Python dependency installation failed.' }
 
 Write-Step 'Copying CRANE Python application'
@@ -172,6 +172,8 @@ finally {
 }
 
 Write-Step 'Creating release artifacts'
+Get-ChildItem -LiteralPath $stage -Recurse -Directory -Filter '__pycache__' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+Get-ChildItem -LiteralPath $stage -Recurse -File -Include '*.pyc', '*.pyo' -ErrorAction SilentlyContinue | Remove-Item -Force
 $fixedTimestamp = [datetime]'1980-01-01T00:00:00'
 Get-ChildItem -LiteralPath $stage -Recurse -Force | ForEach-Object {
     $_.CreationTimeUtc = $fixedTimestamp
