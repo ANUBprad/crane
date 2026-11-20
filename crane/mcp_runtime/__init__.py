@@ -316,7 +316,7 @@ class MCPInvocationRecord:
     arguments: Dict[str, Any]
     status: str
     started_at: float
-    completed_at: float
+    completed_at: float = 0.0
     result_text: str = ""
     structured_result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None

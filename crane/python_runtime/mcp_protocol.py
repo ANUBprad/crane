@@ -164,14 +164,15 @@ class MCPProtocolRuntime:
             ))
             return False
         try:
-            result = await asyncio.wait_for(
-                self._dispatch(command), timeout=_COMMAND_TIMEOUT_SECONDS
-            )
+            # MCP SDK transports bind anyio task groups to the entering task.
+            # Running dispatch inline keeps long-lived sessions on this one task.
+            async with asyncio.timeout(_COMMAND_TIMEOUT_SECONDS):
+                result = await self._dispatch(command)
             protocol.write_stdout(protocol.mcp_response(command["command_id"], True, result))
         except Exception as exc:  # noqa: BLE001 - never leak transport internals to Go
             if isinstance(exc, MCPError):
                 code, detail = exc.code, exc.message
-            elif isinstance(exc, asyncio.TimeoutError):
+            elif isinstance(exc, TimeoutError):
                 code, detail = "mcp_command_timeout", "MCP command timed out"
             else:
                 code, detail = "mcp_command_failed", f"{type(exc).__name__} during MCP command"
