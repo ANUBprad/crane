@@ -61,7 +61,7 @@ flowchart TB
     GRAPH <--> PROTO
 ```
 
-The diagram reflects the implemented logical architecture. The CLI starts the real supervisor, MCP daemon controller and authenticated loopback API. Task execution, MCP discovery/invocation, approval gating and recovery behavior are covered by real local integration tests. A reproducible unsigned Windows release build and an isolated lifecycle acceptance harness are also implemented; clean-machine and signed-release acceptance remain separate.
+The diagram reflects the implemented logical architecture. The CLI starts the real supervisor, MCP daemon controller and authenticated loopback API. Task execution, MCP discovery/invocation, approval gating and recovery behavior are covered by real local integration tests. Unsigned Windows release build/install/update/rollback/uninstall scripts and an isolated lifecycle acceptance harness are implemented (Windows PowerShell 5.1, PowerShell 7.7.0, and minimal-PATH isolated runs passed on the current dev host for rebuilt `1953963` artifacts). Clean-machine acceptance, Authenticode signing, controlled hosting, and reproducible builds remain separate/unverified.
 
 ## 4. Component responsibilities
 
@@ -340,11 +340,12 @@ On non-Windows hosts the fallback data root is `~/.crane/`. Updates and uninstal
 
 ## 11. Known gaps before production use
 
-- Verify approval denial and restart-time replay prevention against real non-idempotent MCP tools.
+- Verify approval denial and restart-time replay prevention against real non-idempotent MCP tools in packaged/runtime scenarios; Go persistence/supervisor tests cover approval persistence and restart recovery policies (`build\evidence\go-test-approval-recovery-1953963.log`), but packaged-install evidence is incomplete.
 - Verify timeout, concurrency saturation and side-effect ambiguity with real external tools.
-- Validate the packaged installation on clean Windows 10 and Windows 11 x64 machines and with PowerShell 7.
-- Sign the manifest and executable with a real certificate; current release metadata is explicitly unsigned/unverified.
-- Define a controlled official release host and install command; the release source is currently configurable only.
+- Validate the packaged installation on genuine clean Windows 10 and Windows 11 x64 machines without Go/Python/Node/npm/CRANE source/dev dependencies.
+- Sign the manifest and executable with a real certificate and verify Authenticode in release validation; current release metadata is explicitly unsigned/unverified.
+- Define a controlled official release host and documented install command with verified ownership/TLS/access control; the release source is currently configurable only and must not fall back to unverified downloads.
+- Establish reproducible release builds or document bounded non-determinism; identical `0.1.2` rebuilds on this host produced differing hashes (`build\evidence\repro-0.1.2-1953963.json`).
 - Test database migration compatibility across packaged upgrades.
 
-An unsigned PowerShell installer, private Python runtime, update/rollback/uninstall lifecycle, and an isolated Windows acceptance harness are implemented. No official install URL, signed release, or clean-machine acceptance is currently available.
+An unsigned PowerShell installer, private Python runtime, update/rollback/uninstall lifecycle, and isolated Windows acceptance harnesses are implemented (PowerShell 5.1, PowerShell 7.7.0, and minimal-PATH runs passed on this dev host for rebuilt `1953963` artifacts). No official install URL, signed release, controlled host, reproducible build proof, or clean-machine acceptance is currently available.

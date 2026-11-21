@@ -6,7 +6,7 @@
 
 CRANE accepts a task, coordinates authorized tools, runs a bounded workflow, persists execution state, handles failures, and returns a concise result. It is a local-first execution layer—not a chatbot, RAG product, or dashboard.
 
-> **Project status: working vertical slice, not production-ready.** The Go supervisor durably admits tasks, runs bounded Python/LangGraph workflows, confirms cancellation, persists lifecycle/events/checkpoints/results, and streams real events over authenticated SSE. The optional desktop client submits and cancels tasks through the same restricted main-process bridge. Default execution is offline deterministic local mode; real Ollama `llama3.2:3b` and MCP stdio/Streamable HTTP paths were validated on Windows. An unsigned PowerShell installer with a private CPython runtime and verified update/rollback/uninstall passed isolated Windows acceptance; signing, a release host, and clean-machine acceptance remain.
+> **Project status: working vertical slice, not production-ready.** The Go supervisor durably admits tasks, runs bounded Python/LangGraph workflows, confirms cancellation, persists lifecycle/events/checkpoints/results, and streams real events over authenticated SSE. The optional desktop client submits and cancels tasks through the same restricted main-process bridge. Default execution is offline deterministic local mode; real Ollama `llama3.2:3b` and MCP stdio/Streamable HTTP paths were validated on Windows. Unsigned PowerShell release artifacts (`0.1.0`–`0.1.2`, rebuilt from `1953963d21398940370787eb247c6c0a04e76487`) passed isolated Windows acceptance under PowerShell 5.1, PowerShell 7.7.0, and minimal-PATH mode on this dev host, but clean Windows 10/11 machines, Authenticode signing, a controlled official host, and reproducible builds remain unverified.
 
 ## What CRANE is being built to do
 
@@ -80,20 +80,20 @@ This diagram describes the intended component boundaries. It does not imply that
 | LangChain adapter | Yes | MCP adapter and explicit local/Ollama provider policy exist; no silent hosted fallback |
 | LangGraph workflow | Validated | Real `StateGraph` execution, checkpoints, bounded steps, and MCP/approval paths are exercised on Windows |
 | Ollama provider | Validated | Pinned `langchain-ollama` is installed; real `llama3.2:3b` inference, preflight, diagnostics, invalid-model failure and LangGraph/SQLite persistence are validated on Windows. No fallback is permitted |
-| Windows bootstrapper | Yes | Verified PowerShell install/update/rollback/uninstall with SHA-256 checks; explicitly unsigned/unverified manifest state |
-| Signed release / official host | No | No signing certificate or invented download domain; release source is configurable |
-| Production Windows release | Partial | Isolated Windows acceptance passed; clean Windows 10/11 machines and signing remain |
+| Windows bootstrapper | Yes | Verified PowerShell install/update/rollback/uninstall with SHA-256 checks in isolated harnesses (PS 5.1, PS 7.7.0, minimal PATH); explicitly unsigned/unverified manifest state |
+| Signed release / official host | No | No signing certificate or controlled official host; release source is configurable (local path or `http(s)`) and must not fall back to unverified downloads |
+| Production Windows release | Partial | Isolated dev-host acceptance passed for rebuilt `1953963` artifacts; clean Windows 10/11 machines, Authenticode signing/verification, controlled hosting, and reproducible builds remain |
 
 Do not interpret source presence or a passing unit test as proof of a complete production workflow. The current known integration and validation gaps are tracked in [PROJECT_TRACKER.md](PROJECT_TRACKER.md).
 
 ## Current development state
 
-The project now has an end-to-end supervisor/API/desktop task path backed by real Python execution, validated MCP/Ollama behavior, and an unsigned packaged Windows runtime. The next engineering work should prioritize the remaining safety and production boundaries:
+The project now has an end-to-end supervisor/API/desktop task path backed by real Python execution, validated MCP/Ollama behavior, and an unsigned packaged Windows runtime. Isolated lifecycle acceptance passed on this dev host for rebuilt `1953963` artifacts under Windows PowerShell 5.1, PowerShell 7.7.0, and minimal-PATH mode; a real Ollama+MCP e2e run (`llama3.2:3b`) and Go approval/recovery/restart policy tests also passed (see `build\evidence\`). The next engineering work should prioritize the remaining safety and production boundaries:
 
-1. Validate the packaged runtime on clean Windows 10 and Windows 11 x64 machines and with PowerShell 7.
-2. Add a real signing certificate and controlled official release host.
-3. Verify restart-time replay prevention and side-effect ambiguity against real non-idempotent MCP tools.
-4. Verify timeout, concurrency saturation, and cancellation limits under real external tools.
+1. Validate the packaged runtime on genuine clean Windows 10 and Windows 11 x64 machines (no Go/Python/Node/npm/repo/dev dependencies) with PowerShell 5.1 and PowerShell 7.x.
+2. Add a real signing certificate, Authenticode verification, and a controlled official release host with verified ownership/TLS/access control.
+3. Resolve or document release-build non-determinism (identical `0.1.2` rebuilds produced differing hashes on this host) and collect packaged-install approval/restart/replay-prevention evidence.
+4. Verify timeout, concurrency saturation, side-effect ambiguity, and cancellation limits under real external/non-idempotent MCP tools.
 5. Test database migration compatibility across packaged upgrades.
 6. Keep validating additional local models with the pinned packaged runtime.
 
@@ -124,15 +124,17 @@ npm run build
 Windows release build and isolated lifecycle acceptance from the repository root:
 
 ```powershell
-.\scripts\build-release.ps1 -Version 0.1.0
-.\scripts\build-release.ps1 -Version 0.1.1
-.\scripts\build-release.ps1 -Version 0.1.2
-.\scripts\acceptance-windows.ps1
+.\scripts\build-release.ps1 -Version 0.1.0 -Commit <sha> -BuildDate <iso8601> -PythonVersion 3.12.7 -GoVersion <go-version> -PythonEmbedZip <path>
+.\scripts\build-release.ps1 -Version 0.1.1 -Commit <sha> -BuildDate <iso8601> -PythonVersion 3.12.7 -GoVersion <go-version> -PythonEmbedZip <path>
+.\scripts\build-release.ps1 -Version 0.1.2 -Commit <sha> -BuildDate <iso8601> -PythonVersion 3.12.7 -GoVersion <go-version> -PythonEmbedZip <path>
+.\scripts\acceptance-windows.ps1 -ReleaseRoot .\build\release
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\acceptance-windows.ps1 -ReleaseRoot .\build\release
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\acceptance-windows.ps1 -ReleaseRoot .\build\release -MinimalEnvironment
 ```
 
 Generated release trees are written to ignored `build/release/`. Acceptance uses fake local application data and a controlled PATH change that is restored exactly; see [WINDOWS_ACCEPTANCE_TESTS.md](WINDOWS_ACCEPTANCE_TESTS.md).
 
-These checks were run on Windows x64 and passed for the current task path; exact source-tree results are recorded in [PROJECT_TRACKER.md](PROJECT_TRACKER.md). Packaged release validation uses the complete hashed closure in `requirements.lock.txt` and is described in [DISTRIBUTION_AND_INSTALLATION.md](DISTRIBUTION_AND_INSTALLATION.md). Passing checks are not a claim of clean-machine release acceptance.
+These checks were run on this Windows x64 dev host and passed for rebuilt `1953963` artifacts (PS 5.1, PS 7.7.0, minimal PATH) with evidence under `build\evidence\`; exact source-tree validation history is recorded in [PROJECT_TRACKER.md](PROJECT_TRACKER.md). Packaged release validation uses the complete hashed closure in `requirements.lock.txt` and is described in [DISTRIBUTION_AND_INSTALLATION.md](DISTRIBUTION_AND_INSTALLATION.md). Passing checks are not a claim of clean-machine, signed-release, controlled-host, or reproducible-build acceptance.
 
 The current executable supports these development commands:
 

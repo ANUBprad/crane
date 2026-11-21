@@ -75,12 +75,13 @@ The local API token is 256-bit random. On Windows it is protected with DPAPI and
 
 ## Supply chain and updates
 
-- Download only from the official distribution origin over TLS.
-- Verify signed release metadata and checksums before installation.
-- Reject tampered artifacts.
+- Release source must be explicit and controlled (local directory or verified `https` host). Do not define or claim an official CRANE domain until host ownership, TLS, and access control are verified.
+- Verify release metadata and SHA-256 checksums before installation or update; reject tampered, incomplete, or unsupported artifacts. Current manifests are explicitly `signature.scheme = "none"` / `signature.status = "unverified"` and the installer accepts only that explicit unsigned state—it is **not** Authenticode/code-signing verification.
+- Never fall back to unverified downloads or execute an unverified downloaded script/binary.
 - Keep dependencies pinned and generate an SBOM for releases.
-- Sign Windows executables when release infrastructure supports it.
-- Never execute an unverified downloaded script or binary.
+- Sign Windows executables/manifests with a real certificate when release infrastructure supports it and verify signatures in release validation; checksum verification must not be described as code signing.
+
+Current release-readiness evidence (dev-host, isolated): rebuilt `1953963` artifacts had internally consistent manifests/SHA256SUMS, pinned hashed production dependencies, no sampled secrets/credentials/user data/model weights in inspected payloads, and tampered signature-metadata/hash/unsupported-platform inputs were rejected by the installer harness. No production signing certificate, Authenticode verification, controlled official host, or reproducible-build proof is available.
 
 ## Logs and diagnostics
 
@@ -103,4 +104,4 @@ The local API token is 256-bit random. On Windows it is protected with DPAPI and
 - Tampered installer artifacts are rejected.
 - Local-only mode makes no hosted provider requests.
 
-Automated Windows checks cover token lifecycle behavior, constant-time verification inputs, loopback address validation, unauthenticated API rejection, immediate rotation/revocation, request validation, API-safe task reads, component-specific health reporting, duplicate admission rejection, explicit provider failure, confirmed cancellation, SSE cursor replay, and restart recovery policy.
+Automated checks and recent evidence cover token lifecycle behavior, constant-time verification inputs, loopback address validation, unauthenticated API rejection, immediate rotation/revocation, request validation, API-safe task reads, component-specific health reporting, duplicate admission rejection, explicit provider failure, confirmed cancellation, SSE cursor replay, restart recovery policy, and approval persistence/recovery cases (`build\evidence\go-test-approval-recovery-1953963.log`). Isolated packaged install harnesses on this dev host also rejected tampered signature metadata, tampered checksums, and unsupported platform metadata (`build\evidence\acceptance-ps51-1953963.log`, `build\evidence\acceptance-pwsh7-1953963.log`, `build\evidence\acceptance-minimal-pwsh7-1953963.log`). Clean-machine packaged security acceptance, Authenticode validation, and controlled-host verification remain unverified.

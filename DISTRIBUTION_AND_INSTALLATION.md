@@ -8,20 +8,24 @@ This is a per-user PowerShell bootstrapper, not an MSI or graphical installer.
 
 ## Current status
 
-Implemented and validated in an isolated Windows x64 development environment:
+Implemented and validated on this Windows 11 Home Single Language 26H2 x64 development host (`10.0.26300.9974`, Go/Python/Node/npm installed). Rebuilt unsigned release artifacts `0.1.0`–`0.1.2` were produced from commit `1953963d21398940370787eb247c6c0a04e76487` (build date `2026-11-21T00:00:56+05:30`, Windows x64, Go `go1.26.5`, Python `3.12.7`) and are available under ignored `build/release/<version>/`.
 
-- `scripts/build-release.ps1` builds a versioned release tree under `build/release/<version>/`.
-- `scripts/install.ps1` performs verified Install, Update, and Rollback.
-- `scripts/uninstall.ps1` performs detached, data-preserving uninstall.
-- `scripts/acceptance-windows.ps1` runs the isolated lifecycle acceptance suite.
-- `requirements.lock.txt` pins every production Python dependency with a SHA-256 hash.
+Validated in isolated harness runs using fake `LOCALAPPDATA`:
+
+- `scripts/build-release.ps1` builds versioned release trees with tracked app staging, `--no-compile`, packaged runtime cleanup/normalization, and no `crane/mcp_runtime/_init__.py` in payloads.
+- `scripts/install.ps1` performs verified Install, Update, and Rollback; `scripts/uninstall.ps1` performs detached, data-preserving uninstall.
+- `scripts/acceptance-windows.ps1` passed under Windows PowerShell 5.1 (`build\evidence\acceptance-ps51-1953963.log`).
+- `scripts/acceptance-windows.ps1` passed under PowerShell 7.7.0 (`build\evidence\acceptance-pwsh7-1953963.log`), resolving the earlier `Get-FileHash`/`agent update` lifecycle failure.
+- `scripts/acceptance-windows.ps1 -MinimalEnvironment` passed under PowerShell 7.7.0 (`build\evidence\acceptance-minimal-pwsh7-1953963.log`), proving the packaged lifecycle completed with `go`, `python`, `node`, and `npm` unavailable on `PATH`.
+- Isolated checks covered install/PATH/version/doctor/supervisor start-stop/packaged Python/SQLite/authenticated loopback API/real task execution and persisted result, update, rollback, failed-update rollback, default uninstall preservation, explicit confirmed data removal, and tampered signature/hash/unsupported metadata rejection.
 
 Not implemented or not yet validated:
 
-- No official download domain or hosted release channel is defined.
-- No code-signing certificate is available. Manifests explicitly declare `signature.scheme = "none"` and `signature.status = "unverified"`. The installer accepts only that explicit unsigned state; it does not claim signature verification.
-- Clean Windows 10 x64 and Windows 11 x64 machines have not been tested.
-- PowerShell 7 has not been separately validated; Windows PowerShell 5.1 was used.
+- No official download domain or controlled hosted release channel is defined. Release source remains explicit (`-ReleaseSource` or `CRANE_RELEASE_SOURCE`, local path or `http(s)` only); do not publish to an uncontrolled host or claim an official URL.
+- No code-signing certificate is available. Manifests explicitly declare `signature.scheme = "none"` and `signature.status = "unverified"`. The installer accepts only that explicit unsigned state; it does not claim Authenticode/signature verification.
+- Genuine clean Windows 10 x64 and Windows 11 x64 machines without Go/Python/Node/npm/CRANE source are unavailable for validation on this host.
+- Release build reproducibility is **not verified** on this host: two identical `0.1.2` rebuilds with the same `-Version`, `-Commit`, `-BuildDate`, `-PythonVersion`, `-GoVersion`, and `-PythonEmbedZip` produced different payload/manifest/SHA256SUMS hashes (`build\evidence\repro-0.1.2-1953963.json`), while scripts and `python-requirements.lock.txt` matched.
+- Packaged-install approval persistence/recovery and packaged restart-recovery beyond harness/task-history checks are not separately exercised by `acceptance-windows.ps1`; source/test evidence exists (`build\evidence\go-test-approval-recovery-1953963.log`) and should not be treated as clean-machine packaged proof.
 
 ## Release source
 
@@ -42,6 +46,8 @@ $env:CRANE_RELEASE_SOURCE = 'https://<your-controlled-release-host>/crane'
 .\scripts\build-release.ps1 -Version 0.1.1
 .\scripts\build-release.ps1 -Version 0.1.2
 ```
+
+For reproducible/evidence builds, pass explicit `-Commit`, `-BuildDate`, `-PythonVersion`, `-GoVersion`, and `-PythonEmbedZip` so metadata does not depend on the current checkout state. `build-release.ps1` uses tracked CRANE app files only (`git ls-files`), excludes `_init__.py`, installs pinned dependencies with `--no-compile`, removes `__pycache__`/`.pyc`/`.pyo`, and normalizes staged timestamps before zipping.
 
 Each release directory contains:
 
@@ -137,17 +143,46 @@ PowerShell equivalents:
 Run:
 
 ```powershell
-.\scripts\acceptance-windows.ps1
+.\scripts\acceptance-windows.ps1 -ReleaseRoot .\build\release
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\acceptance-windows.ps1 -ReleaseRoot .\build\release
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\acceptance-windows.ps1 -ReleaseRoot .\build\release -MinimalEnvironment
 ```
 
-The harness uses a fake `LOCALAPPDATA`, generated local releases `0.1.0`, `0.1.1`, and `0.1.2`, and writes `acceptance.log` under `%TEMP%\crane-acceptance-<id>\`. The latest run passed all isolated checks, including install, doctor, task submission/status/result, update, rollback, default and confirmed uninstall, tampered checksum/manifest rejection, unsupported platform rejection, failed-update recovery, and exact user PATH add/remove/restore.
+The harness uses a fake `LOCALAPPDATA`, local releases `0.1.0`–`0.1.2`, and writes `acceptance.log` under `%TEMP%\crane-acceptance-<id>\`. It temporarily changes the real user PATH for the final PATH test and restores it in `finally`; do not run concurrently.
 
-This is not a clean-machine acceptance. Actual Windows 10 and Windows 11 x64 validation remains outstanding.
+Latest verified results for rebuilt `1953963` artifacts:
+
+- Windows PowerShell 5.1: **all isolated checks passed** (`build\evidence\acceptance-ps51-1953963.log`).
+- PowerShell 7.7.0: **all isolated checks passed** (`build\evidence\acceptance-pwsh7-1953963.log`).
+- PowerShell 7.7.0 with `-MinimalEnvironment`: **all isolated checks passed**; `go`/`python`/`node`/`npm` were absent from `PATH` and lifecycle completed (`build\evidence\acceptance-minimal-pwsh7-1953963.log`).
+- Real Ollama + MCP end-to-end acceptance (source/runtime e2e script, `llama3.2:3b`): **PASS** (`build\evidence\ollama-mcp-e2e-1953963.log`).
+- Go approval/recovery/restart policy tests: **PASS** (`build\evidence\go-test-approval-recovery-1953963.log`).
+
+This is **not** clean-machine acceptance and does not prove clean Windows 10/11 behavior, signed artifacts, or an official controlled host.
+
+## Clean-machine validation procedure (unverified on this project)
+
+Run on genuine clean Windows 10 x64 and Windows 11 x64 VMs/images with no Go, Python, Node.js, npm, CRANE repository, or development dependencies:
+
+1. Copy a verified local release directory (or use a controlled `http(s)` release host) and confirm `release-manifest.json`/`SHA256SUMS.txt` state, including explicit unsigned/unverified signature metadata.
+2. Install: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Action Install -ReleaseSource <dir-or-url>`.
+3. From a fresh terminal, run `agent --version`, `agent doctor`, `agent run "clean machine acceptance"`, `agent status <id>`, and `agent result <id>`.
+4. Validate supervisor start/stop behavior, authenticated loopback API availability, packaged Python/SQLite operation, task persistence across CLI/process restart, approval persistence/recovery, MCP stdio behavior, and PowerShell 7.x with the same steps.
+5. Validate update to a newer verified release, rollback, failed update rollback, default uninstall (data preserved), and explicit confirmed data removal (`REMOVE-CRANE-DATA`).
+6. Record OS build, PowerShell versions, artifact hashes, logs, and any failures. Do not claim release readiness if any step cannot be completed.
+
+## Hosting readiness (configurable, not official)
+
+- A controlled host must serve versioned, immutable artifacts and matching metadata: payload ZIP, `release-manifest.json`, `SHA256SUMS.txt`, `install.ps1`, `uninstall.ps1`, and `python-requirements.lock.txt`.
+- Use `https` with verified host ownership, TLS, and access control for release publication/update paths. Do not invent or document an official CRANE domain.
+- Installer/update must fail safely on missing/tampered/unsupported metadata and must never fall back to unverified downloads.
+- Because artifacts are unsigned, the host/control plane must not be presented as providing Authenticode trust.
 
 ## Release requirements still pending
 
-- Signing certificate and signed manifest/executable.
-- Official, controlled release host and documented install command.
-- Clean Windows 10/11 x64 acceptance.
-- PowerShell 7 acceptance.
-- SBOM generation and database migration compatibility testing.
+- Signing certificate and Authenticode-signed executable/manifest (or an equivalent verifiable signing scheme) with verification enforced in release validation.
+- Official, controlled release host and documented install command with verified ownership.
+- Clean Windows 10/11 x64 acceptance (PowerShell 5.1 and PowerShell 7.x).
+- Reproducible release builds or documented, bounded non-determinism.
+- Packaged-install approval persistence/recovery and packaged restart-recovery evidence.
+- SBOM generation and database migration compatibility testing across packaged upgrades.
