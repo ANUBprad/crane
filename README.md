@@ -1,203 +1,212 @@
 <div align="center">
-  <img src="apps/desktop/public/crane-mark-dark.webp" alt="CRANE" width="360" />
+  <img src="apps/desktop/public/crane-mark-dark.webp" alt="CRANE" width="320" />
 </div>
 
-<p align="center"><strong>CRANE</strong> is a headless, offline-first MCP execution and orchestration runtime for durable, multi-step tasks.</p>
+<p align="center"><strong>CRANE</strong> is a headless, offline-first execution runtime for durable, tool-using tasks.</p>
 
-CRANE accepts a task, coordinates authorized tools, runs a bounded workflow, persists execution state, handles failures, and returns a concise result. It is a local-first execution layer—not a chatbot, RAG product, or dashboard.
+CRANE runs as a local supervisor: it accepts tasks through a CLI or authenticated loopback API, executes bounded workflows through a Python/LangGraph runtime, invokes MCP tools under policy control, persists state in SQLite, and returns concise results. It is designed for local-first operation, not as a chatbot, RAG product, or dashboard.
 
-> **Project status: working vertical slice, not production-ready.** The Go supervisor durably admits tasks, runs bounded Python/LangGraph workflows, confirms cancellation, persists lifecycle/events/checkpoints/results, and streams real events over authenticated SSE. The optional desktop client submits and cancels tasks through the same restricted main-process bridge. Default execution is offline deterministic local mode; real Ollama `llama3.2:3b` and MCP stdio/Streamable HTTP paths were validated on Windows. Unsigned PowerShell release artifacts (`0.1.0`-`0.1.2`, rebuilt from `1953963d21398940370787eb247c6c0a04e76487`) passed isolated Windows acceptance under PowerShell 5.1, PowerShell 7.7.0, and minimal-PATH mode on this dev host, and deterministic release packaging now produces byte-identical outputs for identical declared inputs on this host (`scripts/test-release-reproducibility.ps1`), but clean Windows 10/11 machines, Authenticode signing, a controlled official host, and cross-environment reproducibility proof remain unverified.
+> **Project status:** working vertical slice with active hardening. Core task admission, Python/LangGraph execution, MCP stdio/Streamable HTTP tool integration, local Ollama execution, SQLite persistence, authenticated loopback API/SSE, approval gating, and Windows packaging scripts are implemented and exercised by tests/harnesses. Current packaged recovery evidence exists for deterministic artifact `0.1.3-recovery-fix2` (commit `62b3d3d961fdc69a746b4348ca89873a67f45bda`) in isolated Windows environments. CRANE is **not** production-ready: clean-machine Windows 10/11 acceptance, Authenticode signing/verification, a controlled official release host, and cross-environment reproducibility proof remain unverified.
 
-## What CRANE is being built to do
+## What CRANE does
 
-- Run headlessly through a CLI and local interfaces.
-- Execute workflows using **LangGraph**, with **LangChain** for model and tool abstractions.
-- Connect to local and remote tools through **MCP**.
-- Persist task and checkpoint data locally with **SQLite**.
-- Prefer local inference and local tools when available.
-- Require explicit policy authorization for risky or externally consequential actions.
-- Continue eligible work after the submitting terminal disconnects.
-- Recover safely after runtime interruption without blindly replaying uncertain side effects.
+CRANE is built to coordinate work that needs more than a single model response:
 
-## Architecture at a glance
+- Accept a task, plan a bounded next action, and execute it through authorized tools.
+- Keep execution headless and local-first: CLI and loopback API first, no mandatory UI.
+- Use MCP as the external tool boundary instead of embedding ad hoc integrations into the core runtime.
+- Persist task lifecycle, events, checkpoints, approvals, and invocation records in SQLite.
+- Continue or recover safely after interruption where the persisted state makes recovery unambiguous.
+- Require explicit authorization before consequential actions.
 
-The intended ownership boundary is Go for process/task coordination and Python for agent execution:
+## Architecture and responsibilities
 
-```mermaid
-flowchart TD
-    U[User / CLI] --> G[Go CLI and Supervisor]
-    G <--> P[Versioned JSON Protocol]
-    P <--> R[Python Agent Runtime]
-    G <--> DB[(SQLite)]
-    R --> W[LangGraph Workflow]
-    W --> LC[LangChain]
-    LC --> MCP[MCP Manager]
-    MCP --> S[Local stdio / Remote Streamable HTTP Servers]
-    LC --> L[Configured Model Provider]
-    L --> O[Local Ollama or Explicit Hosted Provider]
-    W --> P
-```
+CRANE separates process control from agent execution:
 
-This diagram describes the intended component boundaries. It does not imply that every path is already wired end to end. See [ARCHITECTURE.md](ARCHITECTURE.md) for component responsibilities, data flow, lifecycle, and known integration gaps.
+| Component | Responsibility |
+|---|---|
+| **Go CLI / supervisor** | Owns the `agent` executable, process lifecycle, task admission/cancellation, recovery decisions, local API, and coordination of durable state. |
+| **Python execution service** | Runs agent execution as a supervised runtime. It receives versioned protocol messages, executes workflows, and emits state/events/results. |
+| **LangChain** | Model/tool abstraction layer. MCP tools are adapted through LangChain interfaces; provider integration is explicit. |
+| **LangGraph** | Stateful workflow orchestration. The workflow executes bounded graph steps, checkpoints, tool routing, and result/failure transitions. |
+| **MCP** | External tool/server protocol boundary. CRANE supports local stdio and remote Streamable HTTP MCP servers through the MCP runtime. |
+| **SQLite** | Default local persistence engine for tasks, events, checkpoints, MCP configuration/discovery/invocations, and approval records. |
 
-## Repository layout
+The optional desktop app is a separate client; it is not part of the execution core. See [ARCHITECTURE.md](ARCHITECTURE.md) and [TECHNICAL_SPECIFICATION.md](TECHNICAL_SPECIFICATION.md) for details.
 
-```text
-.
-├── apps/desktop/           # Optional Electron + React workspace
-├── cmd/agent/              # Go CLI entry point
-├── supervisor/             # Go runtime/process coordination
-├── localapi/               # Authenticated loopback API
-├── localauth/              # DPAPI-protected installation token lifecycle
-├── persistence/            # SQLite store and task/checkpoint persistence
-├── python_protocol/        # Versioned Go/Python message definitions
-├── crane/
-│   ├── python_runtime/     # Python runtime and LangGraph workflow engine
-│   └── mcp_runtime/        # MCP manager and LangChain tool adapter
-├── scripts/                # Release build, install, uninstall, and acceptance harness
-├── AGENTS.md               # Repository instructions for coding agents
-├── ARCHITECTURE.md         # System architecture and boundaries
-├── PRODUCT_REQUIREMENTS.md # Product scope and requirements
-├── TECHNICAL_SPECIFICATION.md
-├── SECURITY_AND_PRIVACY.md
-├── WINDOWS_ACCEPTANCE_TESTS.md
-└── ...
-```
+## Model providers: local Ollama and explicit hosted services
 
-## Implementation snapshot
+CRANE's intended offline path is local model execution. Local Ollama support is implemented as an explicit provider choice (`CRANE_MODEL_PROVIDER=ollama`, `CRANE_MODEL`, `OLLAMA_HOST` as configured). CRANE does not silently fall back from local execution to a hosted model.
 
-| Component | Present in repository | Current confidence |
-|---|---:|---|
-| Go CLI entry point | Yes | Runs `serve` by default; supports version, token lifecycle and `task create`; the full task command set remains planned |
-| Go supervisor | Yes | Bounded admission, subprocess execution, cancellation, event streaming and restart recovery are wired into the CLI and tested on Windows |
-| Local authentication | Yes | 256-bit token protected by Windows DPAPI; rotation/revocation tested on Windows |
-| Loopback API | Yes | Authenticated `127.0.0.1:8787`; health, task list/detail, submit, cancel and cursor-replayable SSE |
-| Optional desktop client | Yes | Submits/cancels tasks and shows live persisted events through restricted main-process IPC; MCP/approvals remain unavailable |
-| SQLite persistence | Yes | Task records/events/checkpoints/results and explicit restart-recovery policies are tested |
-| Go/Python protocol | Yes | Versioned, bounded NDJSON with handshake, submission, cancellation, state, result and error integration coverage |
-| Python runtime | Yes | Runs real LangGraph workflows in a supervisor-owned subprocess; CPython 3.12.7 and hashed pinned dependencies are packaged and independently health-checked by the installer |
-| MCP integration | Validated | Real stdio and Streamable HTTP sessions, tool discovery, validation, and policy approval were exercised against local servers on Windows |
-| LangChain adapter | Yes | MCP adapter and explicit local/Ollama provider policy exist; no silent hosted fallback |
-| LangGraph workflow | Validated | Real `StateGraph` execution, checkpoints, bounded steps, and MCP/approval paths are exercised on Windows |
-| Ollama provider | Validated | Pinned `langchain-ollama` is installed; real `llama3.2:3b` inference, preflight, diagnostics, invalid-model failure and LangGraph/SQLite persistence are validated on Windows. No fallback is permitted |
-| Windows bootstrapper | Yes | Verified PowerShell install/update/rollback/uninstall with SHA-256 checks in isolated harnesses (PS 5.1, PS 7.7.0, minimal PATH); explicitly unsigned/unverified manifest state |
-| Signed release / official host | No | No signing certificate or controlled official host; release source is configurable (local path or `http(s)`) and must not fall back to unverified downloads |
-| Production Windows release | Partial | Isolated dev-host acceptance passed for rebuilt `1953963` artifacts and identical-input Windows release outputs are byte-identical on this host; clean Windows 10/11 machines, Authenticode signing/verification, controlled hosting, and cross-environment reproducibility proof remain |
+Hosted model providers or remote MCP endpoints are optional integrations. They must be explicitly configured and authorized; they are not the default execution path, and their use changes the data-egress boundary. See [SECURITY_AND_PRIVACY.md](SECURITY_AND_PRIVACY.md).
 
-Do not interpret source presence or a passing unit test as proof of a complete production workflow. The current known integration and validation gaps are tracked in [PROJECT_TRACKER.md](PROJECT_TRACKER.md).
+## Windows installation and CLI commands
 
-## Current development state
+Windows 10/11 x64 is the first supported target. Packaged installation uses PowerShell scripts and a private per-user runtime layout; end users do not need Go, Python, Node.js, Docker, Redis, or a source checkout.
 
-The project now has an end-to-end supervisor/API/desktop task path backed by real Python execution, validated MCP/Ollama behavior, and an unsigned packaged Windows runtime. Isolated lifecycle acceptance passed on this dev host for rebuilt `1953963` artifacts under Windows PowerShell 5.1, PowerShell 7.7.0, and minimal-PATH mode; a real Ollama+MCP e2e run (`llama3.2:3b`) and Go approval/recovery/restart policy tests also passed (see `build\evidence\`). The next engineering work should prioritize the remaining safety and production boundaries:
-
-1. Validate the packaged runtime on genuine clean Windows 10 and Windows 11 x64 machines (no Go/Python/Node/npm/repo/dev dependencies) with PowerShell 5.1 and PowerShell 7.x.
-2. Add a real signing certificate, Authenticode verification, and a controlled official release host with verified ownership/TLS/access control.
-3. Collect packaged-install approval/restart/replay-prevention evidence and validate deterministic release packaging across environments/toolchains (identical-input outputs are now byte-identical on this host via `scripts/test-release-reproducibility.ps1`; prior `0.1.2` rebuilds differed as recorded in `build\evidence\repro-0.1.2-1953963.json`).
-4. Verify timeout, concurrency saturation, side-effect ambiguity, and cancellation limits under real external/non-idempotent MCP tools.
-5. Test database migration compatibility across packaged upgrades.
-6. Keep validating additional local models with the pinned packaged runtime.
-
-## Build and validation
-
-The Go module is at the repository root. A Go toolchain matching the version declared in `go.mod` is required for Go development.
-
-Useful checks for contributors:
+### Release build (contributors / controlled packaging)
 
 ```powershell
-go version
+.\scripts\build-release.ps1 -Version <version> -Commit <sha> -BuildDate <iso8601> -PythonVersion 3.12.7 -GoVersion <go-version> -PythonEmbedZip <path>
+```
+
+Builds are deterministic for identical declared inputs on the same host as validated by `scripts/test-release-reproducibility.ps1`. Cross-environment reproducibility is not yet proven.
+
+### Install / update / rollback / uninstall
+
+Release source must be explicit (local directory or controlled `http(s)` source). Do not use unverified download sources.
+
+```powershell
+.\scripts\install.ps1 -Action Install -ReleaseSource <dir-or-url> [-Version <version>]
+.\scripts\install.ps1 -Action Update  -ReleaseSource <dir-or-url> [-Version <version>]
+.\scripts\install.ps1 -Action Rollback
+.\scripts\uninstall.ps1
+.\scripts\uninstall.ps1 -RemoveData -Confirm REMOVE-CRANE-DATA
+```
+
+The installer verifies manifest/SHA-256 metadata, rejects tampered/unsupported artifacts, stages payloads safely, and preserves user data by default. Current manifests are explicitly unsigned/unverified (`signature.scheme=none`, `signature.status=unverified`); this is checksum/metadata verification, not Authenticode signing.
+
+### CLI commands
+
+The packaged `agent` launcher exposes the user-facing command set:
+
+```powershell
+agent                               # Start supervisor and local API (default)
+agent serve                         # Start supervisor and local API
+agent run "task"                    # Submit a task and print its ID
+agent status <task-id>              # Report persisted task status
+agent result <task-id>              # Print completed task result
+agent cancel <task-id>              # Request task cancellation
+agent doctor                        # Report runtime/installation health
+agent update -source <dir-or-url> [-version <version>]
+agent uninstall [--remove-data --confirm REMOVE-CRANE-DATA]
+```
+
+Development/source commands also include:
+
+```powershell
+go run ./cmd/agent --version
+go run ./cmd/agent api-token
+go run ./cmd/agent api-token --rotate
+go run ./cmd/agent api-token --revoke
+go run ./cmd/agent task create --id <id> --input "..."
+```
+
+`api-token` is a trusted local integration boundary: tokens are printed to stdout only, never passed as URL/query args, and rotation/revocation take effect immediately because protected token state is reloaded per request. See [DISTRIBUTION_AND_INSTALLATION.md](DISTRIBUTION_AND_INSTALLATION.md).
+
+## MCP server configuration and tool execution
+
+MCP is the boundary for external tools. CRANE manages MCP servers through its Go supervisor and authenticated loopback API (`/v1/mcp/*` routes for status, server CRUD/connect/disconnect/discover, tools, invocations, approvals, and invoke decisions). The desktop client does not yet provide MCP management screens.
+
+Configuration supports stdio and Streamable HTTP transports. Stdio server commands are constrained by explicit allowlist/policy (`CRANE_MCP_ALLOWED_COMMANDS` and runtime validation), and environment values are treated as sensitive: secret-like keys are rejected by policy and secret values must not be exposed through status/invocation/approval APIs or logs.
+
+Tool execution is policy-gated:
+
+- Read-only/allowed tools may run without approval when policy permits.
+- Consequential/destructive/externally impactful tools require explicit exact-action approval.
+- Approvals are bound to the exact action fingerprint; a changed action requires new approval.
+- Denial prevents invocation. Pending approvals persist across restart until decided.
+- MCP invocations/results are recorded as durable records; ambiguous non-idempotent external effects must not be blindly replayed.
+
+## Task lifecycle, persistence, recovery, and approvals
+
+Task state is persisted in SQLite. The durable lifecycle includes queued/running/succeeded/failed/cancelled and approval-waiting states as represented by the runtime/API. CRANE persists lifecycle events, checkpoints, terminal results, MCP tool results, and approval records.
+
+Recovery behavior is safety-first:
+
+- Startup recovery inspects persisted task/checkpoint state and resumes only where safe.
+- Ambiguous in-flight or cancellation-unconfirmed work must not be reported as clean success.
+- Pending approvals survive supervisor restart and remain pending until explicitly approved/denied.
+- Approval decisions are exact-action grants; no broad or implicit authorization.
+- External side effects are treated as potentially non-idempotent. CRANE does not claim exactly-once external execution.
+
+SSE task events are persisted and replayable by cursor. Clients should use cursor replay after reconnect/restart rather than assuming in-memory delivery.
+
+## Security and permission boundaries
+
+CRANE treats tool execution as a security-sensitive boundary:
+
+- The local API binds to loopback (`127.0.0.1:8787`) and requires bearer-token authentication.
+- Model output and tool descriptions are untrusted; they cannot grant permissions or bypass policy.
+- Consequential actions require explicit approval by default policy.
+- Secrets/credentials must be redacted from logs, errors, diagnostics, and API responses.
+- Stdio command execution and MCP environment configuration are validated/constrained.
+- No silent cloud fallback or unauthorized data egress.
+
+See [SECURITY_AND_PRIVACY.md](SECURITY_AND_PRIVACY.md) for the full security model.
+
+## Desktop workspace (optional)
+
+The Electron + React desktop workspace under [apps/desktop](apps/desktop/README.md) is an optional client for observing health/tasks/events and submitting/cancelling tasks through the restricted preload/main-process bridge. It does not replace the CLI, does not own task lifecycle, and must not bypass Go-owned policy or access SQLite/tokens directly.
+
+## Development and testing
+
+### Prerequisites
+
+- Go toolchain matching [go.mod](go.mod)
+- Python 3.12.x for runtime development/packaging parity
+- Node/npm for desktop workspace checks
+- Windows for Windows packaging/install/lifecycle validation
+
+### Common checks
+
+```powershell
+gofmt -l .
 go build ./...
 go vet ./...
 go test ./...
 python -m compileall -q crane
-python -m unittest discover -s crane/python_runtime -p 'test_*.py'
+python -m unittest discover -s crane -p "test_*.py" -v
 python -m crane.python_runtime --health
-go run ./cmd/agent doctor
 ```
 
-Desktop checks from `apps/desktop`:
+Desktop (`apps/desktop`):
 
 ```powershell
+npm ci
 npm run typecheck
 npm run build
 ```
 
-Windows release build and isolated lifecycle acceptance from the repository root:
+Packaging/release validation:
 
 ```powershell
-.\scripts\build-release.ps1 -Version 0.1.0 -Commit <sha> -BuildDate <iso8601> -PythonVersion 3.12.7 -GoVersion <go-version> -PythonEmbedZip <path>
-.\scripts\build-release.ps1 -Version 0.1.1 -Commit <sha> -BuildDate <iso8601> -PythonVersion 3.12.7 -GoVersion <go-version> -PythonEmbedZip <path>
-.\scripts\build-release.ps1 -Version 0.1.2 -Commit <sha> -BuildDate <iso8601> -PythonVersion 3.12.7 -GoVersion <go-version> -PythonEmbedZip <path>
+.\scripts\build-release.ps1 -Version <version> -Commit <sha> -BuildDate <iso8601> -PythonVersion 3.12.7 -GoVersion <go-version> -PythonEmbedZip <path>
+.\scripts\test-release-reproducibility.ps1
 .\scripts\acceptance-windows.ps1 -ReleaseRoot .\build\release
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\acceptance-windows.ps1 -ReleaseRoot .\build\release
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\acceptance-windows.ps1 -ReleaseRoot .\build\release -MinimalEnvironment
 ```
 
-Generated release trees are written to ignored `build/release/`. Acceptance uses fake local application data and a controlled PATH change that is restored exactly; see [WINDOWS_ACCEPTANCE_TESTS.md](WINDOWS_ACCEPTANCE_TESTS.md).
+Run tests relevant to the behavior you changed. Do not claim a test passed unless it was executed in the current environment.
 
-These checks were run on this Windows x64 dev host and passed for rebuilt `1953963` artifacts (PS 5.1, PS 7.7.0, minimal PATH) with evidence under `build\evidence\`; exact source-tree validation history is recorded in [PROJECT_TRACKER.md](PROJECT_TRACKER.md). Packaged release validation uses the complete hashed closure in `requirements.lock.txt` and is described in [DISTRIBUTION_AND_INSTALLATION.md](DISTRIBUTION_AND_INSTALLATION.md). Passing checks are not a claim of clean-machine, signed-release, controlled-host, or reproducible-build acceptance.
+## Current release limitations
 
-The current executable supports these development commands:
+The following are intentionally **not** claimed as complete:
 
-```powershell
-go run ./cmd/agent --version
-go run ./cmd/agent serve
-go run ./cmd/agent api-token
-go run ./cmd/agent api-token --rotate
-go run ./cmd/agent api-token --revoke
-go run ./cmd/agent task create --id example --input "private task input"
-go run ./cmd/agent doctor
-```
-
-The packaged launcher adds the user-facing lifecycle contract:
-
-```powershell
-agent run "do the task"
-agent status <task-id>
-agent result <task-id>
-agent cancel <task-id>
-agent doctor
-agent update -source <dir-or-url> [-version <version>]
-agent uninstall
-```
-
-`serve` starts the supervisor and authenticated loopback API on `127.0.0.1:8787`. `api-token` is a trusted integration boundary: it prints the installation token to stdout only; the token is never passed in an argument, URL, browser storage or renderer API. `api-token --rotate` prints a replacement and permanently revokes the previous token; `api-token --revoke` leaves no active token and writes its status to stderr. Rotation/revocation takes effect in an already-running server because protected state is reloaded on each request. `doctor` reports provider, Ollama installation/connectivity, configured model availability and provider initialization state without task text or credentials.
-
-The task-oriented CLI contract above is implemented in the packaged launcher. Lifecycle commands require a packaged installation; they are not available from `go run`.
-
-## Platform and privacy
-
-- **Initial target:** Windows 10/11 x64.
-- **Current status:** Windows-first design; isolated packaging acceptance passed, but clean-machine production acceptance is not complete.
-- Local model and MCP operation is the intended offline path.
-- Hosted model providers and remote MCP servers must be explicitly configured.
-- CRANE must never silently fall back to a hosted model or send local data to a remote service without authorization.
-- Model weights are not intended to be bundled with the base application.
+- **Clean-machine Windows acceptance:** no verified clean Windows 10/11 x64 acceptance on machines without dev toolchains/repo dependencies.
+- **Authenticode/code signing:** manifests/artifacts are currently unsigned/unverified; checksum validation is not code-signature verification.
+- **Official release host:** no verified controlled official download domain/hosted release channel. Release source must be explicitly provided and controlled.
+- **Cross-environment reproducibility:** identical-input deterministic outputs are validated on this host; cross-environment/toolchain reproducibility is not proven.
+- **Packaged upgrade/rollback evidence:** best-effort packaged upgrade/rollback checks exist, but same-commit true upgrade/rollback proof may be environment-limited; report limitations explicitly.
+- **Production readiness:** external side-effect ambiguity, timeout/concurrency saturation, packaged non-idempotent replay prevention, and full clean-machine security acceptance remain active validation areas.
 
 ## Documentation
 
 | Document | Purpose |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Components, ownership, execution flow, and recovery design |
-| [PRODUCT_REQUIREMENTS.md](PRODUCT_REQUIREMENTS.md) | Product definition, user journeys, and requirements |
-| [TECHNICAL_SPECIFICATION.md](TECHNICAL_SPECIFICATION.md) | Technology choices, protocol, CLI contract, and runtime constraints |
-| [SECURITY_AND_PRIVACY.md](SECURITY_AND_PRIVACY.md) | Trust boundaries, permissions, approvals, and data egress |
-| [DECISIONS.md](DECISIONS.md) | Recorded architecture decisions |
-| [PROJECT_TRACKER.md](PROJECT_TRACKER.md) | Evidence-based implementation status and blockers |
-| [WINDOWS_ACCEPTANCE_TESTS.md](WINDOWS_ACCEPTANCE_TESTS.md) | Windows release acceptance criteria |
-| [DISTRIBUTION_AND_INSTALLATION.md](DISTRIBUTION_AND_INSTALLATION.md) | Implemented unsigned installer, update, rollback, uninstall, and release layout |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | System boundaries, component ownership, and flow |
+| [PRODUCT_REQUIREMENTS.md](PRODUCT_REQUIREMENTS.md) | Product scope and requirements |
+| [TECHNICAL_SPECIFICATION.md](TECHNICAL_SPECIFICATION.md) | Technical contracts and runtime constraints |
+| [SECURITY_AND_PRIVACY.md](SECURITY_AND_PRIVACY.md) | Trust boundaries, approvals, secrets, egress |
+| [DISTRIBUTION_AND_INSTALLATION.md](DISTRIBUTION_AND_INSTALLATION.md) | Windows packaging/install/update/rollback/uninstall |
+| [WINDOWS_ACCEPTANCE_TESTS.md](WINDOWS_ACCEPTANCE_TESTS.md) | Windows acceptance criteria |
+| [PROJECT_TRACKER.md](PROJECT_TRACKER.md) | Evidence-based status and blockers |
 | [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md) | Engineering and validation rules |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow |
-
-## Optional desktop workspace
-
-The optional [desktop client](apps/desktop/README.md) is an Electron + React workspace for submitting, cancelling and observing executions and local runtime health. It stays separate from the Go/Python execution core, so the CLI remains fully usable without it.
-
-The current client reads real health, persisted tasks and task details, submits and cancels tasks, and displays live persisted events from the authenticated loopback API. The Electron main process owns token retrieval, API and stream lifecycle; the renderer receives only narrow typed methods through the preload bridge and never receives the token or arbitrary HTTP access. MCP servers and approvals remain explicitly unavailable because the backend API does not expose them. The client keeps its dark-first theme and the CRANE mark in both dark and light themes, and it never fabricates runtime state.
+| [DECISIONS.md](DECISIONS.md) | Recorded decisions |
 
 ## Contributing
 
-Read [AGENTS.md](AGENTS.md), [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md), and the relevant architecture/product documents before changing code. Keep changes focused, validate the behavior actually changed, preserve user data, and never claim unrun tests or unverified platform support.
+Read [AGENTS.md](AGENTS.md), [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md), and the relevant architecture/product docs before changing code. Keep changes focused, preserve user data, validate behavior you changed, and report tests/limitations honestly.
 
 ## License
 
-See [LICENSE](LICENSE).
+[LICENSE](LICENSE)
