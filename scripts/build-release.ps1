@@ -32,12 +32,59 @@ function Assert-IsWindowsX64 {
 
 function ConvertTo-JsonFile([object]$value, [string]$path) {
     $json = $value | ConvertTo-Json -Depth 12
-    [System.IO.File]::WriteAllText($path, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+    $text = $json + "`n"
+    [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
 }
 
 function Remove-Directory([string]$path) {
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Recurse -Force
+    }
+}
+
+function New-DeterministicZip([string]$sourceDirectory, [string]$destinationZip) {
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (Test-Path -LiteralPath $destinationZip) {
+        Remove-Item -LiteralPath $destinationZip -Force
+    }
+    $sourceFull = [System.IO.Path]::GetFullPath($sourceDirectory)
+    $prefix = $sourceFull.TrimEnd('\', '/') + '\'
+    $entryTime = [DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+    $zipStream = [System.IO.File]::Open($destinationZip, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        $archive = [System.IO.Compression.ZipArchive]::new($zipStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $files = @(Get-ChildItem -LiteralPath $sourceFull -Recurse -File -Force | Sort-Object -Property @{ Expression = { $_.FullName } })
+            foreach ($file in $files) {
+                $full = [System.IO.Path]::GetFullPath($file.FullName)
+                if (-not $full.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Refusing to zip path outside staging directory: $full"
+                }
+                $relative = $full.Substring($prefix.Length).Replace('\', '/')
+                $entry = $archive.CreateEntry($relative, [System.IO.Compression.CompressionLevel]::Optimal)
+                $entry.LastWriteTime = $entryTime
+                $entryStream = $entry.Open()
+                try {
+                    $fileStream = [System.IO.File]::Open($full, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+                    try {
+                        $fileStream.CopyTo($entryStream)
+                    }
+                    finally {
+                        $fileStream.Dispose()
+                    }
+                }
+                finally {
+                    $entryStream.Dispose()
+                }
+            }
+        }
+        finally {
+            $archive.Dispose()
+        }
+    }
+    finally {
+        $zipStream.Dispose()
     }
 }
 
@@ -50,9 +97,11 @@ else {
     $outputRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutputRoot))
 }
 $releaseDir = Join-Path $outputRoot $Version
-$stagingRoot = Join-Path $outputRoot 'staging'
-$stage = Join-Path $stagingRoot ("build-{0}-{1}" -f $Version, [guid]::NewGuid().ToString('N'))
+$stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) 'crane-release-staging'
+$stage = Join-Path $stagingRoot ("build-" + $Version)
 Remove-Directory $releaseDir
+Remove-Directory $stage
+New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $stage 'runtime') -Force | Out-Null
@@ -74,7 +123,9 @@ if (-not $GoVersion) {
     if (-not $GoVersion) { throw 'Could not read the Go version.' }
 }
 if (-not $PythonEmbedZip) {
-    $PythonEmbedZip = Join-Path $stagingRoot ("python-{0}-embed-amd64.zip" -f $PythonVersion)
+    $cacheRoot = Join-Path $outputRoot 'staging'
+    New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
+    $PythonEmbedZip = Join-Path $cacheRoot ("python-{0}-embed-amd64.zip" -f $PythonVersion)
     if (-not (Test-Path -LiteralPath $PythonEmbedZip)) {
         Write-Step "Downloading CPython $PythonVersion embeddable runtime"
         $url = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-embed-amd64.zip"
@@ -85,10 +136,10 @@ if (-not $PythonEmbedZip) {
 if (-not (Test-Path -LiteralPath $PythonEmbedZip)) { throw "Python embeddable archive not found: $PythonEmbedZip" }
 
 Write-Step 'Building agent.exe'
-$ldflags = "-s -w -X main.version=$Version -X main.buildCommit=$Commit -X main.buildDate=$buildDate -X main.goVersion=$($GoVersion -replace '\s+', ' ')"
+$ldflags = "-s -w -buildid= -X main.version=$Version -X main.buildCommit=$Commit -X main.buildDate=$buildDate -X main.goVersion=$($GoVersion -replace '\s+', ' ')"
 Push-Location $repoRoot
 try {
-    & go build -trimpath "-ldflags=$ldflags" -o (Join-Path $stage 'agent.exe') ./cmd/agent
+    & go build -trimpath -buildvcs=false "-ldflags=$ldflags" -o (Join-Path $stage 'agent.exe') ./cmd/agent
     if ($LASTEXITCODE -ne 0) { throw 'go build failed.' }
 }
 finally { Pop-Location }
@@ -106,6 +157,12 @@ $pthPath = Join-Path $pythonDir "python$pyMajorMinor._pth"
 Write-Step 'Installing pinned production Python dependencies'
 & python -m pip install --disable-pip-version-check --no-deps --no-compile --only-binary=:all: --require-hashes --target $sitePackages -r (Join-Path $repoRoot 'requirements.lock.txt')
 if ($LASTEXITCODE -ne 0) { throw 'Packaged Python dependency installation failed.' }
+foreach ($extraDir in @((Join-Path $sitePackages 'bin'), (Join-Path $sitePackages 'Scripts'))) {
+    if (Test-Path -LiteralPath $extraDir) {
+        Remove-Item -LiteralPath $extraDir -Recurse -Force
+    }
+}
+Get-ChildItem -LiteralPath $sitePackages -Recurse -File -Filter 'RECORD' -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -like '*.dist-info' } | Remove-Item -Force
 
 Write-Step 'Copying CRANE Python application'
 $appDir = Join-Path $stage 'runtime\app\crane'
@@ -124,10 +181,10 @@ foreach ($relative in $trackedAppFiles) {
     }
     Copy-Item -LiteralPath $source -Destination $destination -Force
 }
-Get-ChildItem -LiteralPath $appDir -Recurse -Directory -Filter '__pycache__' | Remove-Item -Recurse -Force
-Get-ChildItem -LiteralPath $appDir -Recurse -File -Filter 'test_*.py' | Remove-Item -Force
-Get-ChildItem -LiteralPath $appDir -Recurse -File -Filter '*.pyc' | Remove-Item -Force
-Get-ChildItem -LiteralPath $appDir -Recurse -File -Filter '_init__.py' | Remove-Item -Force
+Get-ChildItem -LiteralPath $appDir -Recurse -Directory -Filter '__pycache__' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+Get-ChildItem -LiteralPath $appDir -Recurse -File -Filter 'test_*.py' -ErrorAction SilentlyContinue | Remove-Item -Force
+Get-ChildItem -LiteralPath $appDir -Recurse -File -Filter '*.pyc' -ErrorAction SilentlyContinue | Remove-Item -Force
+Get-ChildItem -LiteralPath $appDir -Recurse -File -Filter '_init__.py' -ErrorAction SilentlyContinue | Remove-Item -Force
 
 $installInfo = [ordered]@{
     schema_version = 1
@@ -174,19 +231,18 @@ finally {
 Write-Step 'Creating release artifacts'
 Get-ChildItem -LiteralPath $stage -Recurse -Directory -Filter '__pycache__' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
 Get-ChildItem -LiteralPath $stage -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.pyc', '.pyo' } | Remove-Item -Force
-$fixedTimestamp = [datetime]'1980-01-01T00:00:00'
+$fixedTimestamp = [datetime]'1980-01-01T00:00:00Z'
 Get-ChildItem -LiteralPath $stage -Recurse -Force | ForEach-Object {
-    $_.CreationTimeUtc = $fixedTimestamp
-    $_.LastWriteTimeUtc = $fixedTimestamp
-    $_.LastAccessTimeUtc = $fixedTimestamp
+    try { $_.CreationTimeUtc = $fixedTimestamp } catch {}
+    try { $_.LastWriteTimeUtc = $fixedTimestamp } catch {}
+    try { $_.LastAccessTimeUtc = $fixedTimestamp } catch {}
 }
 Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\install.ps1') -Destination (Join-Path $releaseDir 'install.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\uninstall.ps1') -Destination (Join-Path $releaseDir 'uninstall.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'requirements.lock.txt') -Destination (Join-Path $releaseDir 'python-requirements.lock.txt') -Force
 $payloadName = "crane-windows-x64-$Version.zip"
 $payloadPath = Join-Path $releaseDir $payloadName
-if (Test-Path -LiteralPath $payloadPath) { Remove-Item -LiteralPath $payloadPath -Force }
-Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $payloadPath -CompressionLevel Optimal
+New-DeterministicZip -sourceDirectory $stage -destinationZip $payloadPath
 
 $artifacts = @(
     [ordered]@{ name = $payloadName; kind = 'payload'; sha256 = (Get-Sha256 $payloadPath); size = (Get-Item $payloadPath).Length },
@@ -209,7 +265,8 @@ $manifest = [ordered]@{
 }
 ConvertTo-JsonFile $manifest (Join-Path $releaseDir 'release-manifest.json')
 $sums = foreach ($artifact in $artifacts) { "{0}  {1}" -f $artifact.sha256, $artifact.name }
-$sums | Set-Content -LiteralPath (Join-Path $releaseDir 'SHA256SUMS.txt') -Encoding ASCII
+[System.IO.File]::WriteAllText((Join-Path $releaseDir 'SHA256SUMS.txt'), (($sums -join "`n") + "`n"), [System.Text.Encoding]::ASCII)
 
+Remove-Directory $stage
 Write-Step "Release written to $releaseDir"
 Get-ChildItem -LiteralPath $releaseDir -File | Select-Object Name, Length

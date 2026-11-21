@@ -15,7 +15,7 @@ Verified isolated results for rebuilt `1953963` artifacts:
 - **PowerShell 7.7.0, `-MinimalEnvironment`:** all isolated checks passed with `go`/`python`/`node`/`npm` absent from `PATH` — `build\evidence\acceptance-minimal-pwsh7-1953963.log`.
 - **Real Ollama + MCP e2e (`llama3.2:3b`, source/runtime script):** PASS — `build\evidence\ollama-mcp-e2e-1953963.log`.
 - **Go approval/recovery/restart policy tests:** PASS — `build\evidence\go-test-approval-recovery-1953963.log` (`TestMCPSubmissionContextAndToolResultPersistence`, `TestStartupRecoveryPolicies`, cancel/resume/waiting-approval cases).
-- **Release reproducibility:** NOT verified on this host — `build\evidence\repro-0.1.2-1953963.json`.
+- **Release reproducibility:** Deterministic packaging and `scripts/test-release-reproducibility.ps1` added; two independent builds with identical declared inputs produced byte-for-byte identical ZIP/manifest/SHA256SUMS outputs on this host (PASS). Prior identical `0.1.2` rebuilds differed as recorded in `build\evidence\repro-0.1.2-1953963.json`; cross-environment/toolchain reproducibility remains to be validated.
 
 These results are isolated-harness evidence, not clean Windows 10/11 x64 acceptance, signed-release validation, or controlled-host publication proof.
 
@@ -87,7 +87,7 @@ These results are isolated-harness evidence, not clean Windows 10/11 x64 accepta
 - [x] Uninstall removes binaries, runtime, version pointers, and PATH entry.
 - [x] Confirmed uninstall removes CRANE-managed data.
 - [x] Release artifact integrity metadata (manifest/SHA256SUMS) internally consistent for rebuilt `0.1.0`–`0.1.2`; payloads contain no sampled secrets/credentials/user data/model weights and no `crane/mcp_runtime/_init__.py`.
-- [ ] Reproducible release builds verified on this host (`build\evidence\repro-0.1.2-1953963.json` shows differing hashes for identical inputs).
+- [x] Deterministic release builds verified for identical declared inputs on this host via `scripts/test-release-reproducibility.ps1` (ZIP/manifest/SHA256SUMS byte-identical); prior differing `0.1.2` rebuilds recorded in `build\evidence\repro-0.1.2-1953963.json`. Cross-environment/toolchain reproducibility remains to be validated.
 - [ ] Database migration compatibility tested across a real version upgrade.
 - [ ] Signing and artifact provenance validated with a real certificate and controlled release host.
 

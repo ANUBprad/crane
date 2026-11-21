@@ -6,7 +6,7 @@
 
 CRANE accepts a task, coordinates authorized tools, runs a bounded workflow, persists execution state, handles failures, and returns a concise result. It is a local-first execution layer—not a chatbot, RAG product, or dashboard.
 
-> **Project status: working vertical slice, not production-ready.** The Go supervisor durably admits tasks, runs bounded Python/LangGraph workflows, confirms cancellation, persists lifecycle/events/checkpoints/results, and streams real events over authenticated SSE. The optional desktop client submits and cancels tasks through the same restricted main-process bridge. Default execution is offline deterministic local mode; real Ollama `llama3.2:3b` and MCP stdio/Streamable HTTP paths were validated on Windows. Unsigned PowerShell release artifacts (`0.1.0`–`0.1.2`, rebuilt from `1953963d21398940370787eb247c6c0a04e76487`) passed isolated Windows acceptance under PowerShell 5.1, PowerShell 7.7.0, and minimal-PATH mode on this dev host, but clean Windows 10/11 machines, Authenticode signing, a controlled official host, and reproducible builds remain unverified.
+> **Project status: working vertical slice, not production-ready.** The Go supervisor durably admits tasks, runs bounded Python/LangGraph workflows, confirms cancellation, persists lifecycle/events/checkpoints/results, and streams real events over authenticated SSE. The optional desktop client submits and cancels tasks through the same restricted main-process bridge. Default execution is offline deterministic local mode; real Ollama `llama3.2:3b` and MCP stdio/Streamable HTTP paths were validated on Windows. Unsigned PowerShell release artifacts (`0.1.0`-`0.1.2`, rebuilt from `1953963d21398940370787eb247c6c0a04e76487`) passed isolated Windows acceptance under PowerShell 5.1, PowerShell 7.7.0, and minimal-PATH mode on this dev host, and deterministic release packaging now produces byte-identical outputs for identical declared inputs on this host (`scripts/test-release-reproducibility.ps1`), but clean Windows 10/11 machines, Authenticode signing, a controlled official host, and cross-environment reproducibility proof remain unverified.
 
 ## What CRANE is being built to do
 
@@ -82,7 +82,7 @@ This diagram describes the intended component boundaries. It does not imply that
 | Ollama provider | Validated | Pinned `langchain-ollama` is installed; real `llama3.2:3b` inference, preflight, diagnostics, invalid-model failure and LangGraph/SQLite persistence are validated on Windows. No fallback is permitted |
 | Windows bootstrapper | Yes | Verified PowerShell install/update/rollback/uninstall with SHA-256 checks in isolated harnesses (PS 5.1, PS 7.7.0, minimal PATH); explicitly unsigned/unverified manifest state |
 | Signed release / official host | No | No signing certificate or controlled official host; release source is configurable (local path or `http(s)`) and must not fall back to unverified downloads |
-| Production Windows release | Partial | Isolated dev-host acceptance passed for rebuilt `1953963` artifacts; clean Windows 10/11 machines, Authenticode signing/verification, controlled hosting, and reproducible builds remain |
+| Production Windows release | Partial | Isolated dev-host acceptance passed for rebuilt `1953963` artifacts and identical-input Windows release outputs are byte-identical on this host; clean Windows 10/11 machines, Authenticode signing/verification, controlled hosting, and cross-environment reproducibility proof remain |
 
 Do not interpret source presence or a passing unit test as proof of a complete production workflow. The current known integration and validation gaps are tracked in [PROJECT_TRACKER.md](PROJECT_TRACKER.md).
 
@@ -92,7 +92,7 @@ The project now has an end-to-end supervisor/API/desktop task path backed by rea
 
 1. Validate the packaged runtime on genuine clean Windows 10 and Windows 11 x64 machines (no Go/Python/Node/npm/repo/dev dependencies) with PowerShell 5.1 and PowerShell 7.x.
 2. Add a real signing certificate, Authenticode verification, and a controlled official release host with verified ownership/TLS/access control.
-3. Resolve or document release-build non-determinism (identical `0.1.2` rebuilds produced differing hashes on this host) and collect packaged-install approval/restart/replay-prevention evidence.
+3. Collect packaged-install approval/restart/replay-prevention evidence and validate deterministic release packaging across environments/toolchains (identical-input outputs are now byte-identical on this host via `scripts/test-release-reproducibility.ps1`; prior `0.1.2` rebuilds differed as recorded in `build\evidence\repro-0.1.2-1953963.json`).
 4. Verify timeout, concurrency saturation, side-effect ambiguity, and cancellation limits under real external/non-idempotent MCP tools.
 5. Test database migration compatibility across packaged upgrades.
 6. Keep validating additional local models with the pinned packaged runtime.

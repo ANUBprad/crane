@@ -24,7 +24,7 @@ Not implemented or not yet validated:
 - No official download domain or controlled hosted release channel is defined. Release source remains explicit (`-ReleaseSource` or `CRANE_RELEASE_SOURCE`, local path or `http(s)` only); do not publish to an uncontrolled host or claim an official URL.
 - No code-signing certificate is available. Manifests explicitly declare `signature.scheme = "none"` and `signature.status = "unverified"`. The installer accepts only that explicit unsigned state; it does not claim Authenticode/signature verification.
 - Genuine clean Windows 10 x64 and Windows 11 x64 machines without Go/Python/Node/npm/CRANE source are unavailable for validation on this host.
-- Release build reproducibility is **not verified** on this host: two identical `0.1.2` rebuilds with the same `-Version`, `-Commit`, `-BuildDate`, `-PythonVersion`, `-GoVersion`, and `-PythonEmbedZip` produced different payload/manifest/SHA256SUMS hashes (`build\evidence\repro-0.1.2-1953963.json`), while scripts and `python-requirements.lock.txt` matched.
+- Deterministic release packaging is now validated for identical declared inputs on this host: `scripts/test-release-reproducibility.ps1` builds the same release twice in separate temporary directories and verifies byte-for-byte identical ZIP/manifest/SHA256SUMS outputs. Prior identical `0.1.2` rebuilds on this host produced differing payload/manifest/SHA256SUMS hashes (`build\evidence\repro-0.1.2-1953963.json`) before the packaging fix; cross-environment/toolchain reproducibility remains to be validated.
 - Packaged-install approval persistence/recovery and packaged restart-recovery beyond harness/task-history checks are not separately exercised by `acceptance-windows.ps1`; source/test evidence exists (`build\evidence\go-test-approval-recovery-1953963.log`) and should not be treated as clean-machine packaged proof.
 
 ## Release source
@@ -47,7 +47,7 @@ $env:CRANE_RELEASE_SOURCE = 'https://<your-controlled-release-host>/crane'
 .\scripts\build-release.ps1 -Version 0.1.2
 ```
 
-For reproducible/evidence builds, pass explicit `-Commit`, `-BuildDate`, `-PythonVersion`, `-GoVersion`, and `-PythonEmbedZip` so metadata does not depend on the current checkout state. `build-release.ps1` uses tracked CRANE app files only (`git ls-files`), excludes `_init__.py`, installs pinned dependencies with `--no-compile`, removes `__pycache__`/`.pyc`/`.pyo`, and normalizes staged timestamps before zipping.
+For reproducible/evidence builds, pass explicit `-Commit`, `-BuildDate`, `-PythonVersion`, `-GoVersion`, and `-PythonEmbedZip` so metadata does not depend on the current checkout state. `build-release.ps1` uses tracked CRANE app files only (`git ls-files`), excludes `_init__.py`, installs pinned dependencies with `--no-compile`, removes `__pycache__`/`.pyc`/`.pyo`/`*.dist-info/RECORD` and package `bin`/`Scripts` directories, stages in a deterministic temporary path, normalizes timestamps, and writes deterministic ZIP/manifest/SHA256SUMS artifacts. Use `scripts/test-release-reproducibility.ps1` to verify byte-for-byte identical outputs for identical inputs.
 
 Each release directory contains:
 
