@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	defaultStartTimeout    = 30 * time.Second
+	defaultStartTimeout    = 90 * time.Second
 	defaultCommandTimeout  = 120 * time.Second
 	defaultShutdownTimeout = 5 * time.Second
 	maxStderrBytes         = 16 << 10
@@ -107,6 +107,7 @@ type Controller struct {
 	cmd      *exec.Cmd
 	stdin    io.WriteCloser
 	reader   *bufio.Reader
+	stderr   *boundedBuffer
 	done     chan struct{}
 	closeOne sync.Once
 	counter  atomic.Uint64
@@ -181,7 +182,8 @@ func (c *Controller) Start() error {
 		_ = stdin.Close()
 		return fmt.Errorf("create MCP daemon stdout: %w", err)
 	}
-	cmd.Stderr = &boundedBuffer{limit: maxStderrBytes}
+	stderrBuf := &boundedBuffer{limit: maxStderrBytes}
+	cmd.Stderr = stderrBuf
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		return fmt.Errorf("start MCP daemon: %w", err)
@@ -190,7 +192,7 @@ func (c *Controller) Start() error {
 	done := make(chan struct{})
 	identity := make(chan struct{}, 1)
 	c.mu.Lock()
-	c.cmd, c.stdin, c.reader, c.done = cmd, stdin, bufio.NewReaderSize(stdout, python_protocol.MaxMessageBytes+1), done
+	c.cmd, c.stdin, c.reader, c.stderr, c.done = cmd, stdin, bufio.NewReaderSize(stdout, python_protocol.MaxMessageBytes+1), stderrBuf, done
 	c.started = true
 	c.mu.Unlock()
 	go c.readLoop(identity)
@@ -198,10 +200,18 @@ func (c *Controller) Start() error {
 	select {
 	case <-identity:
 	case <-done:
+		stderr := stderrBuf.String()
 		c.Close()
+		if stderr != "" {
+			return fmt.Errorf("MCP daemon exited before its identity frame: %s", stderr)
+		}
 		return errors.New("MCP daemon exited before its identity frame")
 	case <-time.After(c.cfg.StartTimeout):
+		stderr := stderrBuf.String()
 		c.Close()
+		if stderr != "" {
+			return fmt.Errorf("MCP daemon startup timed out: %s", stderr)
+		}
 		return errors.New("MCP daemon startup timed out")
 	}
 
@@ -776,6 +786,12 @@ type boundedBuffer struct {
 	mu    sync.Mutex
 	buf   []byte
 	limit int
+}
+
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
 }
 
 func (b *boundedBuffer) Write(p []byte) (int, error) {

@@ -210,3 +210,27 @@ func TestControllerStreamableHTTPInvocation(t *testing.T) {
 		t.Fatalf("HTTP tool result = %q", text)
 	}
 }
+
+func TestControllerStartIncludesStderrOnFailure(t *testing.T) {
+	store := newControllerStore(t)
+	python := controllerPython(t)
+	// Force an immediate failure with identifiable stderr.
+	controller := New(store, Config{
+		PythonPath:   python,
+		PythonArgs:   []string{"-c", "import sys; sys.stderr.write('mcp-start-fail'); sys.exit(7)"},
+		StartTimeout: 15 * time.Second,
+	})
+	err := controller.Start()
+	if err == nil {
+		t.Fatal("Controller.Start() expected error")
+	}
+	if !strings.Contains(err.Error(), "mcp-start-fail") {
+		t.Fatalf("Start() error = %q, want stderr detail", err)
+	}
+}
+
+func TestDefaultStartTimeoutIsColdStartSafe(t *testing.T) {
+	if defaultStartTimeout < 60*time.Second {
+		t.Fatalf("defaultStartTimeout = %s, want >= 60s for packaged cold start", defaultStartTimeout)
+	}
+}
