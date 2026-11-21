@@ -13,11 +13,11 @@ import sys
 import threading
 from typing import Any, Dict, Optional
 
+from crane import mcp_runtime
 from crane.mcp_runtime import (
     MCPError,
     MCPServerConfig,
     configure_manager,
-    mcp_manager,
     redact,
     shutdown_all,
 )
@@ -56,7 +56,7 @@ class MCPProtocolRuntime:
     async def _dispatch(self, command: Dict[str, Any]) -> Dict[str, Any]:
         operation = command["operation"]
         payload = command["payload"]
-        manager = mcp_manager
+        manager = mcp_runtime.mcp_manager
 
         if operation == "configure":
             servers = payload.get("servers") or []
