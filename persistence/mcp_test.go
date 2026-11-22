@@ -249,7 +249,7 @@ func TestDeniedAndExpiredApprovalsCannotBeGranted(t *testing.T) {
 		t.Fatalf("expired grant err = %v, want %v", err, ErrApprovalExpired)
 	}
 
-	deniedFP := ApprovalFingerprint("task-denied", "srv", "delete_test_record", map[string]any{"id":"d"})
+	deniedFP := ApprovalFingerprint("task-denied", "srv", "delete_test_record", map[string]any{"id": "d"})
 	if err := store.CreateApprovalRequest(ApprovalRequestRecord{
 		ID: "approval-denied", TaskID: "task-denied", ServerID: "srv", ToolName: "delete_test_record",
 		Arguments: json.RawMessage(`{"id":"d"}`), Fingerprint: deniedFP,
