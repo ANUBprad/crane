@@ -235,13 +235,17 @@ try {
         & (Join-Path $release010 'install.ps1') -Action Install -ReleaseSource $release010 -InstallRoot $pathTestRoot
         $pathAfterInstall = [Environment]::GetEnvironmentVariable('Path', 'User')
         $pathAfterInstallRegistry = (Get-ItemProperty -Path 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
-        $pathAfterInstallEffective = if ($pathAfterInstall -like "*$pathEntry*") { $pathAfterInstall } else { $pathAfterInstallRegistry }
-        if ($pathAfterInstallEffective -notlike "*$pathEntry*") {
+        $pathAfterInstallEffective = @($pathAfterInstall, $pathAfterInstallRegistry | Where-Object { $_ }) -join ';'
+        $expectedNorm = [IO.Path]::GetFullPath($pathEntry).TrimEnd('\').ToLowerInvariant()
+        $pathPartsNorm = @($pathAfterInstallEffective -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object { try { [IO.Path]::GetFullPath($_).TrimEnd('\').ToLowerInvariant() } catch { $_.ToLowerInvariant() } })
+        $pathHasEntry = $pathPartsNorm -contains $expectedNorm
+        if (-not $pathHasEntry) {
             Write-Result "DIAG: expected entry=$pathEntry"
+            Write-Result "DIAG: expected normalized=$expectedNorm"
             Write-Result "DIAG: GetEnvironmentVariable(User)=$pathAfterInstall"
             Write-Result "DIAG: HKCU:\Environment\Path=$pathAfterInstallRegistry"
         }
-        Assert-Step ($pathAfterInstallEffective -like "*$pathEntry*") 'Installer added the CRANE bin directory to the user PATH'
+        Assert-Step $pathHasEntry 'Installer added the CRANE bin directory to the user PATH'
         & (Join-Path $release010 'uninstall.ps1') -InstallRoot $pathTestRoot
         $pathAfterUninstall = [Environment]::GetEnvironmentVariable('Path', 'User')
         $pathAfterUninstallRegistry = (Get-ItemProperty -Path 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
