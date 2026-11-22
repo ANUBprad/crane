@@ -16,7 +16,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: clean-windows-acceptance-\${{ github.ref }}-\${{ inputs.target }}
+  group: clean-windows-acceptance-${{ github.ref }}-${{ inputs.target }}
   cancel-in-progress: false
 
 jobs:
@@ -65,16 +65,16 @@ jobs:
       - name: Upload acceptance releases
         uses: actions/upload-artifact@v4
         with:
-          name: crane-clean-acceptance-\${{ inputs.target }}-\${{ github.run_id }}
-          path: \${{ runner.temp }}/crane-clean-acceptance
+          name: crane-clean-acceptance-${{ inputs.target }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/crane-clean-acceptance
           if-no-files-found: error
           retention-days: 2
 
   accept:
-    name: Clean \${{ inputs.target }} physical VM acceptance
+    name: Clean ${{ inputs.target }} physical VM acceptance
     if: github.ref == 'refs/heads/main'
     needs: build
-    runs-on: \${{ fromJSON(format('["self-hosted","windows","x64","crane-clean-{0}"]', inputs.target)) }}
+    runs-on: ${{ fromJSON(format('["self-hosted","windows","x64","crane-clean-{0}"]', inputs.target)) }}
     timeout-minutes: 120
     steps:
       - name: Check out acceptance harness
@@ -83,8 +83,8 @@ jobs:
       - name: Download packaged acceptance releases
         uses: actions/download-artifact@v4
         with:
-          name: crane-clean-acceptance-\${{ inputs.target }}-\${{ github.run_id }}
-          path: \${{ runner.temp }}/crane-clean-acceptance
+          name: crane-clean-acceptance-${{ inputs.target }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/crane-clean-acceptance
 
       - name: Validate OS and run PowerShell 5.1 and 7 acceptance
         shell: pwsh
@@ -93,13 +93,13 @@ jobs:
           $os = Get-CimInstance Win32_OperatingSystem
           $build = [int]$os.BuildNumber
           if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Acceptance runner must be Windows x64.' }
-          if ('\${{ inputs.target }}' -eq 'win10' -and ($build -lt 10240 -or $build -ge 22000)) { throw "Expected Windows 10; found build $build ($($os.Caption))." }
-          if ('\${{ inputs.target }}' -eq 'win11' -and $build -lt 22000) { throw "Expected Windows 11; found build $build ($($os.Caption))." }
+          if ('${{ inputs.target }}' -eq 'win10' -and ($build -lt 10240 -or $build -ge 22000)) { throw "Expected Windows 10; found build $build ($($os.Caption))." }
+          if ('${{ inputs.target }}' -eq 'win11' -and $build -lt 22000) { throw "Expected Windows 11; found build $build ($($os.Caption))." }
 
           $evidence = Join-Path $env:RUNNER_TEMP 'crane-physical-acceptance'
           New-Item -ItemType Directory -Path $evidence -Force | Out-Null
           [ordered]@{
-            target = '\${{ inputs.target }}'
+            target = '${{ inputs.target }}'
             caption = $os.Caption
             version = $os.Version
             build = $os.BuildNumber
@@ -138,7 +138,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: crane-physical-acceptance-\${{ inputs.target }}-\${{ github.run_id }}
-          path: \${{ runner.temp }}/crane-physical-acceptance
+          name: crane-physical-acceptance-${{ inputs.target }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/crane-physical-acceptance
           if-no-files-found: warn
           retention-days: 30
