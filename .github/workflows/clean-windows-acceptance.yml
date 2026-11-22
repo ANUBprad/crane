@@ -1,0 +1,144 @@
+name: Clean Windows 10/11 acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Clean Windows VM to validate
+        required: true
+        type: choice
+        options:
+          - win10
+          - win11
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: clean-windows-acceptance-\${{ github.ref }}-\${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build isolated acceptance releases
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 75
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12.7
+
+      - name: Install locked Python dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.lock.txt
+
+      - name: Download Python embeddable runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'python-3.12.7-embed-amd64.zip'
+          Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-embed-amd64.zip' -OutFile $zip
+          "CRANE_PYTHON_EMBED_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build versioned acceptance releases
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'crane-clean-acceptance'
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          foreach ($version in @('0.1.0', '0.1.1', '0.1.2')) {
+            ./scripts/build-release.ps1 -Version $version -OutputRoot $root -Commit $env:GITHUB_SHA -BuildDate '2026-01-01T00:00:00Z' -PythonVersion '3.12.7' -PythonEmbedZip $env:CRANE_PYTHON_EMBED_ZIP
+            if ($LASTEXITCODE -ne 0) { throw "Failed to build acceptance release $version" }
+          }
+
+      - name: Upload acceptance releases
+        uses: actions/upload-artifact@v4
+        with:
+          name: crane-clean-acceptance-\${{ inputs.target }}-\${{ github.run_id }}
+          path: \${{ runner.temp }}/crane-clean-acceptance
+          if-no-files-found: error
+          retention-days: 2
+
+  accept:
+    name: Clean \${{ inputs.target }} physical VM acceptance
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: \${{ fromJSON(format('["self-hosted","windows","x64","crane-clean-{0}"]', inputs.target)) }}
+    timeout-minutes: 120
+    steps:
+      - name: Check out acceptance harness
+        uses: actions/checkout@v4
+
+      - name: Download packaged acceptance releases
+        uses: actions/download-artifact@v4
+        with:
+          name: crane-clean-acceptance-\${{ inputs.target }}-\${{ github.run_id }}
+          path: \${{ runner.temp }}/crane-clean-acceptance
+
+      - name: Validate OS and run PowerShell 5.1 and 7 acceptance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $os = Get-CimInstance Win32_OperatingSystem
+          $build = [int]$os.BuildNumber
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Acceptance runner must be Windows x64.' }
+          if ('\${{ inputs.target }}' -eq 'win10' -and ($build -lt 10240 -or $build -ge 22000)) { throw "Expected Windows 10; found build $build ($($os.Caption))." }
+          if ('\${{ inputs.target }}' -eq 'win11' -and $build -lt 22000) { throw "Expected Windows 11; found build $build ($($os.Caption))." }
+
+          $evidence = Join-Path $env:RUNNER_TEMP 'crane-physical-acceptance'
+          New-Item -ItemType Directory -Path $evidence -Force | Out-Null
+          [ordered]@{
+            target = '\${{ inputs.target }}'
+            caption = $os.Caption
+            version = $os.Version
+            build = $os.BuildNumber
+            architecture = $os.OSArchitecture
+            powershell7 = $PSVersionTable.PSVersion.ToString()
+            commit = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $evidence 'machine.json') -Encoding utf8
+
+          $releaseRoot = Join-Path $env:RUNNER_TEMP 'crane-clean-acceptance'
+          $harness = Join-Path $env:GITHUB_WORKSPACE 'scripts\acceptance-windows.ps1'
+          $powershell51 = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          if (-not (Test-Path -LiteralPath $powershell51)) { throw 'Windows PowerShell 5.1 is unavailable.' }
+          $pwsh7 = Get-Command pwsh -ErrorAction Stop
+
+          Write-Host 'Running complete acceptance harness under Windows PowerShell 5.1'
+          & $powershell51 -NoProfile -ExecutionPolicy Bypass -File $harness -ReleaseRoot $releaseRoot -MinimalEnvironment
+          if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell 5.1 acceptance failed: $LASTEXITCODE" }
+
+          Write-Host 'Running complete acceptance harness under PowerShell 7'
+          & $pwsh7.Source -NoProfile -ExecutionPolicy Bypass -File $harness -ReleaseRoot $releaseRoot -MinimalEnvironment
+          if ($LASTEXITCODE -ne 0) { throw "PowerShell 7 acceptance failed: $LASTEXITCODE" }
+
+          $logs = Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter 'crane-acceptance-*' -ErrorAction SilentlyContinue
+          foreach ($dir in $logs) {
+            $log = Join-Path $dir.FullName 'acceptance.log'
+            if (Test-Path -LiteralPath $log) {
+              Copy-Item -LiteralPath $log -Destination (Join-Path $evidence ($dir.Name + '.log')) -Force
+            }
+          }
+          if (-not (Get-ChildItem -LiteralPath $evidence -Filter '*.log' -File)) {
+            throw 'No acceptance logs were collected.'
+          }
+
+      - name: Upload physical acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crane-physical-acceptance-\${{ inputs.target }}-\${{ github.run_id }}
+          path: \${{ runner.temp }}/crane-physical-acceptance
+          if-no-files-found: warn
+          retention-days: 30
