@@ -190,7 +190,7 @@ jobs:
           $reproLog = Join-Path $reproRoot 'reproducibility.log'
           $goVersionLine = (& go version).Trim()
           if ($LASTEXITCODE -ne 0) { throw 'Could not determine Go version for reproducibility check.' }
-          $goVersion = ($goVersionLine -split '\\s+')[2]
+          $goVersion = ($goVersionLine -split '\s+')[2]
           if ([string]::IsNullOrWhiteSpace($goVersion)) { throw "Could not parse Go version: $goVersionLine" }
           & ./scripts/test-release-reproducibility.ps1 -Version '0.1.2-repro' -Commit $env:GITHUB_SHA -BuildDate '2026-01-01T00:00:00Z' -PythonVersion '3.12.7' -GoVersion $goVersion -PythonEmbedZip $env:CRANE_PYTHON_EMBED_ZIP -OutputRoot $reproRoot 2>&1 | Tee-Object -FilePath $reproLog
           $reproExitCode = $LASTEXITCODE
