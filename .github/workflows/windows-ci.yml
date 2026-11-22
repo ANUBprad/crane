@@ -17,7 +17,7 @@ jobs:
   windows:
     name: Windows source and packaged smoke tests
     runs-on: windows-2025
-    timeout-minutes: 45
+    timeout-minutes: 75
 
     env:
       CRANE_CI_VERSION: 0.1.3-ci.${{ github.run_number }}
@@ -159,11 +159,41 @@ jobs:
             throw 'Uninstall did not preserve user data by default.'
           }
 
+      - name: Download Python embeddable runtime for acceptance builds
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'python-3.12.7-embed-amd64.zip'
+          if (-not (Test-Path -LiteralPath $zip)) {
+            Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-embed-amd64.zip' -OutFile $zip
+          }
+          "CRANE_PYTHON_EMBED_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build versioned releases for acceptance harness
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $acceptanceRoot = Join-Path $env:RUNNER_TEMP 'crane-acceptance-releases'
+          New-Item -ItemType Directory -Path $acceptanceRoot -Force | Out-Null
+          foreach ($v in @('0.1.0', '0.1.1', '0.1.2')) {
+            ./scripts/build-release.ps1 -Version $v -OutputRoot $acceptanceRoot -Commit $env:GITHUB_SHA -BuildDate '2026-01-01T00:00:00Z' -PythonVersion '3.12.7' -PythonEmbedZip $env:CRANE_PYTHON_EMBED_ZIP
+          }
+          "CRANE_ACCEPTANCE_RELEASE_ROOT=$acceptanceRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run Windows acceptance harness
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/acceptance-windows.ps1 -ReleaseRoot $env:CRANE_ACCEPTANCE_RELEASE_ROOT
+
       - name: Upload Windows release and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: crane-windows-ci-${{ github.run_number }}
-          path: ${{ runner.temp }}/crane-release
+          path: |
+            ${{ runner.temp }}/crane-release
+            ${{ runner.temp }}/crane-acceptance-releases
           if-no-files-found: ignore
           retention-days: 7
