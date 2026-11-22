@@ -42,10 +42,18 @@ jobs:
         run: |
           $files = @(git ls-files '*.go')
           if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate Go files.' }
-          $unformatted = @($files | ForEach-Object { gofmt -l $_ } | Where-Object { $_ })
+          $unformatted = @()
+          foreach ($file in $files) {
+            $diff = gofmt -d $file
+            if ($LASTEXITCODE -ne 0) { throw "gofmt failed for $file" }
+            if ($diff) {
+              Write-Host "===== gofmt diff: $file ====="
+              $diff | ForEach-Object { Write-Host $_ }
+              $unformatted += $file
+            }
+          }
           if ($unformatted.Count -gt 0) {
-            $unformatted | ForEach-Object { Write-Error "Unformatted Go file: $_" }
-            throw 'Run gofmt on the listed files.'
+            throw "Unformatted Go files: $($unformatted -join ', ')"
           }
 
       - name: Run Go vet
