@@ -40,17 +40,35 @@ jobs:
       - name: Check Go formatting
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Continue'
           $files = @(git ls-files '*.go')
           if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate Go files.' }
           $unformatted = @()
+          $failed = @()
           foreach ($file in $files) {
-            $diff = gofmt -d $file
-            if ($LASTEXITCODE -ne 0) { throw "gofmt failed for $file" }
-            if ($diff) {
+            $output = @(gofmt -d $file 2>&1 | ForEach-Object { $_.ToString() })
+            $rc = $LASTEXITCODE
+            $text = ($output -join "`n")
+            if ($rc -ne 0) {
+              if ($text -match '(?m)^diff ') {
+                Write-Host "===== gofmt diff: $file ====="
+                $output | ForEach-Object { Write-Host $_ }
+                $unformatted += $file
+                continue
+              }
+              Write-Host "===== gofmt error: $file ====="
+              $output | ForEach-Object { Write-Host $_ }
+              $failed += $file
+              continue
+            }
+            if ($text -match '(?m)^diff ') {
               Write-Host "===== gofmt diff: $file ====="
-              $diff | ForEach-Object { Write-Host $_ }
+              $output | ForEach-Object { Write-Host $_ }
               $unformatted += $file
             }
+          }
+          if ($failed.Count -gt 0) {
+            throw "gofmt failed for: $($failed -join ', ')"
           }
           if ($unformatted.Count -gt 0) {
             throw "Unformatted Go files: $($unformatted -join ', ')"
