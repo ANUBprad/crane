@@ -272,15 +272,19 @@ try {
 
     Write-Result 'ACCEPTANCE RESULT: ALL ISOLATED CHECKS PASSED'
     Write-Result "Evidence log: $logPath"
+    $script:acceptanceExitCode = 0
 }
 catch {
     Write-Result "ACCEPTANCE RESULT: FAILED"
     Write-Result $_.ScriptStackTrace
     Write-Result $_.Exception.Message
-    exit 1
+    $script:acceptanceExitCode = 1
 }
 finally {
     if ($null -ne $originalProcessPath) {
         $env:Path = $originalProcessPath
     }
 }
+
+$global:LASTEXITCODE = $script:acceptanceExitCode
+exit $script:acceptanceExitCode
