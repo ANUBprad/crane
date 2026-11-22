@@ -234,10 +234,23 @@ try {
         $env:Path = 'C:\Windows\System32'
         & (Join-Path $release010 'install.ps1') -Action Install -ReleaseSource $release010 -InstallRoot $pathTestRoot
         $pathAfterInstall = [Environment]::GetEnvironmentVariable('Path', 'User')
-        Assert-Step ($pathAfterInstall -like "*$pathEntry*") 'Installer added the CRANE bin directory to the user PATH'
+        $pathAfterInstallRegistry = (Get-ItemProperty -Path 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
+        $pathAfterInstallEffective = if ($pathAfterInstall -like "*$pathEntry*") { $pathAfterInstall } else { $pathAfterInstallRegistry }
+        if ($pathAfterInstallEffective -notlike "*$pathEntry*") {
+            Write-Result "DIAG: expected entry=$pathEntry"
+            Write-Result "DIAG: GetEnvironmentVariable(User)=$pathAfterInstall"
+            Write-Result "DIAG: HKCU:\Environment\Path=$pathAfterInstallRegistry"
+        }
+        Assert-Step ($pathAfterInstallEffective -like "*$pathEntry*") 'Installer added the CRANE bin directory to the user PATH'
         & (Join-Path $release010 'uninstall.ps1') -InstallRoot $pathTestRoot
         $pathAfterUninstall = [Environment]::GetEnvironmentVariable('Path', 'User')
-        Assert-Step ($pathAfterUninstall -ceq 'C:\Windows\System32') 'Uninstall restored the user PATH exactly'
+        $pathAfterUninstallRegistry = (Get-ItemProperty -Path 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
+        $pathAfterUninstallEffective = if ($pathAfterUninstall -ceq 'C:\Windows\System32') { $pathAfterUninstall } else { $pathAfterUninstallRegistry }
+        if ($pathAfterUninstallEffective -cne 'C:\Windows\System32') {
+            Write-Result "DIAG: GetEnvironmentVariable(User)=$pathAfterUninstall"
+            Write-Result "DIAG: HKCU:\Environment\Path=$pathAfterUninstallRegistry"
+        }
+        Assert-Step ($pathAfterUninstallEffective -ceq 'C:\Windows\System32') 'Uninstall restored the user PATH exactly'
         Assert-Step (-not (Test-Path -LiteralPath $pathTestRoot)) 'PATH test uninstall removed installed binaries'
     }
     finally {
