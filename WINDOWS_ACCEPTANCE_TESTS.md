@@ -1,100 +1,69 @@
 # CRANE — Windows Acceptance Tests
 
-A Linux build is not proof of Windows readiness. This checklist distinguishes behavior verified in isolated Windows x64 harness runs on this development host from requirements that still need genuine clean supported machines.
+This checklist tracks Windows release-readiness evidence. It distinguishes clean GitHub-hosted runner evidence from clean physical Windows 10/11 x64 acceptance. Do not treat a development machine, source checkout, or historical local evidence as clean-machine acceptance.
 
-## Evidence
+## Current status (HEAD `256de3c3354e49c5878dd4c058397b1867d7a9ca`)
 
-Host: Windows 11 Home Single Language 26H2 x64 (`10.0.26300.9974`) with Go/Python/Node/npm installed. Rebuilt unsigned artifacts `0.1.0`–`0.1.2` from commit `1953963d21398940370787eb247c6c0a04e76487` (`build/release/*/release-manifest.json`, build date `2026-11-21T00:00:56+05:30`, Windows x64, Go `go1.26.5`, Python `3.12.7`, signature `none`/`unverified`). Manifest/SHA256SUMS checksums matched computed artifact hashes.
+- GitHub-hosted `windows-2025` CI: **PASS** for build, formatting/vet, Go/Python tests, release packaging, and packaged install/`agent --version`/`agent doctor`/basic task smoke. Run: [45040349046](https://github.com/ANUBprad/crane/actions/runs/45040349046).
+- `scripts/acceptance-windows.ps1`: implemented; covers install, version/doctor smoke, basic task/result, upgrade, rollback, uninstall/data preservation, PATH, and integrity/failure cases. It requires prebuilt `0.1.0`-`0.1.2` release directories, uses isolated `LOCALAPPDATA`, and temporarily modifies/restores the real user PATH for the final PATH check. Run sequentially on a machine where that PATH mutation is acceptable.
+- `scripts/test-release-reproducibility.ps1`: implemented; compares two independent builds with identical declared inputs for byte-for-byte ZIP/manifest/SHA256SUMS equality. Same-host evidence only unless cross-environment inputs are controlled.
+- Clean physical Windows 10/11 x64 acceptance: **not performed**.
+- Authenticode signing/publisher authenticity verification: **not available** (no legitimate certificate/credentials; artifacts are unsigned, integrity-only).
+- Controlled official release host/domain: **not verified/published**.
 
-`scripts/acceptance-windows.ps1` uses local releases, a fake `LOCALAPPDATA`, and writes `%TEMP%\crane-acceptance-<id>\acceptance.log`. The final PATH test temporarily changes the real user PATH and restores it in `finally`; runs must be sequential.
+## Clean GitHub-hosted runner checklist
 
-Verified isolated results for rebuilt `1953963` artifacts:
+- [x] Windows runner builds Go binary and packages a release artifact (`windows-ci.yml`).
+- [x] Go formatting, `go vet`, `go test ./...`, Python compile/tests run on `windows-2025`.
+- [x] Packaged install smoke: `agent --version`, `agent doctor`, basic task submission on runner.
+- [ ] Full `scripts/acceptance-windows.ps1` run on clean GitHub-hosted runner with recorded artifact versions/hashes/commit.
+- [ ] `scripts/test-release-reproducibility.ps1` run with recorded inputs/hashes on runner or controlled environment.
+- [ ] Hosted-runner evidence recorded with workflow URL, HEAD SHA, artifact names, and hashes.
 
-- **Windows PowerShell 5.1:** all isolated checks passed — `build\evidence\acceptance-ps51-1953963.log`.
-- **PowerShell 7.7.0:** all isolated checks passed — `build\evidence\acceptance-pwsh7-1953963.log`.
-- **PowerShell 7.7.0, `-MinimalEnvironment`:** all isolated checks passed with `go`/`python`/`node`/`npm` absent from `PATH` — `build\evidence\acceptance-minimal-pwsh7-1953963.log`.
-- **Real Ollama + MCP e2e (`llama3.2:3b`, source/runtime script):** PASS — `build\evidence\ollama-mcp-e2e-1953963.log`.
-- **Go approval/recovery/restart policy tests:** PASS — `build\evidence\go-test-approval-recovery-1953963.log` (`TestMCPSubmissionContextAndToolResultPersistence`, `TestStartupRecoveryPolicies`, cancel/resume/waiting-approval cases).
-- **Release reproducibility:** Deterministic packaging and `scripts/test-release-reproducibility.ps1` added; two independent builds with identical declared inputs produced byte-for-byte identical ZIP/manifest/SHA256SUMS outputs on this host (PASS). Prior identical `0.1.2` rebuilds differed as recorded in `build\evidence\repro-0.1.2-1953963.json`; cross-environment/toolchain reproducibility remains to be validated.
+## Clean physical machine checklist (required for Windows 10/11 acceptance claim)
 
-These results are isolated-harness evidence, not clean Windows 10/11 x64 acceptance, signed-release validation, or controlled-host publication proof.
+Run on genuine clean Windows 10 x64 and Windows 11 x64 machines/VM images with no Go, Python, Node.js, npm, CRANE repository, or developer dependencies:
 
-## Installation and CLI
+- [ ] Install from a verified release directory/source; confirm manifest/SHA256SUMS and signature state before install.
+- [ ] `agent --version` reports expected version/build metadata.
+- [ ] `agent doctor` reports packaged Python runtime, SQLite, and required modules available.
+- [ ] Basic task submission, status, and result retrieval succeed.
+- [ ] Supervisor start/stop behavior is clean; no orphaned processes after exit.
+- [ ] Authenticated loopback API is available locally; no unexpected external listeners/data transmission observed.
+- [ ] Task data persists across process restart in `%LOCALAPPDATA%\CRANE`.
+- [ ] Update to a newer verified release preserves data/task history.
+- [ ] Rollback restores previous version and preserves data/task history.
+- [ ] Failed/unhealthy update leaves no inconsistent active install.
+- [ ] Uninstall preserves data by default; removes install/PATH entries.
+- [ ] Uninstall with `-RemoveData -Confirm REMOVE-CRANE-DATA` removes data only after explicit confirmation.
+- [ ] PowerShell 5.1 and PowerShell 7.x both validated.
+- [ ] OS build, PowerShell version, artifact version/hash/build commit, logs, and pass/fail evidence recorded.
 
-- [x] Isolated Windows x64 install with verified local release source (PowerShell 5.1, PowerShell 7.7.0).
-- [x] `agent --version`, `agent run`, `agent status`, `agent result`, `agent doctor`, `agent update`, `agent uninstall` invoked from the installed launcher in isolated harnesses.
-- [x] Install creates `bin\`, `versions\`, `staging\`, `current.txt`, and all `%LOCALAPPDATA%\CRANE` data directories.
-- [x] Private CPython 3.12.7 reports healthy and imports all pinned production packages.
-- [x] Per-user install requires no administrator rights in the isolated harness.
-- [x] Unsupported OS/architecture metadata is rejected.
-- [x] Installer PATH entry is added and removed exactly in a controlled test.
-- [x] PowerShell 7.7.0 isolated install/lifecycle path tested (including prior `Get-FileHash`/update fix verification).
-- [x] Packaged lifecycle completed in minimal-PATH isolated harness without `go`/`python`/`node`/`npm` on `PATH` (`-MinimalEnvironment`).
-- [ ] Clean Windows 10 x64 install (no Go/Python/Node/npm/CRANE repo/dev dependencies).
-- [ ] Clean Windows 11 x64 install (no Go/Python/Node/npm/CRANE repo/dev dependencies).
-- [ ] `agent` resolves from a genuinely fresh terminal after PATH propagation.
-- [ ] Unsupported physical architecture fails safely on real ARM64/x86 hardware.
-- [ ] Interrupted install leaves no broken PATH or partial active version.
+## Artifact integrity / trust checklist
 
-## Runtime and task lifecycle
+- [x] Release manifest records version, commit, OS/arch, Go/Python versions, build date, files, sizes, SHA-256 hashes, and signature state.
+- [x] `SHA256SUMS.txt` generated and cross-checked by installer.
+- [x] Installer validates file hashes/sizes and rejects tampered manifest/checksum/unsupported metadata.
+- [x] Installer rejects unverifiable authentic signature metadata; unsigned artifacts are explicitly marked `none`/`unverified`.
+- [ ] Authenticode signature generated with legitimate certificate/credentials (external blocker).
+- [ ] Authenticode/signature verification validated on clean Windows (external blocker; requires legitimate certificate).
 
-- [x] Submit task and receive a durable task ID.
-- [x] Query status and result from a new CLI process.
-- [x] Task history survives update and rollback in the isolated packaged harness.
-- [x] Live MCP controller is reachable after task execution.
-- [x] Packaged `agent doctor` reports active release, Python, SQLite, MCP modules, and real overall status.
-- [x] Failed update after pointer switch restores the previous active version and binaries.
-- [x] Approval persistence/recovery and restart recovery policies validated by Go tests (`build\evidence\go-test-approval-recovery-1953963.log`); packaged-install-specific restart/approval recovery remains unverified.
-- [ ] Task continues after terminal/client disconnect in the packaged installation.
-- [ ] Cancel a running task in the packaged installation.
-- [ ] Runtime restart recovers eligible queued/running tasks in the packaged installation (explicit packaged evidence).
-- [ ] Uncertain external side effects are not blindly replayed in the packaged installation.
-- [ ] Concurrent tasks obey configured limits in the packaged installation.
+## Distribution / reproducibility checklist
 
-## MCP
+- [ ] Controlled official release host/domain with verified ownership (external blocker).
+- [ ] Official install command documented only after controlled host/domain exists.
+- [x] Remote `http(s)` release source is explicit opt-in (`CRANE_ALLOW_REMOTE_RELEASE_SOURCE=1`); no silent remote fallback.
+- [x] Same-host deterministic rebuild check script exists (`scripts/test-release-reproducibility.ps1`).
+- [ ] Same-host reproducibility evidence recorded for current release candidate inputs.
+- [ ] Cross-environment reproducibility evidence recorded, or nondeterminism documented.
 
-- [x] MCP modules and supervisor controller health verified in the packaged runtime.
-- [x] Prior Windows source-tree validation connected to real local stdio and Streamable HTTP MCP servers and enforced exact approval fingerprints.
-- [x] Real Ollama + MCP tool flow (stdio test server, discovery/invoke, blocked consequential action, exact approval grant, task tool call, persisted invocation) passed in the source/runtime e2e script with `llama3.2:3b` (`build\evidence\ollama-mcp-e2e-1953963.log`); packaged-install MCP revalidation remains separate.
-- [ ] MCP lifecycle revalidated from the packaged installation against real local servers.
-- [ ] Reconnect behavior, malformed schemas, and timeout isolation revalidated from the packaged installation.
+## Evidence log template
 
-## Agent orchestration and offline behavior
+Record each run with:
 
-- [x] Prior Windows validation executed a real `llama3.2:3b` Ollama tool call through LangGraph and SQLite with no fallback.
-- [x] Packaged runtime default local mode executes a real bounded workflow and persists the result in isolated harnesses.
-- [x] Real Ollama + MCP task execution validated in source/runtime e2e with `llama3.2:3b` (`build\evidence\ollama-mcp-e2e-1953963.log`).
-- [ ] Packaged Ollama path validated with a local model from the installed release.
-- [ ] Network-disconnected execution validated on a clean machine.
-- [ ] Hosted fallback absence revalidated from the packaged installation.
-
-## Permissions and security
-
-- [x] Tampered manifest signature metadata is rejected.
-- [x] Tampered payload checksum is rejected.
-- [x] Unsupported platform metadata is rejected.
-- [x] Uninstall preserves user data by default.
-- [x] Explicit data removal requires `REMOVE-CRANE-DATA` and removes only CRANE-managed data.
-- [x] Local API credential state survives update and rollback.
-- [ ] Tampered executable with a valid-looking manifest is rejected (requires Authenticode signing and verification).
-- [ ] Unauthorized API caller and traversal inputs revalidated from the packaged installation.
-
-## Maintenance
-
-- [x] Update preserves data, credentials, logs, MCP config, temp/cache, and task history.
-- [x] Previous version is retained for rollback.
-- [x] Rollback preserves current user data and retains the newer version for forward recovery.
-- [x] Uninstall removes binaries, runtime, version pointers, and PATH entry.
-- [x] Confirmed uninstall removes CRANE-managed data.
-- [x] Release artifact integrity metadata (manifest/SHA256SUMS) internally consistent for rebuilt `0.1.0`–`0.1.2`; payloads contain no sampled secrets/credentials/user data/model weights and no `crane/mcp_runtime/_init__.py`.
-- [x] Deterministic release builds verified for identical declared inputs on this host via `scripts/test-release-reproducibility.ps1` (ZIP/manifest/SHA256SUMS byte-identical); prior differing `0.1.2` rebuilds recorded in `build\evidence\repro-0.1.2-1953963.json`. Cross-environment/toolchain reproducibility remains to be validated.
-- [ ] Database migration compatibility tested across a real version upgrade.
-- [ ] Signing and artifact provenance validated with a real certificate and controlled release host.
-
-## Resource and stability
-
-- [ ] Idle CPU and memory measured.
-- [ ] Repeated task submission process/handle leak check.
-- [ ] Long-running task memory bounded.
-- [ ] Large tool output bounded/streamed safely.
-- [ ] SQLite concurrent access and disk-full/permission-denied scenarios tested.
+- Date/time (UTC and local), operator, machine/runner type
+- OS build, PowerShell version
+- HEAD commit, CI run URL
+- Artifact version(s), manifest SHA-256, payload SHA-256, SHA256SUMS SHA-256
+- Commands run, pass/fail, logs/screenshots/output paths
+- Whether evidence is clean GitHub-hosted runner, dev-host isolated harness, or clean physical Windows 10/11 machine

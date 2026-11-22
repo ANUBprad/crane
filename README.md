@@ -6,7 +6,7 @@
 
 CRANE runs as a local supervisor: it accepts tasks through a CLI or authenticated loopback API, executes bounded workflows through a Python/LangGraph runtime, invokes MCP tools under policy control, persists state in SQLite, and returns concise results. It is designed for local-first operation, not as a chatbot, RAG product, or dashboard.
 
-> **Project status:** working vertical slice with active hardening. Core task admission, Python/LangGraph execution, MCP stdio/Streamable HTTP tool integration, local Ollama execution, SQLite persistence, authenticated loopback API/SSE, approval gating, and Windows packaging scripts are implemented and exercised by tests/harnesses. Current packaged recovery evidence exists for deterministic artifact `0.1.3-recovery-fix2` (commit `62b3d3d961fdc69a746b4348ca89873a67f45bda`) in isolated Windows environments. CRANE is **not** production-ready: clean-machine Windows 10/11 acceptance, Authenticode signing/verification, a controlled official release host, and cross-environment reproducibility proof remain unverified.
+> **Project status:** working vertical slice with active hardening. Core task admission, Python/LangGraph execution, MCP stdio/Streamable HTTP tool integration, local Ollama execution, SQLite persistence, authenticated loopback API/SSE, approval gating, and Windows packaging scripts are implemented and exercised by tests and CI. CRANE is **not** production-ready: clean physical-machine Windows 10/11 x64 acceptance, Authenticode signing and publisher-authenticity verification, a controlled official release host/domain, and cross-environment reproducibility proof remain pending or external blockers.
 
 ## What CRANE does
 
