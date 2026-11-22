@@ -319,7 +319,7 @@ func (c *Controller) markDone() {
 	started := c.started
 	c.mu.Unlock()
 	if started && stderr != "" {
-		fmt.Fprintln(os.Stderr, "CRANE MCP: daemon exited: "+stderr)
+		fmt.Fprintln(os.Stderr, "CRANE MCP: daemon exited: "+fmt.Sprint(persistence.RedactMCPValue(stderr)))
 	}
 }
 
@@ -434,7 +434,8 @@ func serverMessage(record persistence.MCPServerRecord) python_protocol.MCPServer
 
 // Configure replaces the daemon's server catalog and active approval grants.
 func (c *Controller) Configure(servers []persistence.MCPServerRecord) error {
-	grants, err := c.store.GrantedApprovalFingerprints()
+	taskID := "mcp-daemon"
+	grants, err := c.store.GrantedApprovalFingerprints(taskID)
 	if err != nil {
 		return err
 	}
@@ -632,8 +633,9 @@ func (c *Controller) Invoke(serverID, toolName string, arguments map[string]any)
 	if policy == "blocked" {
 		return InvokeResult{}, &CommandError{Code: "mcp_tool_blocked", Message: "This tool is blocked by policy"}
 	}
-	fingerprint := persistence.ApprovalFingerprint(serverID, toolName, arguments)
-	grants, err := c.store.GrantedApprovalFingerprints()
+	taskID := "mcp-daemon"
+	fingerprint := persistence.ApprovalFingerprint(taskID, serverID, toolName, arguments)
+	grants, err := c.store.GrantedApprovalFingerprints(taskID)
 	if err != nil {
 		return InvokeResult{}, err
 	}
@@ -642,6 +644,7 @@ func (c *Controller) Invoke(serverID, toolName string, arguments map[string]any)
 	if policy != "allowed" && !approved {
 		request := persistence.ApprovalRequestRecord{
 			ID:          fmt.Sprintf("approval-%d", time.Now().UnixNano()),
+			TaskID:      taskID,
 			ServerID:    serverID,
 			ToolName:    toolName,
 			Arguments:   persistence.RedactedJSON(arguments),
@@ -650,7 +653,16 @@ func (c *Controller) Invoke(serverID, toolName string, arguments map[string]any)
 		if err := c.store.CreateApprovalRequest(request); err != nil {
 			return InvokeResult{}, err
 		}
-		approvalID = request.ID
+		return InvokeResult{
+			Invocation: map[string]any{
+				"status":          "blocked",
+				"server_id":       serverID,
+				"tool_name":       toolName,
+				"policy_decision": "approval_required",
+				"error":           "This tool requires explicit approval for this exact action",
+			},
+			ApprovalRequestID: request.ID,
+		}, nil
 	}
 	// Only an existing durable grant may authorize a consequential action.
 	if approved {
@@ -673,6 +685,13 @@ func (c *Controller) Invoke(serverID, toolName string, arguments map[string]any)
 	if err := decodeResult(response, &result); err != nil {
 		return InvokeResult{}, err
 	}
+	if approved {
+		if status, _ := result.Invocation["status"].(string); status == "succeeded" {
+			if consumeErr := c.store.ConsumeGrantedApproval(taskID, fingerprint); consumeErr != nil {
+				return InvokeResult{}, consumeErr
+			}
+		}
+	}
 	return InvokeResult{Invocation: result.Invocation, ApprovalRequestID: approvalID}, nil
 }
 
@@ -681,12 +700,14 @@ func (c *Controller) RequestApproval(serverID, toolName string, arguments map[st
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
+	taskID := "mcp-daemon"
 	request := persistence.ApprovalRequestRecord{
 		ID:          fmt.Sprintf("approval-%d", time.Now().UnixNano()),
+		TaskID:      taskID,
 		ServerID:    serverID,
 		ToolName:    toolName,
 		Arguments:   persistence.RedactedJSON(arguments),
-		Fingerprint: persistence.ApprovalFingerprint(serverID, toolName, arguments),
+		Fingerprint: persistence.ApprovalFingerprint(taskID, serverID, toolName, arguments),
 	}
 	err := c.store.CreateApprovalRequest(request)
 	return request, err

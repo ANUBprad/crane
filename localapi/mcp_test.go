@@ -130,3 +130,63 @@ func TestMCPRoutesAreAuthenticatedAndRedacted(t *testing.T) {
 		t.Fatalf("unexpected approval decision: %#v", mock.decided)
 	}
 }
+
+func TestMCPRoutesRejectInvalidAndMissingCredentials(t *testing.T) {
+	state := newTestState(t)
+	server := state.newServer(t)
+	server.SetMCPController(&mockMCPController{})
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	paths := []struct {
+		method string
+		path   string
+		body   []byte
+	}{
+		{http.MethodGet, "/v1/mcp/status", nil},
+		{http.MethodGet, "/v1/mcp/servers", nil},
+		{http.MethodPost, "/v1/mcp/servers", []byte(`{"server_id":"x","name":"X","transport":"stdio","command":"python"}`)},
+		{http.MethodGet, "/v1/mcp/approvals", nil},
+		{http.MethodPost, "/v1/mcp/approvals/approval-1/decide", []byte(`{"decision":"granted"}`)},
+		{http.MethodPost, "/v1/mcp/invoke", []byte(`{"server_id":"demo","tool_name":"get_test_echo","arguments":{}}`)},
+	}
+	for _, tc := range paths {
+		status, header, body := apiRequest(t, client, httpServer.URL, tc.method, tc.path, "", tc.body)
+		envelope := decodeEnvelope(t, status, header, body)
+		if status != http.StatusUnauthorized || envelope.Error.Code != "unauthorized" {
+			t.Fatalf("%s %s missing token: status=%d body=%s", tc.method, tc.path, status, body)
+		}
+		status, header, body = apiRequest(t, client, httpServer.URL, tc.method, tc.path, "bad-token", tc.body)
+		envelope = decodeEnvelope(t, status, header, body)
+		if status != http.StatusUnauthorized || envelope.Error.Code != "unauthorized" {
+			t.Fatalf("%s %s bad token: status=%d body=%s", tc.method, tc.path, status, body)
+		}
+	}
+}
+
+func TestMCPInvokeRejectsMalformedAndTraversalIDs(t *testing.T) {
+	state := newTestState(t)
+	mock := &mockMCPController{}
+	server := state.newServer(t)
+	server.SetMCPController(mock)
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	badBodies := []string{
+		`{"server_id":"../bad","tool_name":"get_test_echo","arguments":{}}`,
+		`{"server_id":"demo","tool_name":"../../etc/passwd","arguments":{}}`,
+		`{"server_id":"demo","tool_name":"get_test_echo"}`,
+		`not-json`,
+	}
+	for _, payload := range badBodies {
+		status, _, body := apiRequest(t, client, httpServer.URL, http.MethodPost, "/v1/mcp/invoke", state.token, []byte(payload))
+		if status != http.StatusBadRequest {
+			t.Fatalf("payload %s: status=%d body=%s", payload, status, body)
+		}
+	}
+	if mock.invoke.ToolName != "" {
+		t.Fatalf("controller invoke was called for bad input: %#v", mock.invoke)
+	}
+}

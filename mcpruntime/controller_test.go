@@ -139,7 +139,7 @@ func TestControllerStdioServerPolicyAndInvocation(t *testing.T) {
 	}
 
 	invocations, err := controller.ListInvocations(20)
-	if err != nil || len(invocations) != 3 {
+	if err != nil || len(invocations) != 2 {
 		t.Fatalf("ListInvocations() count = %d, error = %v", len(invocations), err)
 	}
 }

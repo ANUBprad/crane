@@ -187,7 +187,7 @@ class MCPWorkflowTest(unittest.TestCase):
 
     def test_durable_grant_allows_exact_consequential_tool(self) -> None:
         arguments = {"record_id": "r-granted"}
-        fingerprint = action_fingerprint("workflow-test", "delete_test_record", arguments)
+        fingerprint = action_fingerprint("mcp-task-granted", "workflow-test", "delete_test_record", arguments)
         outcome, tool_results = self._run_tool_task(
             "mcp-task-granted", "delete_test_record", arguments, [fingerprint],
         )

@@ -155,8 +155,15 @@ func RedactedJSON(value any) json.RawMessage {
 }
 
 // ApprovalFingerprint produces the exact-action digest shared with Python.
-func ApprovalFingerprint(serverID, toolName string, arguments any) string {
+// The task context is part of the fingerprint so approvals cannot be reused
+// across unrelated tasks.
+func ApprovalFingerprint(taskID, serverID, toolName string, arguments any) string {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		taskID = "mcp-daemon"
+	}
 	payload := map[string]any{
+		"task_id":   taskID,
 		"server_id": serverID,
 		"tool_name": toolName,
 		"arguments": RedactMCPValue(arguments),
@@ -605,7 +612,36 @@ func (s *Store) CreateApprovalRequest(request ApprovalRequestRecord) error {
 	)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
-			return nil // The exact action is already tracked.
+			existing, getErr := s.GetApprovalByFingerprint(request.Fingerprint)
+			if getErr != nil {
+				return nil // Fail-safe: do not duplicate or overwrite an ambiguous record.
+			}
+			switch existing.Status {
+			case "pending":
+				if _, expired := parseTimestamp(existing.ExpiresAt); !expired {
+					return nil
+				}
+			case "granted":
+				if _, expired := parseTimestamp(existing.ExpiresAt); !expired {
+					return nil
+				}
+			case "denied", "expired", "consumed":
+				// A new explicit request can supersede a terminal/consumed decision.
+			default:
+				return nil
+			}
+			_, resetErr := s.db.Exec(`
+				UPDATE mcp_approval_requests
+				SET id = ?, task_id = ?, server_id = ?, tool_name = ?, arguments = ?, status = 'pending',
+				    requested_at = ?, expires_at = ?, decided_at = '', decided_by = '', decision = ''
+				WHERE fingerprint = ?`,
+				request.ID, request.TaskID, request.ServerID, request.ToolName,
+				string(arguments), requestedAt, expiresAt, request.Fingerprint,
+			)
+			if resetErr != nil {
+				return fmt.Errorf("reset approval request: %w", resetErr)
+			}
+			return nil
 		}
 		return fmt.Errorf("create approval request: %w", err)
 	}
@@ -700,12 +736,19 @@ func (s *Store) DecideApprovalRequest(id, decision, actor string) (ApprovalReque
 	return s.GetApprovalRequest(id)
 }
 
-// GrantedApprovalFingerprints returns active grants for task execution.
-func (s *Store) GrantedApprovalFingerprints() ([]string, error) {
+// GrantedApprovalFingerprints returns active grants for one task execution
+// context. Approvals are bound to task context and cannot be reused across
+// unrelated tasks.
+func (s *Store) GrantedApprovalFingerprints(taskID string) ([]string, error) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		taskID = "mcp-daemon"
+	}
 	rows, err := s.db.Query(`
 		SELECT fingerprint FROM mcp_approval_requests
-		WHERE status = 'granted' AND expires_at > ? ORDER BY decided_at, id`,
-		time.Now().UTC().Format(time.RFC3339Nano))
+		WHERE status = 'granted' AND expires_at > ? AND task_id = ?
+		ORDER BY decided_at, id`,
+		time.Now().UTC().Format(time.RFC3339Nano), taskID)
 	if err != nil {
 		return nil, fmt.Errorf("list granted approvals: %w", err)
 	}
@@ -722,6 +765,28 @@ func (s *Store) GrantedApprovalFingerprints() ([]string, error) {
 		return nil, fmt.Errorf("iterate granted approvals: %w", err)
 	}
 	return fingerprints, nil
+}
+
+// ConsumeGrantedApproval marks an exact granted approval as consumed after a
+// successful authorized invocation. This prevents approval replay.
+func (s *Store) ConsumeGrantedApproval(taskID, fingerprint string) error {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		taskID = "mcp-daemon"
+	}
+	if !validFingerprint(fingerprint) {
+		return errors.New("approval fingerprint is invalid")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.Exec(`
+		UPDATE mcp_approval_requests
+		SET status = 'consumed', decision = 'granted', decided_at = CASE WHEN decided_at = '' THEN ? ELSE decided_at END
+		WHERE task_id = ? AND fingerprint = ? AND status = 'granted' AND expires_at > ?`,
+		now, taskID, fingerprint, now)
+	if err != nil {
+		return fmt.Errorf("consume granted approval: %w", err)
+	}
+	return nil
 }
 
 // ListApprovalRequests returns the newest durable approval records.

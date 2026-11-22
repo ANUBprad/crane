@@ -128,9 +128,10 @@ func TestMCPSubmissionContextAndToolResultPersistence(t *testing.T) {
 	if err := store.UpsertMCPServer(server); err != nil {
 		t.Fatal(err)
 	}
-	fingerprint := persistence.ApprovalFingerprint("demo", "delete_test_record", map[string]any{"id": "one"})
+	taskID := "mcp-task"
+	fingerprint := persistence.ApprovalFingerprint(taskID, "demo", "delete_test_record", map[string]any{"id": "one"})
 	request := persistence.ApprovalRequestRecord{
-		ID: "approval-1", ServerID: "demo", ToolName: "delete_test_record",
+		ID: "approval-1", TaskID: taskID, ServerID: "demo", ToolName: "delete_test_record",
 		Arguments: json.RawMessage(`{"id":"one"}`), Fingerprint: fingerprint,
 	}
 	if err := store.CreateApprovalRequest(request); err != nil {
@@ -140,7 +141,7 @@ func TestMCPSubmissionContextAndToolResultPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	servers, grants, err := sup.mcpSubmissionContext()
+	servers, grants, err := sup.mcpSubmissionContext(taskID)
 	if err != nil {
 		t.Fatal(err)
 	}

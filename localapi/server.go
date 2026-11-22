@@ -213,6 +213,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	host := r.Host
+	if splitHost, _, err := net.SplitHostPort(host); err == nil {
+		host = splitHost
+	}
+	host = strings.Trim(host, "[]")
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		if !strings.EqualFold(host, "localhost") {
+			writeError(w, http.StatusForbidden, "forbidden_host")
+			return
+		}
+	}
 
 	header := r.Header.Get("Authorization")
 	if len(header) < 8 || !strings.EqualFold(header[:7], "Bearer ") {

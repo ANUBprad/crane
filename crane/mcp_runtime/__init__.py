@@ -51,6 +51,42 @@ ENV_KEY_RE = re.compile(r"^CRANE_MCP_[A-Z0-9_]{1,127}$")
 SENSITIVE_ENV_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|CREDENTIAL|API_?KEY|PRIVATE)", re.I)
 DANGEROUS_ARGS_RE = re.compile(r"^(-c|-m|--eval|--exec|-e|--command)$", re.I)
 
+_STDIO_ENV_BASE_ALLOWLIST = {
+    "APPDATA",
+    "COMSPEC",
+    "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LANG",
+    "LC_ALL",
+    "LOCALAPPDATA",
+    "PATH",
+    "PATHEXT",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "WINDIR",
+}
+
+
+def _base_stdio_env() -> Dict[str, str]:
+    """Return a minimal environment for stdio MCP servers.
+
+    Full parent environment inheritance can leak unrelated secrets to untrusted
+    servers. Only common OS/runtime essentials and explicitly configured
+    CRANE_MCP_* values are passed.
+    """
+    env: Dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key.upper() in _STDIO_ENV_BASE_ALLOWLIST:
+            env[key] = value
+    return env
+
 _SAFE_IDENTIFIERS = re.compile(r"^[A-Za-z0-9_.-]{1,200}$")
 _READ_ONLY_VERBS = (
     "get_", "list_", "read_", "search_", "find_", "status_", "inspect_",
@@ -109,8 +145,10 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def action_fingerprint(server_id: str, tool_name: str, arguments: Dict[str, Any]) -> str:
+def action_fingerprint(task_id: Optional[str], server_id: str, tool_name: str, arguments: Dict[str, Any]) -> str:
+    context = str(task_id or "").strip() or "mcp-daemon"
     payload = canonical_json({
+        "task_id": context,
         "server_id": server_id,
         "tool_name": tool_name,
         "arguments": arguments,
@@ -499,7 +537,7 @@ class MCPManager:
                     params = StdioServerParameters(
                         command=config.command,
                         args=list(config.args),
-                        env={**os.environ, **config.env},
+                        env={**_base_stdio_env(), **config.env},
                     )
                     read, write = await stack.enter_async_context(stdio_client(params))
                 else:
@@ -568,7 +606,7 @@ class MCPManager:
                 params = StdioServerParameters(
                     command=config.command,
                     args=list(config.args),
-                    env={**os.environ, **config.env},
+                    env={**_base_stdio_env(), **config.env},
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
             else:
@@ -670,7 +708,7 @@ class MCPManager:
                 except jsonschema.ValidationError as exc:
                     raise MCPError("mcp_schema_validation_failed", redact(exc.message)) from exc
 
-                fingerprint = action_fingerprint(server_id, tool_name, args)
+                fingerprint = action_fingerprint(self.task_id, server_id, tool_name, args)
                 record.policy_decision = tool.policy_class
                 if tool.policy_class != POLICY_ALLOWED and fingerprint not in self.granted_fingerprints:
                     record.status = "blocked"
@@ -698,6 +736,8 @@ class MCPManager:
                 record.status = "failed" if is_error else "succeeded"
                 if is_error:
                     record.error = redact(record.result_text) or "MCP tool reported an error"
+                elif tool.policy_class != POLICY_ALLOWED:
+                    self.granted_fingerprints.discard(fingerprint)
             except Exception as exc:  # noqa: BLE001 - never leak transport internals
                 normalized = self._normalize_error(exc, "mcp_invocation_failed")
                 record.status = "failed"

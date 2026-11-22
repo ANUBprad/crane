@@ -148,7 +148,7 @@ type Supervisor struct {
 func New() *Supervisor {
 	store, err := persistence.NewStore(persistence.DBPath())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to initialize SQLite store: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Warning: failed to initialize SQLite store: %v\n", persistence.RedactMCPValue(err.Error()))
 		store = nil
 	}
 	return NewWithStore(store)
@@ -429,7 +429,7 @@ func (s *Supervisor) executeTask(id, input string, checkpoint []byte, resume boo
 		s.activeMu.Unlock()
 	}()
 
-	servers, grants, err := s.mcpSubmissionContext()
+	servers, grants, err := s.mcpSubmissionContext(id)
 	if err != nil {
 		cancel()
 		_ = task.finish(s, "failed", "", "unable to load MCP execution context", nil)
@@ -490,15 +490,16 @@ func (s *Supervisor) executeTask(id, input string, checkpoint []byte, resume boo
 	}
 	_ = stdin.Close()
 	if stderrText := strings.TrimSpace(stderr.String()); stderrText != "" {
-		fmt.Fprintln(os.Stderr, "CRANE: task runtime stderr: "+stderrText)
+		fmt.Fprintln(os.Stderr, "CRANE: task runtime stderr: "+fmt.Sprint(persistence.RedactMCPValue(stderrText)))
 	}
 	task.finish(s, "failed", `{"code":"runtime_exited"}`, "Python runtime exited before a terminal result", nil)
 }
 
 // mcpSubmissionContext supplies the task child with enabled server configs and
-// exact approval grants. Environment values travel only on this private
-// process boundary; they are never written to task events or API responses.
-func (s *Supervisor) mcpSubmissionContext() ([]python_protocol.MCPServerConfigMessage, []string, error) {
+// exact approval grants for that task context. Environment values travel only on
+// this private process boundary; they are never written to task events or API
+// responses.
+func (s *Supervisor) mcpSubmissionContext(taskID string) ([]python_protocol.MCPServerConfigMessage, []string, error) {
 	records, err := s.store.ListMCPServers()
 	if err != nil {
 		return nil, nil, err
@@ -522,7 +523,7 @@ func (s *Supervisor) mcpSubmissionContext() ([]python_protocol.MCPServerConfigMe
 			AllowRemoteEndpoint:      record.AllowRemoteEndpoint,
 		})
 	}
-	grants, err := s.store.GrantedApprovalFingerprints()
+	grants, err := s.store.GrantedApprovalFingerprints(taskID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -620,7 +621,7 @@ func (s *Supervisor) handleProtocolFrame(id string, task *runningTask, frame []b
 		}
 		if result.Status == "failed" && task.stderr != nil {
 			if stderrText := strings.TrimSpace(task.stderr.String()); stderrText != "" {
-				fmt.Fprintln(os.Stderr, "CRANE: task runtime stderr: "+stderrText)
+				fmt.Fprintln(os.Stderr, "CRANE: task runtime stderr: "+fmt.Sprint(persistence.RedactMCPValue(stderrText)))
 			}
 		}
 		_ = task.finish(s, result.Status, resultJSON, errorText, result.Checkpoint)
@@ -793,7 +794,7 @@ func (s *Supervisor) Stop() {
 	}
 	s.started.Store(false)
 	if err := s.RequestShutdown(); err != nil {
-		fmt.Fprintln(os.Stderr, "CRANE supervisor shutdown warning:", err)
+		fmt.Fprintln(os.Stderr, "CRANE supervisor shutdown warning:", persistence.RedactMCPValue(err.Error()))
 	}
 }
 
