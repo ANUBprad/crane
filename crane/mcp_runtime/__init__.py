@@ -524,8 +524,9 @@ class MCPManager:
                     "tool_count": len(managed.tools),
                 })
                 return list(managed.tools.values())
-            except Exception as exc:  # noqa: BLE001 - normalized at the boundary
-                await stack.aclose()
+            except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - normalized at the boundary
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await stack.aclose()
                 managed.clear()
                 managed.last_error = redact(str(exc))
                 raise self._normalize_error(exc, "mcp_connect_failed") from exc
@@ -541,7 +542,7 @@ class MCPManager:
         stack, session = managed.stack, managed.session
         managed.clear()
         if stack is not None:
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
                 await stack.aclose()
         del session
 
@@ -578,8 +579,9 @@ class MCPManager:
                 read_timeout_seconds=timedelta(seconds=config.connect_timeout_seconds),
             ))
             await session.initialize()
-        except Exception as exc:  # noqa: BLE001
-            await stack.aclose()
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await stack.aclose()
             managed.clear()
             managed.last_error = redact(str(exc))
             raise self._normalize_error(exc, "mcp_connect_failed") from exc

@@ -31,7 +31,21 @@ const (
 // environment override used by the launcher and lifecycle scripts.
 func InstallRoot() string {
 	if value := strings.TrimSpace(os.Getenv(installRootEnv)); value != "" {
-		return filepath.Clean(value)
+		cleaned := filepath.Clean(value)
+		if abs, err := filepath.Abs(cleaned); err == nil {
+			if info, statErr := os.Stat(abs); statErr == nil && info.IsDir() {
+				return abs
+			}
+			// If the relative path was resolved against a different cwd than the
+			// caller intended, prefer a known-good install root from the executable.
+			if executable, exeErr := os.Executable(); exeErr == nil {
+				if root, ok := rootFromExecutable(executable); ok {
+					return root
+				}
+			}
+			return abs
+		}
+		return cleaned
 	}
 	if executable, err := os.Executable(); err == nil {
 		if root, ok := rootFromExecutable(executable); ok {
@@ -187,17 +201,28 @@ func versionFromExecutable() (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	parent := filepath.Dir(executable)
-	if !strings.EqualFold(filepath.Base(parent), "versions") {
-		return "", false
+	parent := filepath.Clean(filepath.Dir(executable))
+	if strings.EqualFold(filepath.Base(filepath.Dir(parent)), "versions") {
+		version := filepath.Base(parent)
+		if validVersion(version) {
+			return version, true
+		}
 	}
-	version := filepath.Base(filepath.Dir(parent))
-	return version, validVersion(version)
+	if strings.EqualFold(filepath.Base(parent), "versions") {
+		version := filepath.Base(filepath.Dir(parent))
+		if validVersion(version) {
+			return version, true
+		}
+	}
+	return "", false
 }
 
 func rootFromExecutable(executable string) (string, bool) {
 	parent := filepath.Clean(filepath.Dir(executable))
 	base := strings.ToLower(filepath.Base(parent))
+	if strings.EqualFold(filepath.Base(filepath.Dir(parent)), "versions") {
+		return filepath.Dir(filepath.Dir(parent)), true
+	}
 	switch base {
 	case "versions":
 		return filepath.Dir(parent), true

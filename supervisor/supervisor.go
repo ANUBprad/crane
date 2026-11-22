@@ -47,6 +47,7 @@ type runningTask struct {
 	id     string
 	cancel context.CancelFunc
 	stdin  io.WriteCloser
+	stderr *boundedBuffer
 	write  sync.Mutex
 	done   chan struct{}
 	once   sync.Once
@@ -416,7 +417,7 @@ func (s *Supervisor) executeTask(id, input string, checkpoint []byte, resume boo
 		_ = s.finalize(id, "failed", "", "unable to start Python runtime", nil)
 		return
 	}
-	task := &runningTask{id: id, cancel: cancel, stdin: stdin, done: make(chan struct{})}
+	task := &runningTask{id: id, cancel: cancel, stdin: stdin, stderr: stderr, done: make(chan struct{})}
 	s.activeMu.Lock()
 	s.active[id] = task
 	s.activeMu.Unlock()
@@ -488,6 +489,9 @@ func (s *Supervisor) executeTask(id, input string, checkpoint []byte, resume boo
 		<-waitDone
 	}
 	_ = stdin.Close()
+	if stderrText := strings.TrimSpace(stderr.String()); stderrText != "" {
+		fmt.Fprintln(os.Stderr, "CRANE: task runtime stderr: "+stderrText)
+	}
 	task.finish(s, "failed", `{"code":"runtime_exited"}`, "Python runtime exited before a terminal result", nil)
 }
 
@@ -613,6 +617,11 @@ func (s *Supervisor) handleProtocolFrame(id string, task *runningTask, frame []b
 		errorText := result.FailureReason
 		if result.Status == "cancelled" && errorText == "" {
 			errorText = "task cancelled by supervisor request"
+		}
+		if result.Status == "failed" && task.stderr != nil {
+			if stderrText := strings.TrimSpace(task.stderr.String()); stderrText != "" {
+				fmt.Fprintln(os.Stderr, "CRANE: task runtime stderr: "+stderrText)
+			}
 		}
 		_ = task.finish(s, result.Status, resultJSON, errorText, result.Checkpoint)
 		return true
@@ -806,4 +815,10 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	}
 	_, _ = b.buf.Write(p)
 	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

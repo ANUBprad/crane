@@ -155,7 +155,22 @@ $pthPath = Join-Path $pythonDir "python$pyMajorMinor._pth"
 @("python$pyMajorMinor.zip", '.', '..\app', 'Lib\site-packages', 'import site') | Set-Content -LiteralPath $pthPath -Encoding ASCII
 
 Write-Step 'Installing pinned production Python dependencies'
-& python -m pip install --disable-pip-version-check --no-deps --no-compile --only-binary=:all: --require-hashes --target $sitePackages -r (Join-Path $repoRoot 'requirements.lock.txt')
+$pyMajorMinorDot = ($PythonVersion -split '\.')[0] + '.' + ($PythonVersion -split '\.')[1]
+$pipArgs = @(
+    '-m', 'pip', 'install',
+    '--disable-pip-version-check',
+    '--no-deps',
+    '--no-compile',
+    '--only-binary=:all:',
+    '--require-hashes',
+    '--python-version', $pyMajorMinorDot,
+    '--platform', 'win_amd64',
+    '--implementation', 'cp',
+    '--abi', "cp$pyMajorMinor",
+    '--target', $sitePackages,
+    '-r', (Join-Path $repoRoot 'requirements.lock.txt')
+)
+& python @pipArgs
 if ($LASTEXITCODE -ne 0) { throw 'Packaged Python dependency installation failed.' }
 foreach ($extraDir in @((Join-Path $sitePackages 'bin'), (Join-Path $sitePackages 'Scripts'))) {
     if (Test-Path -LiteralPath $extraDir) {

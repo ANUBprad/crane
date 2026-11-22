@@ -3,8 +3,10 @@ package localapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -92,6 +94,7 @@ func writeMCPError(w http.ResponseWriter, err error) {
 	case errors.Is(err, mcpruntime.ErrControllerNotStarted):
 		writeError(w, http.StatusServiceUnavailable, "mcp_unavailable")
 	default:
+		fmt.Fprintln(os.Stderr, "CRANE MCP API error:", err)
 		writeError(w, http.StatusBadRequest, "mcp_request_failed")
 	}
 }

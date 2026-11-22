@@ -94,14 +94,14 @@ func TestControllerStdioServerPolicyAndInvocation(t *testing.T) {
 		t.Fatalf("Connect() error = %v", err)
 	}
 	tools, err := controller.ListTools(server.ID)
-	if err != nil || len(tools) != 2 {
+	if err != nil || len(tools) != 3 {
 		t.Fatalf("ListTools() = %#v, %v", tools, err)
 	}
 	policies := map[string]string{}
 	for _, tool := range tools {
 		policies[tool.ToolName] = tool.PolicyClass
 	}
-	if policies["get_test_echo"] != "allowed" || policies["delete_test_record"] != "approval_required" {
+	if policies["get_test_echo"] != "allowed" || policies["delete_test_record"] != "approval_required" || policies["get_invocation_counts"] != "allowed" {
 		t.Fatalf("unexpected tool policies: %#v", policies)
 	}
 

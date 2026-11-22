@@ -308,11 +308,19 @@ func (c *Controller) markDone() {
 	}
 	c.pendingMu.Unlock()
 	c.mu.Lock()
+	stderr := ""
+	if c.stderr != nil {
+		stderr = c.stderr.String()
+	}
 	if c.done != nil {
 		close(c.done)
 		c.done = nil
 	}
+	started := c.started
 	c.mu.Unlock()
+	if started && stderr != "" {
+		fmt.Fprintln(os.Stderr, "CRANE MCP: daemon exited: "+stderr)
+	}
 }
 
 func (c *Controller) deliver(commandID string, response pendingResponse) {

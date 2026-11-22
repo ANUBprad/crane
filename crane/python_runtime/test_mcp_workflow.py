@@ -47,11 +47,13 @@ class MCPWorkflowTest(unittest.TestCase):
                 self.assertEqual(tools_by_server[config.server_id], True)
                 self.assertEqual(
                     sorted(tool.name for tool in manager.server_tools(config.server_id).values()),
-                    ["delete_test_record", "get_test_echo"],
+                    ["delete_test_record", "get_invocation_counts", "get_test_echo"],
                 )
                 tools = manager.langchain_tools()
                 self.assertEqual(sorted(tool.name for tool in tools), [
-                    "workflow_test_delete_test_record", "workflow_test_get_test_echo",
+                    "workflow_test_delete_test_record",
+                    "workflow_test_get_invocation_counts",
+                    "workflow_test_get_test_echo",
                 ])
 
                 echo_tool = next(tool for tool in tools if tool.name.endswith("get_test_echo"))
