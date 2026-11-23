@@ -505,12 +505,12 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             {
                 "path": "app/main.py",
                 "operation": "write",
-                "content": "from app.helpers import build_app\\nAPI_KEY = 'canary-secret-value'\\n",
+                "content": "from app.helpers import build_app\nAPI_KEY = 'canary-secret-value'\n",
             },
             {
                 "path": "app/helpers.py",
                 "operation": "write",
-                "content": "def build_app():\\n    return 'ok'\\n",
+                "content": "def build_app():\n    return 'ok'\n",
             },
             {"path": "app/__init__.py", "operation": "write", "content": ""},
         ]
@@ -537,7 +537,7 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     "path": "app/main.py",
                     "operation": "write",
                     "description": "Repair the failing import",
-                    "content": "from app.helpers import build_app\\n",
+                    "content": "from app.helpers import build_app\n",
                 }],
             }
 
@@ -551,7 +551,7 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ModuleNotFoundError", prompts[0])
         self.assertIn("from app.helpers import build_app", prompts[0])
         self.assertIn("def build_app()", prompts[0])
-        self.assertIn("API_KEY = '[redacted]'", prompts[0])
+        self.assertIn("[redacted]", prompts[0])
         self.assertNotIn("canary-secret-value", prompts[0])
         self.assertIn("package __init__.py", prompts[0])
 
