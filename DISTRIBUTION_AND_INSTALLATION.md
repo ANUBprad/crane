@@ -8,7 +8,7 @@ This is a per-user PowerShell bootstrapper, not an MSI or graphical installer.
 
 ## Current status
 
-**As of HEAD `af0b4a18f6da37a1a293315a273b71f681400ec4` (Windows CI run [45238765482](https://github.com/ANUBprad/crane/actions/runs/45238765482), success, completed `2026-11-23T18:36:42Z`).**
+**As of HEAD `8ae928f7e9c9074e7626bc77b8d269b4992b5325` (Windows CI run [45253450966](https://github.com/ANUBprad/crane/actions/runs/45253450966), success, completed `2026-11-23T20:02:16Z`).**
 
 Implemented:
 
@@ -17,26 +17,29 @@ Implemented:
 - `scripts/uninstall.ps1` runs detached, removes install/PATH entries, preserves `%LOCALAPPDATA%\CRANE` data by default, and removes data only with `-RemoveData -Confirm REMOVE-CRANE-DATA`.
 - `scripts/acceptance-windows.ps1` provides an isolated lifecycle harness (install, version/doctor smoke, basic task/result, upgrade, rollback, uninstall/data preservation, PATH, integrity/failure cases). It mutates process LOCALAPPDATA and, for one check, the real user PATH with restore in `finally`; run it only on a machine where that is acceptable.
 - `scripts/test-release-reproducibility.ps1` compares two independent builds with identical declared inputs and checks byte-for-byte ZIP/manifest/SHA256SUMS equality.
+- `scripts/generate-sbom.py` emits a deterministic CycloneDX 1.5 inventory; release builds list it as an authenticated `sbom` artifact, and both installers require it.
 
 Validated by current repository evidence:
 
-- GitHub-hosted `windows-2025` CI builds, formats/vets, runs Go/Python tests, packages a release, and smoke-tests packaged install/`agent --version`/`agent doctor`/basic task submission.
-- The current run built versioned `0.1.0`–`0.1.2` releases, verified all six `0.1.2-repro` outputs byte-for-byte identical (ZIP SHA-256 `a84f26e0b6c9f615f865d40e9378aa7a44b8f5b2ec20b7d943f17778d375f3b8`), and ran the full isolated acceptance harness with `ACCEPTANCE RESULT: ALL ISOLATED CHECKS PASSED` (install, version/doctor, task/result, update, rollback, uninstall/data preservation, PATH, and integrity/failure cases).
-- Artifact [`crane-windows-ci-47`](https://github.com/ANUBprad/crane/actions/runs/45238765482/artifacts/14851690816) is 150,044,577 bytes; uploaded ZIP SHA-256 `b0015df306e3e7be87671e920e76e39b8703a60eeb2df808bfb5e2a7822c361e`.
+- GitHub-hosted `windows-2025` CI builds, formats/vets, runs Go/Python tests (76 Python tests), packages a release, and smoke-tests packaged install/`agent --version`/`agent doctor`/basic task submission. The repair source-context regression and the approval-checkpoint restart regression both ran and passed.
+- The current run built versioned `0.1.0`–`0.1.2` releases, verified all six `0.1.2-repro` outputs byte-for-byte identical (ZIP SHA-256 `a822f1333ec240e8eaf8a506a5d770ec787c3defcac369ec05fa51d3bff1e3ee`, manifest SHA-256 `859bab52628d634d38f51900ca07d34baf5d50bcc91da557de17b6a94c325d5f`), and ran the full isolated acceptance harness with `ACCEPTANCE RESULT: ALL ISOLATED CHECKS PASSED` (install, version/doctor, task/result, update, rollback, uninstall/data preservation, PATH, integrity/failure cases, and SBOM checks).
+- Artifact [`crane-windows-ci-54`](https://github.com/ANUBprad/crane/actions/runs/45253450966/artifacts/14858345897) is 150,074,220 bytes; uploaded ZIP SHA-256 `f0f1466144c996753c89203f4ea48bf449f6213627c5f743a06f44f5f78889c5`.
+- A local Windows 11 x64 release build produced a CycloneDX 1.5 SBOM with 82 components (57 PyPI, 25 Go); every manifest artifact (including `sbom.cdx.json`) matched its manifest and `SHA256SUMS.txt` hash. An isolated install with `CRANE_SKIP_PATH_UPDATE=1` left the user PATH unchanged, and removing the `sbom` artifact made the installer fail closed.
 
 Not validated / external blockers:
 
-- **Clean physical Windows 10/11 x64 acceptance:** not performed on this dev host. GitHub-hosted runner evidence is not a substitute for clean physical Windows 10/11 acceptance.
+- **Clean physical Windows 10/11 x64 acceptance:** not performed. `GET /repos/ANUBprad/crane/actions/runners` returned `total_count: 0`, so the clean Windows 10/11 workflow was not dispatched. GitHub-hosted runner evidence is not a substitute for clean physical Windows 10/11 acceptance.
 - **Authenticode / publisher authenticity:** no legitimate code-signing certificate/credentials are available in this environment. Artifacts are unsigned (`signature.scheme=none`, `signature.status=unverified`). SHA-256/checksum verification provides artifact-integrity evidence, not publisher authenticity.
 - **Controlled official release host/domain:** no controlled official release host/domain is verified. Do not publish or claim an official install URL. Remote `http(s)` install sources are opt-in only and must be operator-controlled.
-- **Cross-environment reproducibility:** `scripts/test-release-reproducibility.ps1` can provide same-host/same-input evidence; cross-environment/toolchain reproducibility is not proven while relevant environment differences remain uncontrolled.
+- **Cross-environment reproducibility:** same-host/same-input determinism is proven for the current inputs. A `windows-2022` vs `windows-2025` comparison job has been added to `windows-ci.yml`; its first result is pending on the next run.
 
 ## Public website and bootstrap installer
 
-The project website is deployed from `website/` using the GitHub Pages workflow:
-`https://anubprad.github.io/crane/`.
+The website source is deployed from `website/` by `.github/workflows/pages.yml`. The intended URL is `https://anubprad.github.io/crane/`, but it is **not currently live**: Pages run [45248258548](https://github.com/ANUBprad/crane/actions/runs/45248258548) failed at `actions/configure-pages@v5` because the repository has no Pages site (`GET /repos/ANUBprad/crane/pages` returned 404; `has_pages=false`).
 
-After a stable GitHub Release exists, Windows users can bootstrap the installer from PowerShell:
+`configure-pages` has an `enablement: true` input, but its own documentation requires a token other than the default `GITHUB_TOKEN` for that path (a PAT with `repo`/Pages write, or a GitHub App with `administration:write` and `pages:write`). With the workflow's existing permissions this setting cannot self-enable Pages. The exact owner action is: **Settings → Pages → Build and deployment → Source: GitHub Actions**, then rerun the workflow. Do not claim the public URL works until that deployment succeeds.
+
+After a stable GitHub Release exists and Pages is enabled, Windows users can bootstrap the installer from PowerShell:
 
 ```powershell
 irm https://anubprad.github.io/crane/install.ps1 | iex
@@ -81,6 +84,7 @@ build/release/<version>/
   install.ps1
   uninstall.ps1
   python-requirements.lock.txt
+  sbom.cdx.json                     # deterministic CycloneDX 1.5 inventory
 ```
 
 The manifest records `schema_version`, `version`, `channel`, `os`, `arch`, `python_version`, `go_version`, `commit`, `build_date`, `signature`, and `artifacts`. Generated artifacts live under ignored `build/` and are not committed.
@@ -142,7 +146,7 @@ PowerShell equivalents:
 ## Verification performed by the installer
 
 1. Validates Windows x64 and Windows 10+.
-2. Reads the manifest and requires schema version 1, Windows x64 metadata, complete build metadata, and exact unsigned/unverified signature state.
+2. Reads the manifest and requires schema version 1, Windows x64 metadata, complete build metadata, exactly one artifact of each required kind (`payload`, `installer`, `uninstaller`, `dependency_lock`, `sbom`), and exact unsigned/unverified signature state.
 3. Cross-checks `SHA256SUMS.txt` against the manifest.
 4. Verifies each artifact's size and SHA-256 before use.
 5. Extracts the payload with path-traversal and reparse-point checks.
@@ -189,7 +193,7 @@ Run on genuine clean Windows 10 x64 and Windows 11 x64 machines/VMs with no Go, 
 
 ## Hosting readiness (configurable, not official)
 
-- A controlled host must serve versioned, immutable artifacts and matching metadata: payload ZIP, `release-manifest.json`, `SHA256SUMS.txt`, `install.ps1`, `uninstall.ps1`, and `python-requirements.lock.txt`.
+- A controlled host must serve versioned, immutable artifacts and matching metadata: payload ZIP, `release-manifest.json`, `SHA256SUMS.txt`, `install.ps1`, `uninstall.ps1`, `python-requirements.lock.txt`, and `sbom.cdx.json`.
 - Use `https` with verified host ownership, TLS, and access control for release publication/update paths. Do not invent or document an official CRANE domain.
 - Installer/update must fail safely on missing/tampered/unsupported metadata and must never fall back to unverified downloads.
 - Because artifacts are unsigned, the host/control plane must not be presented as providing Authenticode trust.
@@ -198,7 +202,8 @@ Run on genuine clean Windows 10 x64 and Windows 11 x64 machines/VMs with no Go, 
 
 - Legitimate Authenticode signing certificate/credentials and verification enforced in release validation. Without them, CRANE can claim checksum/integrity validation only, not publisher authenticity.
 - Controlled official release host/domain with verified ownership and a documented install command.
-- Clean physical Windows 10/11 x64 acceptance (PowerShell 5.1 and PowerShell 7.x) with recorded evidence.
-- Cross-environment reproducibility evidence, or documented bounded nondeterminism for uncontrolled environment differences.
-- Packaged-install approval persistence/recovery and packaged restart-recovery evidence.
-- SBOM generation and database migration compatibility testing across packaged upgrades.
+- Clean physical Windows 10/11 x64 acceptance (PowerShell 5.1 and PowerShell 7.x) with recorded evidence; no self-hosted runners are registered.
+- Cross-environment reproducibility: first `windows-2022` vs `windows-2025` result pending on the next CI run.
+- Packaged-install approval persistence/recovery: the production defect is fixed and the exact checkpoint/resume contract is covered by `TestApprovalCheckpointSurvivesSupervisorRestartAndResumesExactGrant` using a real SQLite store and supervisor restart; no separate packaged interactive-approval scenario was executed.
+- SBOM generation is complete and authenticated through manifest/checksum/installer/bootstrap. Database migration compatibility is covered by `TestLegacyV1DatabaseMigratesWithoutLosingTasksEventsApprovalsOrCheckpoints`; packaged upgrade/rollback/data preservation is covered by the acceptance harness, but not against historical packaged versions with older schemas.
+- GitHub Pages site must be enabled by the repository owner (Settings → Pages → Build and deployment → Source: GitHub Actions) before the bootstrap URL can be published.

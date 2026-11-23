@@ -21,6 +21,7 @@ jobs:
 
     env:
       CRANE_CI_VERSION: 0.1.3-ci.${{ github.run_number }}
+      CRANE_PYTHON_EMBED_SHA256: 0d57bb6cb078b74d23dbfe91f77d6780d45bed328911609f1f7ee2ba1606bf44
 
     steps:
       - name: Check out source
@@ -182,6 +183,10 @@ jobs:
           if (-not (Test-Path -LiteralPath $zip)) {
             Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-embed-amd64.zip' -OutFile $zip
           }
+          $actualHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:CRANE_PYTHON_EMBED_SHA256) {
+            throw "Python embeddable runtime hash mismatch: $actualHash"
+          }
           "CRANE_PYTHON_EMBED_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build versioned releases for acceptance harness
@@ -227,3 +232,84 @@ jobs:
             ${{ runner.temp }}/crane-reproducibility
           if-no-files-found: ignore
           retention-days: 7
+
+  cross-env-repro:
+    name: Cross-environment release reproducibility
+    needs: windows
+    runs-on: windows-2022
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CRANE_REPRO_VERSION: 0.1.2
+      CRANE_REPRO_BUILD_DATE: '2026-01-01T00:00:00Z'
+      CRANE_PYTHON_EMBED_SHA256: 0d57bb6cb078b74d23dbfe91f77d6780d45bed328911609f1f7ee2ba1606bf44
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12.7
+
+      - name: Download pinned Python embeddable runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'python-3.12.7-embed-amd64.zip'
+          Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-embed-amd64.zip' -OutFile $zip
+          $actualHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:CRANE_PYTHON_EMBED_SHA256) {
+            throw "Python embeddable runtime hash mismatch: $actualHash"
+          }
+          "CRANE_PYTHON_EMBED_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build release on windows-2022
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $goVersion = ((go version).Trim() -split '\s+')[2]
+          if ([string]::IsNullOrWhiteSpace($goVersion)) { throw 'Could not determine Go version.' }
+          $root = Join-Path $env:RUNNER_TEMP 'crane-cross-env'
+          ./scripts/build-release.ps1 -Version $env:CRANE_REPRO_VERSION -OutputRoot $root -Commit $env:GITHUB_SHA -BuildDate $env:CRANE_REPRO_BUILD_DATE -PythonVersion '3.12.7' -GoVersion $goVersion -PythonEmbedZip $env:CRANE_PYTHON_EMBED_ZIP
+          if ($LASTEXITCODE -ne 0) { throw 'Cross-environment release build failed.' }
+
+      - name: Download windows-2025 baseline release
+        uses: actions/download-artifact@v4
+        with:
+          name: crane-windows-ci-${{ github.run_number }}
+          path: ${{ runner.temp }}/crane-baseline
+
+      - name: Compare release artifacts across environments
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baseline = Join-Path $env:RUNNER_TEMP (Join-Path 'crane-baseline' (Join-Path 'crane-acceptance-releases' $env:CRANE_REPRO_VERSION))
+          $candidate = Join-Path $env:RUNNER_TEMP (Join-Path 'crane-cross-env' $env:CRANE_REPRO_VERSION)
+          if (-not (Test-Path -LiteralPath $baseline -PathType Container)) { throw "Baseline release not found: $baseline" }
+          if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { throw "Candidate release not found: $candidate" }
+          $baselineFiles = @(Get-ChildItem -LiteralPath $baseline -File | Sort-Object Name)
+          $candidateFiles = @(Get-ChildItem -LiteralPath $candidate -File | Sort-Object Name)
+          $baselineNames = @($baselineFiles | ForEach-Object { $_.Name })
+          $candidateNames = @($candidateFiles | ForEach-Object { $_.Name })
+          if (($baselineNames -join '|') -ne ($candidateNames -join '|')) {
+            throw "Release artifact lists differ: baseline=$($baselineNames -join ',') candidate=$($candidateNames -join ',')"
+          }
+          foreach ($file in $baselineFiles) {
+            $other = Join-Path $candidate $file.Name
+            $baselineHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $candidateHash = (Get-FileHash -LiteralPath $other -Algorithm SHA256).Hash.ToLowerInvariant()
+            $equal = $baselineHash -eq $candidateHash -and $file.Length -eq (Get-Item -LiteralPath $other).Length
+            Write-Host ("CROSS-ENV {0} equal={1} sha256={2} size={3}" -f $file.Name, $equal, $baselineHash, $file.Length)
+            if (-not $equal) { throw "Cross-environment reproducibility mismatch for $($file.Name)" }
+          }
+          Write-Host "CROSS-ENV RESULT=PASS ($($baselineFiles.Count) artifacts byte-for-byte identical between windows-2025 and windows-2022)"
