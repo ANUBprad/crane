@@ -602,6 +602,8 @@ def _resolved_validation_argv(argv: Any) -> Optional[List[str]]:
     raw = values[0].replace("\\", "/")
     basename = raw.rsplit("/", 1)[-1]
     key = basename[:-4].lower() if basename.lower().endswith(".exe") else basename.lower()
+    if key in {"pytest", "py.test"} and "/" not in raw and not re.match(r"^[A-Za-z]:", raw):
+        return [sys.executable, "-m", "pytest", *values[1:]]
     trusted = _TRUSTED_EXECUTABLES.get(key)
     if trusted is None:
         return None
@@ -628,6 +630,9 @@ def _validation_environment() -> Dict[str, str]:
         if value is not None:
             env[key] = value
     env["PATH"] = _TRUSTED_PATH
+    # Third-party pytest plugins are not part of the validation contract and can
+    # fail collection or execute unintended code before tests start.
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     return env
 
 

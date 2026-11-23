@@ -499,10 +499,19 @@ def _plan_status_sync(state: WorkflowState) -> None:
 
 def _next_runnable_step(state: WorkflowState) -> Optional[PlanStep]:
     completed = set(state.completed_steps)
+    failed = set(state.failed_steps)
     for idx, step in enumerate(state.plan):
         if step.status != "pending":
             continue
-        if all(dep in completed for dep in step.dependencies):
+        ready = True
+        for dep in step.dependencies:
+            if dep in completed:
+                continue
+            if step.step_id == "repair_project" and dep == "validate_project" and dep in failed:
+                continue
+            ready = False
+            break
+        if ready:
             state.current_step_index = idx
             state.current_step_id = step.step_id
             return step
@@ -1138,6 +1147,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                 "Return ONLY JSON with keys: files (array of {path, operation, description, content}), "
                 "validation_commands (array of {name, argv, cwd, timeout_seconds, required}), "
                 "notes (array). operation must be exactly \"write\" for new or updated files or exactly \"delete\" for removals. "
+                "argv[0] must be an allowlisted runtime executable; use python -m pytest -q for Python tests, never bare pytest. "
                 "Paths must be relative to the authorized workspace. No absolute paths, no .., no .git/env writes. "
                 "Generate complete file contents, no placeholders. "
                 f"Specification: {json.dumps(spec, ensure_ascii=False)[:12000]}\n"

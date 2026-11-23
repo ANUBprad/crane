@@ -210,6 +210,16 @@ class GenerationSafetyTests(unittest.TestCase):
         self.assertFalse(gen.allowed_validation_command(["git", "push", "origin", "main"]))
         self.assertTrue(gen.allowed_validation_command(["python.exe", "-m", "py_compile", "app.py"]))
 
+    def test_bare_pytest_is_pinned_to_runtime_python_module(self):
+        resolved = gen._resolved_validation_argv(["pytest", "-q", "tests.py"])
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved[:3], [sys.executable, "-m", "pytest"])
+        self.assertEqual(resolved[3:], ["-q", "tests.py"])
+        shim = self.ws / ("pytest.exe" if os.name == "nt" else "pytest")
+        shim.write_text("", encoding="utf-8")
+        self.assertFalse(gen.allowed_validation_command([str(shim), "-q"]))
+        self.assertEqual(gen._validation_environment()["PYTEST_DISABLE_PLUGIN_AUTOLOAD"], "1")
+
     def test_validation_executable_is_pinned_and_python_env_is_ignored(self):
         shim_dir = self.ws / "shim"
         shim_dir.mkdir()
@@ -362,6 +372,23 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(prompts), 1)
         self.assertIn('"write"', prompts[0])
         self.assertIn('"delete"', prompts[0])
+
+    def test_repair_step_is_runnable_after_failed_validation(self):
+        state = workflow_engine.WorkflowState(
+            task_id="repair-dependency", user_input="test", workspace=str(self.ws),
+        )
+        state.plan = workflow_engine._default_generation_plan(state)
+        for step in state.plan:
+            if step.step_id in {"analyze_requirements", "plan_project", "generate_files"}:
+                step.status = "completed"
+            elif step.step_id == "validate_project":
+                step.status = "failed"
+            else:
+                step.status = "pending"
+        workflow_engine._plan_status_sync(state)
+        runnable = workflow_engine._next_runnable_step(state)
+        self.assertIsNotNone(runnable)
+        self.assertEqual(runnable.step_id, "repair_project")
 
     def _state_and_step(self, step_id):
         state = workflow_engine.WorkflowState(

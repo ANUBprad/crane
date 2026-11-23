@@ -511,9 +511,10 @@ func (s *Store) GetTaskRecord(id string) (TaskRecord, error) {
 	}
 	record.HasCheckpoint = checkpointAt != ""
 	record.UpdatedAt = latestTimestamp(record.CreatedAt, record.StartedAt, record.CompletedAt, checkpointAt)
-	if record.Status == "waiting_approval" {
-		if snapshot, ok := s.GetLatestTaskState(id); ok {
-			record.PendingApprovalScope, record.PendingApprovalReason = ApprovalPendingFromCheckpoint(snapshot)
+	if snapshot, ok := s.GetLatestTaskState(id); ok {
+		scope, reason := ApprovalPendingFromCheckpoint(snapshot)
+		if scope != "" || reason != "" {
+			record.PendingApprovalScope, record.PendingApprovalReason = scope, reason
 		}
 	}
 	return record, nil
