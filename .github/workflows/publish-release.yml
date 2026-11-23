@@ -1,0 +1,55 @@
+name: Publish CRANE Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish Windows x64
+    runs-on: windows-2025
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build verified release directory
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
+            throw "Tag must contain a semantic version, for example v0.1.0. Got: $env:GITHUB_REF_NAME"
+          }
+          $buildDate = (git show -s --format=%cI $env:GITHUB_SHA).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $buildDate) { throw 'Could not resolve tagged commit date.' }
+          ./scripts/build-release.ps1 -Version $version -Commit $env:GITHUB_SHA -BuildDate $buildDate -PythonVersion '3.12.7'
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Publish immutable versioned assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: CRANE ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            build/release/${{ env.RELEASE_VERSION }}/crane-windows-x64-${{ env.RELEASE_VERSION }}.zip
+            build/release/${{ env.RELEASE_VERSION }}/release-manifest.json
+            build/release/${{ env.RELEASE_VERSION }}/SHA256SUMS.txt
+            build/release/${{ env.RELEASE_VERSION }}/install.ps1
+            build/release/${{ env.RELEASE_VERSION }}/uninstall.ps1
+            build/release/${{ env.RELEASE_VERSION }}/python-requirements.lock.txt
