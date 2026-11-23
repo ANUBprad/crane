@@ -726,7 +726,7 @@ func TestEventStreamReplaysPersistedEventsWithCursor(t *testing.T) {
 	reader = bufio.NewReader(response.Body)
 	_ = readSSEEvent(t, reader)
 	state.controller.publish(persistence.TaskEvent{
-		ID: eventID + 1, TaskID: "api-running", Type: "live_event",
+		ID: eventID + 1, Seq: eventID + 1, TaskID: "api-running", Type: "live_event",
 		Payload: json.RawMessage(`{"ok":true}`),
 	})
 	live := readSSEEvent(t, reader)

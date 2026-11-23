@@ -155,12 +155,20 @@ func (c *Client) ApproveTask(ctx context.Context, id string, approved bool, scop
 
 // TaskEvent is a streamed task event from the local API SSE endpoint.
 type TaskEvent struct {
-	ID        int64           `json:"id"`
-	TaskID    string          `json:"task_id"`
-	Timestamp string          `json:"timestamp"`
-	Type      string          `json:"type"`
-	Payload   json.RawMessage `json:"payload"`
+	ID           int64           `json:"id"`
+	Seq          int64           `json:"seq"`
+	EventVersion string          `json:"event_version,omitempty"`
+	TaskID       string          `json:"task_id"`
+	Timestamp    string          `json:"timestamp"`
+	Type         string          `json:"type"`
+	Payload      json.RawMessage `json:"payload"`
+	StepID       string          `json:"step_id,omitempty"`
+	ToolName     string          `json:"tool_name,omitempty"`
+	Severity     string          `json:"severity,omitempty"`
 }
+
+// ErrEventCursorExpired indicates the requested replay cursor is no longer retained.
+var ErrEventCursorExpired = errors.New("event cursor expired")
 
 // StreamTaskEvents subscribes to task SSE events and calls onEvent for each event.
 // It returns when context is cancelled, the stream ends, or an error occurs.
@@ -196,6 +204,17 @@ func (c *Client) StreamTaskEvents(ctx context.Context, taskID string, after int6
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode == http.StatusGone {
+			var envelope struct {
+				Data struct {
+					Reason string `json:"reason"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(data, &envelope); err == nil && envelope.Data.Reason == "event_cursor_expired" {
+				return ErrEventCursorExpired
+			}
+			return ErrEventCursorExpired
+		}
 		code := apiErrorCode(data)
 		if code == "" {
 			code = http.StatusText(resp.StatusCode)
@@ -212,7 +231,31 @@ func (c *Client) StreamTaskEvents(ctx context.Context, taskID string, after int6
 			return nil
 		}
 		data := strings.Join(dataLines, "\n")
-		ev := TaskEvent{ID: eventID, TaskID: taskID, Type: eventType, Payload: json.RawMessage(data)}
+		ev := TaskEvent{ID: eventID, Seq: eventID, TaskID: taskID, Type: eventType, Payload: json.RawMessage(data)}
+		if len(data) > 0 {
+			var payloadEvent TaskEvent
+			if err := json.Unmarshal([]byte(data), &payloadEvent); err == nil {
+				if payloadEvent.Seq > 0 {
+					ev.Seq = payloadEvent.Seq
+					ev.ID = payloadEvent.Seq
+				}
+				if payloadEvent.EventVersion != "" {
+					ev.EventVersion = payloadEvent.EventVersion
+				}
+				if payloadEvent.StepID != "" {
+					ev.StepID = payloadEvent.StepID
+				}
+				if payloadEvent.ToolName != "" {
+					ev.ToolName = payloadEvent.ToolName
+				}
+				if payloadEvent.Severity != "" {
+					ev.Severity = payloadEvent.Severity
+				}
+				if payloadEvent.Timestamp != "" {
+					ev.Timestamp = payloadEvent.Timestamp
+				}
+			}
+		}
 		eventType = ""
 		dataLines = nil
 		eventID = 0

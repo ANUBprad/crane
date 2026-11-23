@@ -275,7 +275,17 @@ func runTaskCreate(args []string, stdout, stderr io.Writer) error {
 }
 
 func runTaskPrompt(args []string, stdout, stderr io.Writer) error {
-	input := strings.TrimSpace(strings.Join(args, " "))
+	flags := flag.NewFlagSet("run", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	output := flags.String("output", "text", "output mode: text or json")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	mode, err := parseOutputMode(*output)
+	if err != nil {
+		return err
+	}
+	input := strings.TrimSpace(strings.Join(flags.Args(), " "))
 	if input == "" {
 		return errors.New("run requires task text")
 	}
@@ -315,15 +325,23 @@ func runTaskPrompt(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "task %s %s\n", created.ID, created.Status)
+	if mode == outputJSON {
+		emitJSONLine(stdout, map[string]any{"type": "task", "task_id": created.ID, "status": created.Status})
+	} else {
+		fmt.Fprintf(stdout, "task %s %s\n", created.ID, created.Status)
+	}
 
+	lastSeq := int64(0)
 	for {
-		renderer, cancelStream := streamTaskOutput(ctx, client, created.ID, stdout, stderr)
+		renderer, cancelStream := streamTaskOutput(ctx, client, created.ID, stdout, stderr, mode, lastSeq)
 		record, err := waitForTaskCompletion(ctx, client, created.ID, 10*time.Minute)
 		cancelStream()
 		time.Sleep(150 * time.Millisecond)
 		if err != nil {
 			return err
+		}
+		if seq := renderer.LastSeq(); seq > lastSeq {
+			lastSeq = seq
 		}
 		if taskExecutionStatus(record) == "waiting_for_approval" {
 			_, approved, aerr := promptApproval(ctx, client, record, os.Stdin, stdout, stderr)
@@ -335,22 +353,7 @@ func runTaskPrompt(args []string, stdout, stderr io.Writer) error {
 			}
 			continue
 		}
-		answer := renderer.FinalAnswer(record)
-		if !renderer.SawDelta() {
-			fmt.Fprintln(stdout, answer)
-		} else if !strings.HasSuffix(answer, "\n") {
-			fmt.Fprintln(stdout)
-		}
-		if record.Status == "failed" {
-			if record.Error != "" {
-				return fmt.Errorf("%s", record.Error)
-			}
-			return errors.New("task failed")
-		}
-		if record.Status == "cancelled" {
-			return errors.New("task cancelled")
-		}
-		return nil
+		return emitTaskResult(stdout, stderr, mode, renderer, record)
 	}
 }
 
@@ -359,8 +362,13 @@ func runCreate(args []string, stdout, stderr io.Writer) error {
 	flags.SetOutput(io.Discard)
 	workspace := flags.String("workspace", "", "Authorized workspace directory for generated project files")
 	planOnly := flags.Bool("plan-only", false, "Plan the generation task without applying file changes")
+	output := flags.String("output", "text", "output mode: text or json")
 	if err := flags.Parse(args); err != nil {
 		return errors.New("usage: agent create \"<objective>\" --workspace <dir>")
+	}
+	mode, err := parseOutputMode(*output)
+	if err != nil {
+		return err
 	}
 	objective := strings.TrimSpace(strings.Join(flags.Args(), " "))
 	if objective == "" {
@@ -410,15 +418,23 @@ func runCreate(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "task %s %s\n", created.ID, created.Status)
+	if mode == outputJSON {
+		emitJSONLine(stdout, map[string]any{"type": "task", "task_id": created.ID, "status": created.Status, "workspace": *workspace})
+	} else {
+		fmt.Fprintf(stdout, "task %s %s\n", created.ID, created.Status)
+	}
 
+	lastSeq := int64(0)
 	for {
-		renderer, cancelStream := streamTaskOutput(ctx, client, created.ID, stdout, stderr)
+		renderer, cancelStream := streamTaskOutput(ctx, client, created.ID, stdout, stderr, mode, lastSeq)
 		record, err := waitForTaskCompletion(ctx, client, created.ID, 15*time.Minute)
 		cancelStream()
 		time.Sleep(150 * time.Millisecond)
 		if err != nil {
 			return err
+		}
+		if seq := renderer.LastSeq(); seq > lastSeq {
+			lastSeq = seq
 		}
 		if taskExecutionStatus(record) == "waiting_for_approval" {
 			_, approved, aerr := promptApproval(ctx, client, record, os.Stdin, stdout, stderr)
@@ -430,22 +446,7 @@ func runCreate(args []string, stdout, stderr io.Writer) error {
 			}
 			continue
 		}
-		answer := renderer.FinalAnswer(record)
-		if !renderer.SawDelta() {
-			fmt.Fprintln(stdout, answer)
-		} else if !strings.HasSuffix(answer, "\n") {
-			fmt.Fprintln(stdout)
-		}
-		if record.Status == "failed" {
-			if record.Error != "" {
-				return fmt.Errorf("%s", record.Error)
-			}
-			return errors.New("task failed")
-		}
-		if record.Status == "cancelled" {
-			return errors.New("task cancelled")
-		}
-		return nil
+		return emitTaskResult(stdout, stderr, mode, renderer, record)
 	}
 }
 
@@ -652,18 +653,41 @@ func chatHistory(ctx context.Context, client *localclient.Client, conversationID
 	return nil
 }
 
-type taskStreamRenderer struct {
-	stdout   io.Writer
-	stderr   io.Writer
-	tty      bool
-	mu       sync.Mutex
-	sawDelta bool
-	deltaBuf strings.Builder
-	lastLine string
+type outputMode string
+
+const (
+	outputText outputMode = "text"
+	outputJSON outputMode = "json"
+)
+
+func parseOutputMode(raw string) (outputMode, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "text":
+		return outputText, nil
+	case "json":
+		return outputJSON, nil
+	default:
+		return "", fmt.Errorf("unsupported output mode %q (expected text or json)", raw)
+	}
 }
 
-func newTaskStreamRenderer(stdout, stderr io.Writer) *taskStreamRenderer {
-	return &taskStreamRenderer{stdout: stdout, stderr: stderr, tty: isTerminalWriter(stdout)}
+type taskStreamRenderer struct {
+	stdout       io.Writer
+	stderr       io.Writer
+	mode         outputMode
+	tty          bool
+	mu           sync.Mutex
+	sawDelta     bool
+	deltaBuf     strings.Builder
+	lastLine     string
+	lastSeq      int64
+	seenSeq      map[int64]struct{}
+	terminalSeen bool
+}
+
+func newTaskStreamRenderer(stdout, stderr io.Writer, mode outputMode) *taskStreamRenderer {
+	tty := mode == outputText && isTerminalWriter(stdout) && isTerminalWriter(stderr)
+	return &taskStreamRenderer{stdout: stdout, stderr: stderr, mode: mode, tty: tty, seenSeq: make(map[int64]struct{})}
 }
 
 func isTerminalWriter(w io.Writer) bool {
@@ -681,7 +705,41 @@ func isTerminalWriter(w io.Writer) bool {
 func (r *taskStreamRenderer) HandleEvent(ev localclient.TaskEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if ev.Seq > 0 {
+		if _, ok := r.seenSeq[ev.Seq]; ok {
+			return
+		}
+		r.seenSeq[ev.Seq] = struct{}{}
+		if ev.Seq > r.lastSeq {
+			r.lastSeq = ev.Seq
+		}
+	}
+	if isTerminalStreamEvent(ev) {
+		r.terminalSeen = true
+	}
+
+	if r.mode == outputJSON {
+		r.handleEventJSONLocked(ev)
+		return
+	}
+
 	switch ev.Type {
+	case "assistant.snapshot":
+		var p struct {
+			Text    string `json:"text"`
+			Partial bool   `json:"partial"`
+		}
+		_ = json.Unmarshal(ev.Payload, &p)
+		if strings.TrimSpace(p.Text) == "" {
+			return
+		}
+		if !r.sawDelta {
+			r.sawDelta = true
+			r.deltaBuf.Reset()
+			r.deltaBuf.WriteString(p.Text)
+			fmt.Fprint(r.stdout, p.Text)
+		}
+		return
 	case "assistant.delta":
 		var p struct {
 			Delta string `json:"delta"`
@@ -707,22 +765,100 @@ func (r *taskStreamRenderer) HandleEvent(ev localclient.TaskEvent) {
 		}
 		r.lastLine = line
 		if r.tty {
-			// Keep progress separate from streamed assistant text.
 			if r.sawDelta {
-				fmt.Fprintln(r.stderr, "\n"+line)
-			} else {
-				fmt.Fprintln(r.stderr, line)
+				fmt.Fprintln(r.stderr)
 			}
+			fmt.Fprintln(r.stderr, line)
 		} else {
-			fmt.Fprintf(r.stdout, "event\t%s\t%s\n", ev.Type, line)
+			fmt.Fprintln(r.stderr, "event: "+line)
 		}
 	}
+}
+
+func (r *taskStreamRenderer) handleEventJSONLocked(ev localclient.TaskEvent) {
+	switch ev.Type {
+	case "assistant.snapshot":
+		var p struct {
+			Text string `json:"text"`
+		}
+		_ = json.Unmarshal(ev.Payload, &p)
+		if strings.TrimSpace(p.Text) != "" && !r.sawDelta {
+			r.sawDelta = true
+			r.deltaBuf.Reset()
+			r.deltaBuf.WriteString(p.Text)
+		}
+	case "assistant.delta":
+		var p struct {
+			Delta string `json:"delta"`
+			Text  string `json:"text"`
+		}
+		_ = json.Unmarshal(ev.Payload, &p)
+		delta := p.Delta
+		if delta == "" {
+			delta = p.Text
+		}
+		if delta != "" {
+			r.sawDelta = true
+			r.deltaBuf.WriteString(delta)
+		}
+	default:
+	}
+	obj := map[string]any{
+		"type":      "event",
+		"task_id":   ev.TaskID,
+		"event":     ev.Type,
+		"seq":       ev.Seq,
+		"timestamp": ev.Timestamp,
+		"payload":   json.RawMessage(ev.Payload),
+	}
+	if ev.EventVersion != "" {
+		obj["event_version"] = ev.EventVersion
+	}
+	encoded, err := json.Marshal(obj)
+	if err != nil {
+		return
+	}
+	fmt.Fprintln(r.stdout, string(encoded))
 }
 
 func (r *taskStreamRenderer) SawDelta() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.sawDelta
+}
+
+func (r *taskStreamRenderer) LastSeq() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastSeq
+}
+
+func (r *taskStreamRenderer) TerminalSeen() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.terminalSeen
+}
+
+func isTerminalStreamEvent(ev localclient.TaskEvent) bool {
+	if ev.Type != "task_finished" {
+		return false
+	}
+	var p struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		return false
+	}
+	return isTerminalTaskStatus(p.Status)
+}
+
+func isTerminalTaskStatus(status string) bool {
+	switch status {
+	case "succeeded", "failed", "cancelled":
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *taskStreamRenderer) FinalAnswer(record persistence.TaskRecord) string {
@@ -833,16 +969,162 @@ func renderProgressEvent(ev localclient.TaskEvent) string {
 	}
 }
 
-func streamTaskOutput(ctx context.Context, client *localclient.Client, taskID string, stdout, stderr io.Writer) (*taskStreamRenderer, context.CancelFunc) {
-	renderer := newTaskStreamRenderer(stdout, stderr)
+func streamTaskOutput(ctx context.Context, client *localclient.Client, taskID string, stdout, stderr io.Writer, mode outputMode, after int64) (*taskStreamRenderer, context.CancelFunc) {
+	renderer := newTaskStreamRenderer(stdout, stderr, mode)
+	if after > 0 {
+		renderer.mu.Lock()
+		renderer.lastSeq = after
+		renderer.mu.Unlock()
+	}
 	streamCtx, cancel := context.WithCancel(ctx)
 	go func() {
-		_ = client.StreamTaskEvents(streamCtx, taskID, 0, func(ev localclient.TaskEvent) error {
-			renderer.HandleEvent(ev)
-			return nil
-		})
+		backoff := 250 * time.Millisecond
+		maxBackoff := 5 * time.Second
+		for {
+			if streamCtx.Err() != nil || renderer.TerminalSeen() {
+				return
+			}
+			err := client.StreamTaskEvents(streamCtx, taskID, renderer.LastSeq(), func(ev localclient.TaskEvent) error {
+				renderer.HandleEvent(ev)
+				if renderer.TerminalSeen() {
+					return context.Canceled
+				}
+				return nil
+			})
+			if streamCtx.Err() != nil || renderer.TerminalSeen() {
+				return
+			}
+			if err == nil {
+				// Clean stream end (terminal replay drained or server closed). Confirm status.
+				record, recErr := client.GetTask(streamCtx, taskID)
+				if recErr == nil && isTerminalTaskStatus(record.Status) {
+					return
+				}
+				// Transient end; reconnect.
+			} else if errors.Is(err, localclient.ErrEventCursorExpired) {
+				record, recErr := client.GetTask(streamCtx, taskID)
+				msg := "event cursor expired; reconnect could not replay all events"
+				if recErr == nil {
+					msg = fmt.Sprintf("event cursor expired; task status=%s", record.Status)
+					if answer := taskResultSummary(record); answer != "" {
+						msg += "; final result available via task record"
+					}
+				}
+				emitStreamStatus(renderer, stderr, mode, taskID, "cursor_expired", msg)
+				return
+			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) && streamCtx.Err() != nil {
+				return
+			} else {
+				emitStreamStatus(renderer, stderr, mode, taskID, "reconnecting", err.Error())
+			}
+
+			// Before reconnecting, check if task is already terminal.
+			record, recErr := client.GetTask(streamCtx, taskID)
+			if recErr == nil && isTerminalTaskStatus(record.Status) {
+				return
+			}
+			if recErr != nil {
+				emitStreamStatus(renderer, stderr, mode, taskID, "reconnecting", "unable to fetch task status: "+recErr.Error())
+			}
+
+			select {
+			case <-streamCtx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
 	}()
 	return renderer, cancel
+}
+
+func emitStreamStatus(renderer *taskStreamRenderer, stderr io.Writer, mode outputMode, taskID, status, message string) {
+	if mode == outputJSON {
+		obj := map[string]any{
+			"type":    "stream_status",
+			"task_id": taskID,
+			"status":  status,
+			"message": message,
+		}
+		encoded, err := json.Marshal(obj)
+		if err == nil {
+			renderer.mu.Lock()
+			fmt.Fprintln(renderer.stdout, string(encoded))
+			renderer.mu.Unlock()
+		}
+		return
+	}
+	renderer.mu.Lock()
+	fmt.Fprintf(stderr, "stream: %s: %s\n", status, message)
+	renderer.mu.Unlock()
+}
+
+func taskResultSummary(record persistence.TaskRecord) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(record.Result), &payload); err == nil {
+		if mo, _ := payload["model_output"].(string); strings.TrimSpace(mo) != "" {
+			return strings.TrimSpace(mo)
+		}
+		if summary, _ := payload["summary"].(string); strings.TrimSpace(summary) != "" {
+			return strings.TrimSpace(summary)
+		}
+	}
+	return strings.TrimSpace(record.Result)
+}
+
+func emitJSONLine(w io.Writer, value any) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return
+	}
+	fmt.Fprintln(w, string(encoded))
+}
+
+func emitTaskResult(stdout, stderr io.Writer, mode outputMode, renderer *taskStreamRenderer, record persistence.TaskRecord) error {
+	answer := renderer.FinalAnswer(record)
+	if mode == outputJSON {
+		obj := map[string]any{
+			"type":         "result",
+			"task_id":      record.ID,
+			"status":       record.Status,
+			"result":       answer,
+			"error":        record.Error,
+			"updated_at":   record.UpdatedAt,
+			"completed_at": record.CompletedAt,
+		}
+		if record.Result != "" {
+			var structured map[string]any
+			if err := json.Unmarshal([]byte(record.Result), &structured); err == nil {
+				obj["result_json"] = structured
+				if es, _ := structured["execution_status"].(string); es != "" {
+					obj["execution_status"] = es
+				}
+				if summary, _ := structured["summary"].(string); summary != "" {
+					obj["summary"] = summary
+				}
+			}
+		}
+		emitJSONLine(stdout, obj)
+	} else {
+		if !renderer.SawDelta() {
+			fmt.Fprintln(stdout, answer)
+		} else if !strings.HasSuffix(answer, "\n") {
+			fmt.Fprintln(stdout)
+		}
+	}
+	if record.Status == "failed" {
+		if record.Error != "" {
+			return fmt.Errorf("%s", record.Error)
+		}
+		return errors.New("task failed")
+	}
+	if record.Status == "cancelled" {
+		return errors.New("task cancelled")
+	}
+	return nil
 }
 
 func chatTurn(ctx context.Context, client *localclient.Client, conversationID, prompt string, stdout, stderr io.Writer) error {
@@ -869,13 +1151,17 @@ func chatTurn(ctx context.Context, client *localclient.Client, conversationID, p
 		return fmt.Errorf("submit chat task: %w", err)
 	}
 
+	lastSeq := int64(0)
 	for {
-		renderer, cancelStream := streamTaskOutput(ctx, client, taskID, stdout, stderr)
+		renderer, cancelStream := streamTaskOutput(ctx, client, taskID, stdout, stderr, outputText, lastSeq)
 		record, err := waitForTaskCompletion(ctx, client, taskID, 10*time.Minute)
 		cancelStream()
 		time.Sleep(150 * time.Millisecond)
 		if err != nil {
 			return err
+		}
+		if seq := renderer.LastSeq(); seq > lastSeq {
+			lastSeq = seq
 		}
 		if taskExecutionStatus(record) == "waiting_for_approval" {
 			rec, approved, aerr := promptApproval(ctx, client, record, os.Stdin, stdout, stderr)
@@ -985,13 +1271,46 @@ func waitForTaskCompletion(ctx context.Context, client *localclient.Client, task
 }
 
 func runTaskStatus(args []string, stdout, stderr io.Writer) error {
-	id, err := singleTaskID("status", args)
+	flags := flag.NewFlagSet("status", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	output := flags.String("output", "text", "output mode: text or json")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	mode, err := parseOutputMode(*output)
 	if err != nil {
 		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("status requires exactly one task ID")
+	}
+	id := strings.TrimSpace(flags.Arg(0))
+	if !persistence.ValidTaskID(id) {
+		return errors.New("invalid task ID")
 	}
 	record, err := readTaskRecord(id)
 	if err != nil {
 		return err
+	}
+	if mode == outputJSON {
+		obj := map[string]any{
+			"task_id": record.ID, "status": record.Status, "error": record.Error,
+			"updated_at": record.UpdatedAt, "completed_at": record.CompletedAt,
+		}
+		if record.Result != "" {
+			var result map[string]any
+			if err := json.Unmarshal([]byte(record.Result), &result); err == nil {
+				obj["result_json"] = result
+				if es, _ := result["execution_status"].(string); es != "" {
+					obj["execution_status"] = es
+				}
+				if summary, _ := result["summary"].(string); summary != "" {
+					obj["summary"] = summary
+				}
+			}
+		}
+		emitJSONLine(stdout, obj)
+		return nil
 	}
 	fmt.Fprintf(stdout, "ID: %s\nStatus: %s\n", record.ID, record.Status)
 	if record.Result != "" {
@@ -1012,13 +1331,44 @@ func runTaskStatus(args []string, stdout, stderr io.Writer) error {
 }
 
 func runTaskResult(args []string, stdout, stderr io.Writer) error {
-	id, err := singleTaskID("result", args)
+	flags := flag.NewFlagSet("result", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	output := flags.String("output", "text", "output mode: text or json")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	mode, err := parseOutputMode(*output)
 	if err != nil {
 		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("result requires exactly one task ID")
+	}
+	id := strings.TrimSpace(flags.Arg(0))
+	if !persistence.ValidTaskID(id) {
+		return errors.New("invalid task ID")
 	}
 	record, err := readTaskRecord(id)
 	if err != nil {
 		return err
+	}
+	if mode == outputJSON {
+		obj := map[string]any{
+			"task_id": record.ID, "status": record.Status, "error": record.Error,
+			"result":     strings.TrimSpace(record.Result),
+			"updated_at": record.UpdatedAt, "completed_at": record.CompletedAt,
+		}
+		if record.Result != "" {
+			var result map[string]any
+			if err := json.Unmarshal([]byte(record.Result), &result); err == nil {
+				obj["result_json"] = result
+			}
+		}
+		emitJSONLine(stdout, obj)
+		if record.Status == "failed" {
+			return errors.New(record.Error)
+		}
+		return nil
 	}
 	if record.Status == "failed" && record.Error != "" {
 		fmt.Fprintf(stderr, "Task %s failed: %s\n", id, record.Error)

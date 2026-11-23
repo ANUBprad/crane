@@ -70,6 +70,8 @@ var ErrDuplicateTask = errors.New("task already exists")
 const (
 	maxTaskIDLength  = 200
 	maxEventsPerTask = 1000
+	// EventSchemaVersion identifies the durable task event envelope contract.
+	EventSchemaVersion = "1"
 )
 
 // mcpSchema is applied as migration 2 to existing and fresh databases.
@@ -159,6 +161,55 @@ CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv_id ON conversation_mes
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
 `
 
+func migrateTaskEventSequence(db *sql.DB) error {
+	hasSeq, err := sqliteColumnExists(db, "task_events", "seq")
+	if err != nil {
+		return err
+	}
+	if !hasSeq {
+		if _, err := db.Exec(`ALTER TABLE task_events ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add task_events.seq: %w", err)
+		}
+	}
+	// Backfill per-task monotonic sequence for existing rows. Global id order is
+	// preserved as the authoritative historical order.
+	if _, err := db.Exec(`
+		UPDATE task_events
+		SET seq = (
+			SELECT COUNT(*) FROM task_events AS prior
+			WHERE prior.task_id = task_events.task_id AND prior.id <= task_events.id
+		)
+		WHERE seq = 0 OR seq IS NULL
+	`); err != nil {
+		return fmt.Errorf("backfill task_events.seq: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_task_events_task_seq ON task_events(task_id, seq)`); err != nil {
+		return fmt.Errorf("create task_events seq index: %w", err)
+	}
+	return nil
+}
+
+func sqliteColumnExists(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
 // ValidTaskID restricts task IDs to a safe, portable character set shared by
 // the CLI, persistence boundary and local API paths.
 func ValidTaskID(id string) bool {
@@ -198,12 +249,19 @@ type TaskRecord struct {
 }
 
 // TaskEvent is an API-safe, persisted lifecycle or workflow event.
+// Seq is the authoritative per-task monotonic sequence cursor. ID mirrors Seq
+// for backward compatibility with existing consumers.
 type TaskEvent struct {
-	ID        int64           `json:"id"`
-	TaskID    string          `json:"task_id"`
-	Timestamp string          `json:"timestamp"`
-	Type      string          `json:"type"`
-	Payload   json.RawMessage `json:"payload"`
+	ID           int64           `json:"id"`
+	Seq          int64           `json:"seq"`
+	EventVersion string          `json:"event_version,omitempty"`
+	TaskID       string          `json:"task_id"`
+	Timestamp    string          `json:"timestamp"`
+	Type         string          `json:"type"`
+	Payload      json.RawMessage `json:"payload"`
+	StepID       string          `json:"step_id,omitempty"`
+	ToolName     string          `json:"tool_name,omitempty"`
+	Severity     string          `json:"severity,omitempty"`
 }
 
 // NewStore opens the database at path and initializes the schema.
@@ -270,6 +328,7 @@ func NewStore(path string) (*Store, error) {
 	CREATE TABLE IF NOT EXISTS task_events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		task_id TEXT NOT NULL,
+		seq INTEGER NOT NULL DEFAULT 0,
 		timestamp TEXT NOT NULL,
 		type TEXT NOT NULL,
 		payload TEXT,
@@ -329,6 +388,18 @@ func NewStore(path string) (*Store, error) {
 			time.Now().UTC().Format(time.RFC3339Nano),
 		); err != nil {
 			return fail(fmt.Errorf("record conversation schema migration: %w", err))
+		}
+		version = 3
+	}
+	if version < 4 {
+		if err := migrateTaskEventSequence(db); err != nil {
+			return fail(fmt.Errorf("apply task event sequence migration: %w", err))
+		}
+		if _, err := db.Exec(
+			"INSERT OR REPLACE INTO schema_migrations (version, description, applied_at) VALUES (4, 'per-task event sequence', ?)",
+			time.Now().UTC().Format(time.RFC3339Nano),
+		); err != nil {
+			return fail(fmt.Errorf("record task event sequence migration: %w", err))
 		}
 	}
 	if err := db.Ping(); err != nil {
@@ -607,7 +678,8 @@ func (s *Store) LatestCheckpointVersion(taskID string) (int, bool) {
 }
 
 // AppendTaskEvent durably records one safe lifecycle event and bounds the
-// retained event history for each task.
+// retained event history for each task. It returns the per-task monotonic
+// sequence cursor assigned by the trusted persistence layer.
 func (s *Store) AppendTaskEvent(taskID, eventType string, payload any) (int64, error) {
 	if !ValidTaskID(taskID) {
 		return 0, errors.New("invalid task identifier")
@@ -620,35 +692,62 @@ func (s *Store) AppendTaskEvent(taskID, eventType string, payload any) (int64, e
 		return 0, fmt.Errorf("encode task event: %w", err)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := s.db.Exec(
-		"INSERT INTO task_events (task_id, timestamp, type, payload) VALUES (?, ?, ?, ?)",
-		taskID, now, eventType, string(encoded),
-	)
+	tx, err := s.db.Begin()
 	if err != nil {
+		return 0, fmt.Errorf("begin task event transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var seq int64
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(seq), 0) + 1 FROM task_events WHERE task_id = ?`, taskID).Scan(&seq); err != nil {
+		return 0, fmt.Errorf("assign task event sequence: %w", err)
+	}
+	if eventType == "assistant.snapshot" {
+		if _, err := tx.Exec(`DELETE FROM task_events WHERE task_id = ? AND type = 'assistant.snapshot'`, taskID); err != nil {
+			return 0, fmt.Errorf("compact assistant snapshot: %w", err)
+		}
+	}
+	if _, err := tx.Exec(
+		"INSERT INTO task_events (task_id, seq, timestamp, type, payload) VALUES (?, ?, ?, ?, ?)",
+		taskID, seq, now, eventType, string(encoded),
+	); err != nil {
 		return 0, fmt.Errorf("append task event: %w", err)
 	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("read task event identifier: %w", err)
-	}
-	if _, err := s.db.Exec(`
+	if _, err := tx.Exec(`
 		DELETE FROM task_events
 		WHERE task_id = ? AND id NOT IN (
 			SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT ?
 		)`, taskID, taskID, maxEventsPerTask); err != nil {
 		return 0, fmt.Errorf("bound task event history: %w", err)
 	}
-	return id, nil
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit task event: %w", err)
+	}
+	return seq, nil
 }
 
-// GetTaskEventsAfter returns persisted events newer than a cursor.
+// ErrEventCursorExpired indicates a replay cursor is older than retained events.
+var ErrEventCursorExpired = errors.New("event cursor expired")
+
+// GetTaskEventsAfter returns persisted events newer than a per-task sequence cursor.
 func (s *Store) GetTaskEventsAfter(taskID string, after int64, limit int) ([]TaskEvent, error) {
 	if limit <= 0 || limit > maxEventsPerTask {
 		limit = maxEventsPerTask
 	}
+	if after < 0 {
+		after = 0
+	}
+	if after > 0 {
+		var minSeq sql.NullInt64
+		if err := s.db.QueryRow(`SELECT MIN(seq) FROM task_events WHERE task_id = ?`, taskID).Scan(&minSeq); err != nil {
+			return nil, fmt.Errorf("check task event cursor: %w", err)
+		}
+		if minSeq.Valid && after < minSeq.Int64-1 {
+			return nil, ErrEventCursorExpired
+		}
+	}
 	rows, err := s.db.Query(`
-		SELECT id, task_id, timestamp, type, COALESCE(payload, '{}')
-		FROM task_events WHERE task_id = ? AND id > ? ORDER BY id ASC LIMIT ?`,
+		SELECT id, seq, task_id, timestamp, type, COALESCE(payload, '{}')
+		FROM task_events WHERE task_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
 		taskID, after, limit,
 	)
 	if err != nil {
@@ -659,10 +758,14 @@ func (s *Store) GetTaskEventsAfter(taskID string, after int64, limit int) ([]Tas
 	for rows.Next() {
 		var event TaskEvent
 		var payload string
-		if err := rows.Scan(&event.ID, &event.TaskID, &event.Timestamp, &event.Type, &payload); err != nil {
+		var rowID int64
+		if err := rows.Scan(&rowID, &event.Seq, &event.TaskID, &event.Timestamp, &event.Type, &payload); err != nil {
 			return nil, fmt.Errorf("scan task event: %w", err)
 		}
+		event.ID = event.Seq
+		event.EventVersion = EventSchemaVersion
 		event.Payload = json.RawMessage(payload)
+		_ = rowID
 		events = append(events, event)
 	}
 	if err := rows.Err(); err != nil {

@@ -563,6 +563,18 @@ func (s *Server) handleTaskEvents(w http.ResponseWriter, r *http.Request, id str
 	}
 	events, unsubscribe, err := s.controller.SubscribeTaskEvents(id, after)
 	if err != nil {
+		if errors.Is(err, persistence.ErrEventCursorExpired) {
+			writeData(w, http.StatusGone, struct {
+				Task    persistence.TaskRecord `json:"task"`
+				Reason  string                 `json:"reason"`
+				Message string                 `json:"message"`
+			}{
+				Task:    record,
+				Reason:  "event_cursor_expired",
+				Message: "The requested event cursor is no longer retained. Use the returned task snapshot and reconnect from a current cursor.",
+			})
+			return
+		}
 		writeError(w, http.StatusServiceUnavailable, "event_stream_unavailable")
 		return
 	}
@@ -582,6 +594,12 @@ func (s *Server) handleTaskEvents(w http.ResponseWriter, r *http.Request, id str
 	writeSSE(w, "snapshot", 0, record)
 	flusher.Flush()
 
+	if isTerminalTaskStatus(record.Status) {
+		// Replay may still contain the terminal event; drain it before closing.
+		drainSSEEvents(w, flusher, events, 2*time.Second)
+		return
+	}
+
 	ticker := time.NewTicker(sseKeepAlive)
 	defer ticker.Stop()
 	for {
@@ -590,8 +608,15 @@ func (s *Server) handleTaskEvents(w http.ResponseWriter, r *http.Request, id str
 			if !open {
 				return
 			}
-			writeSSE(w, event.Type, event.ID, event)
+			seq := event.Seq
+			if seq == 0 {
+				seq = event.ID
+			}
+			writeSSE(w, event.Type, seq, event)
 			flusher.Flush()
+			if isTerminalTaskEvent(event) {
+				return
+			}
 		case <-ticker.C:
 			_, _ = io.WriteString(w, ": keep-alive\n\n")
 			flusher.Flush()
@@ -633,6 +658,52 @@ func writeSSE(w http.ResponseWriter, event string, id int64, data any) {
 		_, _ = fmt.Fprintf(w, "id: %d\n", id)
 	}
 	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, encoded)
+}
+
+func isTerminalTaskStatus(status string) bool {
+	switch status {
+	case "succeeded", "failed", "cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
+func isTerminalTaskEvent(event persistence.TaskEvent) bool {
+	if event.Type != "task_finished" {
+		return false
+	}
+	var payload struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return false
+	}
+	return isTerminalTaskStatus(payload.Status)
+}
+
+func drainSSEEvents(w http.ResponseWriter, flusher http.Flusher, events <-chan persistence.TaskEvent, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case event, open := <-events:
+			if !open {
+				return
+			}
+			seq := event.Seq
+			if seq == 0 {
+				seq = event.ID
+			}
+			writeSSE(w, event.Type, seq, event)
+			flusher.Flush()
+			if isTerminalTaskEvent(event) {
+				return
+			}
+		case <-timer.C:
+			return
+		}
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter) {

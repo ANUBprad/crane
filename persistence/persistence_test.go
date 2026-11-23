@@ -151,3 +151,37 @@ func TestTaskRecordsForAPI(t *testing.T) {
 		t.Fatalf("GetTaskRecord(missing) error = %v, want ErrTaskNotFound", err)
 	}
 }
+
+func TestTaskEventsArePerTaskSequenced(t *testing.T) {
+	store := newTestStore(t)
+	if _, err := store.CreateTask("seq-task", "queued", "input"); err != nil {
+		t.Fatal(err)
+	}
+	seq1, err := store.AppendTaskEvent("seq-task", "a", map[string]any{"n": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq2, err := store.AppendTaskEvent("seq-task", "b", map[string]any{"n": 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq1 != 1 || seq2 != 2 {
+		t.Fatalf("expected per-task seq 1,2 got %d,%d", seq1, seq2)
+	}
+	events, err := store.GetTaskEventsAfter("seq-task", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Seq != 2 || events[0].Type != "b" {
+		t.Fatalf("unexpected events: %#v", events)
+	}
+	for i := 0; i < maxEventsPerTask+5; i++ {
+		if _, err := store.AppendTaskEvent("seq-task", "x", map[string]any{"i": i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err = store.GetTaskEventsAfter("seq-task", 1, 10)
+	if !errors.Is(err, ErrEventCursorExpired) {
+		t.Fatalf("expected ErrEventCursorExpired, got %v", err)
+	}
+}

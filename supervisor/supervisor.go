@@ -57,6 +57,11 @@ type runningTask struct {
 	write  sync.Mutex
 	done   chan struct{}
 	once   sync.Once
+
+	assistantMu          sync.Mutex
+	assistantText        strings.Builder
+	assistantLastSnap    time.Time
+	assistantLastSnapLen int
 }
 
 func (r *runningTask) send(message any) error {
@@ -96,11 +101,27 @@ func (h *eventHub) subscribe(id string, after int64) (<-chan persistence.TaskEve
 	if len(h.subs[id]) >= maxEventSubscribers {
 		return nil, nil, errors.New("event subscriber limit reached")
 	}
-	replay, err := h.store.GetTaskEventsAfter(id, after, eventBufferSize)
-	if err != nil {
-		return nil, nil, err
+	replay := make([]persistence.TaskEvent, 0, eventBufferSize)
+	cursor := after
+	for {
+		page, err := h.store.GetTaskEventsAfter(id, cursor, eventBufferSize)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		replay = append(replay, page...)
+		cursor = page[len(page)-1].Seq
+		if len(page) < eventBufferSize {
+			break
+		}
 	}
-	sub := &eventSubscription{ch: make(chan persistence.TaskEvent, eventBufferSize)}
+	bufSize := eventBufferSize
+	if len(replay)+eventBufferSize > bufSize {
+		bufSize = len(replay) + eventBufferSize
+	}
+	sub := &eventSubscription{ch: make(chan persistence.TaskEvent, bufSize)}
 	for _, event := range replay {
 		sub.ch <- event
 	}
@@ -453,6 +474,36 @@ func (s *Supervisor) SubscribeTaskEvents(id string, after int64) (<-chan persist
 	return s.events.subscribe(id, after)
 }
 
+func (s *Supervisor) handleAssistantDelta(task *runningTask, taskID string, payload json.RawMessage) {
+	var p struct {
+		Delta string `json:"delta"`
+		Text  string `json:"text"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	delta := p.Delta
+	if delta == "" {
+		delta = p.Text
+	}
+	if delta != "" && task != nil {
+		task.assistantMu.Lock()
+		task.assistantText.WriteString(delta)
+		fullLen := task.assistantText.Len()
+		shouldSnap := task.assistantLastSnap.IsZero() || time.Since(task.assistantLastSnap) >= 2*time.Second || fullLen-task.assistantLastSnapLen >= 2048
+		var snapText string
+		if shouldSnap {
+			snapText = task.assistantText.String()
+			task.assistantLastSnap = time.Now()
+			task.assistantLastSnapLen = fullLen
+		}
+		task.assistantMu.Unlock()
+		if shouldSnap && strings.TrimSpace(snapText) != "" {
+			s.emitEventWithPersist(taskID, "assistant.snapshot", map[string]any{"text": snapText, "partial": true}, true)
+		}
+	}
+	// Publish ephemeral delta for live clients.
+	s.emitEventWithPersist(taskID, "assistant.delta", json.RawMessage(payload), false)
+}
+
 func (s *Supervisor) emitEvent(taskID, eventType string, payload any) {
 	s.emitEventWithPersist(taskID, eventType, payload, !ephemeralEventType(eventType))
 }
@@ -467,18 +518,20 @@ func ephemeralEventType(eventType string) bool {
 }
 
 func (s *Supervisor) emitEventWithPersist(taskID, eventType string, payload any, persist bool) {
-	var id int64
+	var seq int64
 	if persist {
 		var err error
-		id, err = s.store.AppendTaskEvent(taskID, eventType, payload)
+		seq, err = s.store.AppendTaskEvent(taskID, eventType, payload)
 		if err != nil {
 			return
 		}
 	}
-	s.events.publish(persistence.TaskEvent{
-		ID: id, TaskID: taskID, Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+	event := persistence.TaskEvent{
+		ID: seq, Seq: seq, EventVersion: persistence.EventSchemaVersion,
+		TaskID: taskID, Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 		Type: eventType, Payload: mustJSON(payload),
-	})
+	}
+	s.events.publish(event)
 }
 
 func mustJSON(value any) json.RawMessage {
@@ -734,6 +787,10 @@ func (s *Supervisor) handleProtocolFrame(id string, task *runningTask, frame []b
 		if err != nil {
 			return false
 		}
+		if event.EventType == "assistant.delta" {
+			s.handleAssistantDelta(task, id, event.Payload)
+			return false
+		}
 		s.emitEvent(id, event.EventType, json.RawMessage(event.Payload))
 	case python_protocol.TypeTaskResult:
 		result, err := python_protocol.DecodeTaskResult(frame)
@@ -797,12 +854,36 @@ func (s *Supervisor) finalize(id, status, result, taskError string, checkpoint [
 	if err := s.store.CompleteTask(id, status, result, taskError); err != nil {
 		return err
 	}
+	if text := s.finalAssistantText(id, result); strings.TrimSpace(text) != "" {
+		s.emitEventWithPersist(id, "assistant.snapshot", map[string]any{"text": text, "partial": false, "status": status}, true)
+	}
 	payload := map[string]any{"status": status}
 	if status == "failed" && taskError != "" {
 		payload["error"] = taskError
 	}
 	s.emitEvent(id, "task_finished", payload)
 	return nil
+}
+
+func (s *Supervisor) finalAssistantText(taskID, result string) string {
+	s.activeMu.Lock()
+	task := s.active[taskID]
+	s.activeMu.Unlock()
+	if task != nil {
+		task.assistantMu.Lock()
+		text := task.assistantText.String()
+		task.assistantMu.Unlock()
+		if strings.TrimSpace(text) != "" {
+			return text
+		}
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(result), &payload); err == nil {
+		if mo, _ := payload["model_output"].(string); strings.TrimSpace(mo) != "" {
+			return mo
+		}
+	}
+	return ""
 }
 
 func isTerminal(status string) bool {
