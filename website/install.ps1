@@ -56,8 +56,59 @@ try {
         throw 'Unexpected release signature metadata. Refusing to continue.'
     }
 
-    Write-Warning 'This release is not Authenticode-signed. The installer verifies SHA-256 integrity, not publisher authenticity.'
+    # Verify the downloaded installer and payload before executing any release code.
+    $manifestArtifacts = @{}
+    foreach ($item in $manifest.artifacts) {
+        if (-not $item.name -or $item.sha256 -notmatch '^[0-9a-fA-F]{64}    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "CRANE installer exited with code $LASTEXITCODE." }
+    Write-Host ''
+    Write-Host 'CRANE installation finished. Open a new PowerShell window and run: agent doctor' -ForegroundColor Green
+}
+catch {
+    Write-Error ("CRANE installation failed: " + $_.Exception.Message)
+    throw
+}
+finally {
+    Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+) {
+            throw 'Release manifest contains an invalid artifact entry.'
+        }
+        $manifestArtifacts[$item.name] = $item.sha256.ToLowerInvariant()
+    }
+    $checksumEntries = @{}
+    foreach ($line in (Get-Content -LiteralPath (Join-Path $tempRoot 'SHA256SUMS.txt'))) {
+        if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+)    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "CRANE installer exited with code $LASTEXITCODE." }
+    Write-Host ''
+    Write-Host 'CRANE installation finished. Open a new PowerShell window and run: agent doctor' -ForegroundColor Green
+}
+catch {
+    Write-Error ("CRANE installation failed: " + $_.Exception.Message)
+    throw
+}
+finally {
+    Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+) {
+            $checksumEntries[$Matches[2].Trim()] = $Matches[1].ToLowerInvariant()
+        }
+    }
+    foreach ($name in $manifestArtifacts.Keys) {
+        if (-not $checksumEntries.ContainsKey($name) -or $checksumEntries[$name] -ne $manifestArtifacts[$name]) {
+            throw "SHA256SUMS does not match the release manifest for $name."
+        }
+        $path = Join-Path $tempRoot $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Required release artifact was not downloaded: $name."
+        }
+        $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $manifestArtifacts[$name]) {
+            throw "SHA-256 verification failed for $name."
+        }
+    }
+
+    Write-Warning 'This release is not Authenticode-signed. SHA-256 checks verify integrity, not publisher authenticity.'
     $installer = Join-Path $tempRoot 'install.ps1'
+    Unblock-File -LiteralPath $installer
     & $installer -Action Install -ReleaseSource $tempRoot
     if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "CRANE installer exited with code $LASTEXITCODE." }
     Write-Host ''
