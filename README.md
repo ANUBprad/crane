@@ -40,6 +40,19 @@ CRANE's intended offline path is local model execution. Local Ollama support is 
 
 Hosted model providers or remote MCP endpoints are optional integrations. They must be explicitly configured and authorized; they are not the default execution path, and their use changes the data-egress boundary. See [SECURITY_AND_PRIVACY.md](SECURITY_AND_PRIVACY.md).
 
+## Project website and public installer
+
+The product website is deployed from `website/` through GitHub Pages:
+[CRANE website](https://anubprad.github.io/crane/).
+
+Once a stable GitHub Release has been published, install the latest Windows x64 build from PowerShell:
+
+```powershell
+irm https://anubprad.github.io/crane/install.ps1 | iex
+```
+
+The bootstrap downloads the release assets from this repository, checks the release metadata, and invokes the existing checksum-verifying installer. Review [website/install.ps1](website/install.ps1) before running it. Releases are currently unsigned: SHA-256 verifies artifact integrity, not publisher authenticity. The command will fail safely until a stable release exists. A tagged release (`vX.Y.Z`) triggers the Windows packaging and GitHub Release workflow.
+
 ## Windows installation and CLI commands
 
 Windows 10/11 x64 is the first supported target. Packaged installation uses PowerShell scripts and a private per-user runtime layout; end users do not need Go, Python, Node.js, Docker, Redis, or a source checkout.
