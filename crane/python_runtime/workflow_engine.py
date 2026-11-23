@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import stat
 import threading
 import time
 import uuid
@@ -1173,6 +1174,72 @@ def _default_generation_manifest(state: WorkflowState, spec: Dict[str, Any]) -> 
     ]
 
 
+MAX_REPAIR_CONTEXT_FILES = 24
+MAX_REPAIR_CONTEXT_FILE_CHARS = 4000
+MAX_REPAIR_CONTEXT_CHARS = 24000
+
+
+def _generation_repair_source_context(state: WorkflowState, workspace: Any) -> str:
+    """Read a bounded, redacted snapshot of generated files relevant to repair.
+
+    Only paths already present in the validated generation manifest or apply
+    records are considered. The workspace is revalidated for every path; no
+    directory walk or arbitrary user-file discovery is performed.
+    """
+    raw_paths: List[str] = []
+    for records in (state.generation.get("manifest"), state.generation.get("applied")):
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if isinstance(record, dict):
+                value = record.get("path")
+                if isinstance(value, str) and value.strip():
+                    raw_paths.append(value)
+
+    unique_paths: List[str] = []
+    seen: set[str] = set()
+    for rel_path in raw_paths:
+        key = os.path.normcase(rel_path.replace("\\", "/"))
+        if key not in seen:
+            seen.add(key)
+            unique_paths.append(rel_path)
+    if not unique_paths:
+        return "(No validated generated file paths are available.)"
+
+    sections: List[str] = []
+    total_chars = 0
+    for rel_path in unique_paths[:MAX_REPAIR_CONTEXT_FILES]:
+        remaining = MAX_REPAIR_CONTEXT_CHARS - total_chars
+        if remaining <= 0:
+            break
+        try:
+            source_path = gen.validate_relative_path(workspace, rel_path)
+            info = gen._lstat_path(source_path, rel_path)
+            if info is None or not stat.S_ISREG(info.st_mode):
+                continue
+            with source_path.open("r", encoding="utf-8", errors="replace") as stream:
+                content = stream.read(MAX_REPAIR_CONTEXT_FILE_CHARS + 1)
+        except (OSError, gen.GenerationError):
+            continue
+
+        truncated = len(content) > MAX_REPAIR_CONTEXT_FILE_CHARS
+        content = content[:MAX_REPAIR_CONTEXT_FILE_CHARS]
+        content = gen.redact_validation_result({"source": content}).get("source", "")
+        content = str(content)[:remaining]
+        if not content:
+            continue
+        suffix = "\n...[file context truncated]" if truncated else ""
+        section = f"--- {rel_path} ---\n{content}{suffix}"
+        if len(section) > remaining:
+            section = section[:remaining]
+        sections.append(section)
+        total_chars += len(section)
+
+    if not sections:
+        return "(No readable regular generated source files were found in the authorized workspace.)"
+    return "\n\n".join(sections)
+
+
 async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[str, Any]:
     if not state.workspace:
         return {"status": "failed", "error": "No authorized workspace provided for generation task"}
@@ -1356,13 +1423,19 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
         if not isinstance(repair_manifest, list) or not repair_manifest:
             repair_manifest = None
             if selected_provider() == "ollama":
+                source_context = _generation_repair_source_context(state, ws)
                 prompt = (
-                    "Return ONLY JSON with key 'files' as array of {path, operation, description, content} for minimal repairs. "
+                    "Return ONLY JSON with key 'files' as an array of {path, operation, description, content} for minimal repairs. "
                     "operation must be exactly \"write\" for new or updated files or exactly \"delete\" for removals. "
-                    "Only include files that must change. Paths must be relative to workspace. No placeholders.\n"
+                    "Only include files that must change. Paths must be relative to workspace. Provide complete file contents, never patches or placeholders. "
+                    "Diagnose the actual validation output against the current source below. Follow tracebacks and import chains; for missing imports/modules, "
+                    "check the referenced module path, package __init__.py files, symbol names, and declared dependencies. Fix the root cause rather than "
+                    "suppressing the error or adding a stub. Preserve existing public behavior and unrelated code. Include every file required for a coherent fix.\n"
                     f"Objective: {state.objective}\n"
-                    f"Failures: {json.dumps(failed, ensure_ascii=False)[:12000]}\n"
+                    f"Validation failures: {json.dumps(failed, ensure_ascii=False)[:12000]}\n"
                     f"Current manifest paths: {json.dumps([m.get('path') for m in (state.generation.get('manifest') or []) if isinstance(m, dict)], ensure_ascii=False)}\n"
+                    "Current generated workspace source (fresh disk reads, bounded and secret-redacted):\n"
+                    f"{source_context}\n"
                 )
                 obj = await _model_json(state, prompt, "You produce strict JSON minimal repair file operations.")
                 if isinstance(obj, dict) and isinstance(obj.get("files"), list):

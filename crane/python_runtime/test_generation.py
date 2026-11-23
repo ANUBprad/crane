@@ -497,6 +497,64 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(replayed["approval_scope"], scope)
             self.assertNotIn(scope, state.granted_approvals)
 
+    async def test_repair_prompt_includes_current_source_and_redacts_secrets(self):
+        state, step = self._state_and_step("repair_project")
+        state.objective = "Repair the generated FastAPI application"
+        self.ws.joinpath("app").mkdir()
+        files = [
+            {
+                "path": "app/main.py",
+                "operation": "write",
+                "content": "from app.helpers import build_app\\nAPI_KEY = 'canary-secret-value'\\n",
+            },
+            {
+                "path": "app/helpers.py",
+                "operation": "write",
+                "content": "def build_app():\\n    return 'ok'\\n",
+            },
+            {"path": "app/__init__.py", "operation": "write", "content": ""},
+        ]
+        ops = gen.validate_file_operations(self.ws, files)
+        for op in ops:
+            target = gen.validate_relative_path(self.ws, op.path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(op.content, encoding="utf-8")
+        state.generation["manifest"] = [op.to_dict() for op in ops]
+        state.generation["applied"] = [
+            {"path": op.path, "operation": "write", "status": "written"} for op in ops
+        ]
+        state.generation["validation_results"] = [{
+            "name": "pytest",
+            "status": "failed",
+            "stderr": "ModuleNotFoundError: No module named 'app.helpers'",
+        }]
+        prompts = []
+
+        async def capture_prompt(current_state, prompt, system=None):
+            prompts.append(prompt)
+            return {
+                "files": [{
+                    "path": "app/main.py",
+                    "operation": "write",
+                    "description": "Repair the failing import",
+                    "content": "from app.helpers import build_app\\n",
+                }],
+            }
+
+        with mock.patch.dict(os.environ, {"CRANE_MODEL_PROVIDER": "ollama"}), \
+                mock.patch.object(workflow_engine, "_model_json", new=capture_prompt), \
+                mock.patch("crane.python_runtime.protocol.write_stdout"):
+            result = await workflow_engine._exec_generation_step(state, step)
+
+        self.assertEqual(result["status"], "blocked", result)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("ModuleNotFoundError", prompts[0])
+        self.assertIn("from app.helpers import build_app", prompts[0])
+        self.assertIn("def build_app()", prompts[0])
+        self.assertIn("API_KEY = '[redacted]'", prompts[0])
+        self.assertNotIn("canary-secret-value", prompts[0])
+        self.assertIn("package __init__.py", prompts[0])
+
     async def test_repair_requires_exact_manifest_digest_and_never_regenerates_under_grant(self):
         state, step = self._state_and_step("repair_project")
         state.generation["validation_results"] = [{"name": "test", "status": "failed"}]
