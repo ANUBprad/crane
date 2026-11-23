@@ -734,3 +734,66 @@ func TestEventStreamReplaysPersistedEventsWithCursor(t *testing.T) {
 		t.Fatalf("unexpected live event: %#v", live)
 	}
 }
+
+
+func TestEventStreamResumesFromLastEventIDHeader(t *testing.T) {
+	state := newTestState(t)
+	seq, err := state.store.AppendTaskEvent("api-running", "step_started", map[string]any{"step_id": "resume"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(state.newServer(t))
+	defer httpServer.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, httpServer.URL+"/v1/tasks/api-running/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+state.token)
+	req.Header.Set("Last-Event-ID", "0")
+	response, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("Last-Event-ID stream status = %d, body = %s", response.StatusCode, body)
+	}
+	reader := bufio.NewReader(response.Body)
+	if snapshot := readSSEEvent(t, reader); snapshot.name != "snapshot" {
+		t.Fatalf("unexpected snapshot event: %#v", snapshot)
+	}
+	event := readSSEEvent(t, reader)
+	if event.id != strconv.FormatInt(seq, 10) || event.name != "step_started" {
+		t.Fatalf("unexpected Last-Event-ID replay event: %#v", event)
+	}
+}
+
+func TestEventStreamExpiredCursorReturnsTaskSnapshot(t *testing.T) {
+	state := newTestState(t)
+	for i := 0; i < 1010; i++ {
+		if _, err := state.store.AppendTaskEvent("api-running", "progress", map[string]any{"index": i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	httpServer := httptest.NewServer(state.newServer(t))
+	defer httpServer.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+	status, _, body := apiRequest(t, client, httpServer.URL, http.MethodGet, "/v1/tasks/api-running/events?cursor=1", state.token, nil)
+	if status != http.StatusGone {
+		t.Fatalf("expired cursor status = %d, body = %s", status, body)
+	}
+	var response struct {
+		Data struct {
+			Reason string `json:"reason"`
+			Task   persistence.TaskRecord `json:"task"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Data.Reason != "event_cursor_expired" || response.Data.Task.ID != "api-running" {
+		t.Fatalf("expired cursor response = %#v", response.Data)
+	}
+}

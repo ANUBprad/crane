@@ -59,32 +59,41 @@ class GenerationSafetyTests(unittest.TestCase):
     def test_rejects_windows_directory_junction_escape(self):
         if os.name != "nt":
             self.skipTest("Windows junction validation")
-        outside = self.ws.parent / (self.ws.name + "-outside")
-        outside.mkdir()
+        outside_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(outside_temp.cleanup)
+        outside = Path(outside_temp.name)
         junction = self.ws / "linked"
         created = subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside)], capture_output=True, text=True, check=False)
         if created.returncode != 0:
             self.skipTest("directory junction creation is unavailable to this runner")
-        with self.assertRaises(gen.GenerationError):
-            gen.validate_relative_path(self.ws, "linked/escape.txt")
+        try:
+            with self.assertRaises(gen.GenerationError):
+                gen.validate_relative_path(self.ws, "linked/escape.txt")
+        finally:
+            os.rmdir(junction)
 
     def test_rejects_staging_root_junction(self):
         if os.name != "nt":
             self.skipTest("Windows junction validation")
-        outside = self.ws.parent / (self.ws.name + "-staging-outside")
-        outside.mkdir()
+        outside_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(outside_temp.cleanup)
+        outside = Path(outside_temp.name)
         junction = self.ws / ".crane-staging"
         created = subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside)], capture_output=True, text=True, check=False)
         if created.returncode != 0:
             self.skipTest("directory junction creation is unavailable to this runner")
         ops = gen.validate_file_operations(self.ws, [{"path": "src/app.py", "operation": "write", "content": "print('safe')"}])
-        with self.assertRaises(gen.GenerationError):
-            gen.stage_operations(self.ws, ops)
-        self.assertFalse((outside / "src" / "app.py").exists())
+        try:
+            with self.assertRaises(gen.GenerationError):
+                gen.stage_operations(self.ws, ops)
+            self.assertFalse((outside / "src" / "app.py").exists())
+        finally:
+            os.rmdir(junction)
 
     def test_stage_reference_cannot_be_forged_outside_staging_root(self):
-        outside = self.ws.parent / (self.ws.name + "-outside-stage")
-        outside.mkdir()
+        outside_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(outside_temp.cleanup)
+        outside = Path(outside_temp.name)
         external_file = outside / "app.py"
         external_file.write_text("do not read or apply", encoding="utf-8")
         ops = gen.validate_file_operations(self.ws, [{"path": "app.py", "operation": "write", "content": "print('safe')"}])
@@ -98,7 +107,9 @@ class GenerationSafetyTests(unittest.TestCase):
         self.assertEqual(external_file.read_text(encoding="utf-8"), "do not read or apply")
 
     def test_cleanup_stage_refuses_outside_numeric_directory(self):
-        outside = self.ws.parent / (self.ws.name + "-123")
+        outside_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(outside_temp.cleanup)
+        outside = Path(outside_temp.name) / "123"
         outside.mkdir()
         marker = outside / "keep.txt"
         marker.write_text("preserve", encoding="utf-8")
@@ -142,6 +153,38 @@ class GenerationSafetyTests(unittest.TestCase):
         self.assertEqual(applied["count"], 1)
         self.assertEqual((self.ws / "a.txt").read_text(encoding="utf-8"), "new")
 
+    def test_overwrite_approval_is_scoped_to_explicit_paths(self):
+        approved = self.ws / "approved.txt"
+        approved.write_text("old approved", encoding="utf-8")
+        ops = gen.validate_file_operations(self.ws, [{"path": "approved.txt", "operation": "write", "content": "new approved"}])
+        stage = gen.stage_operations(self.ws, ops)
+        try:
+            gen.apply_staged_operations(self.ws, stage, approved_overwrite_paths=["approved.txt"])
+        finally:
+            gen.cleanup_stage(stage, self.ws)
+        self.assertEqual(approved.read_text(encoding="utf-8"), "new approved")
+
+        unapproved = self.ws / "unapproved.txt"
+        unapproved.write_text("preserve", encoding="utf-8")
+        ops = gen.validate_file_operations(self.ws, [{"path": "unapproved.txt", "operation": "write", "content": "must not apply"}])
+        stage = gen.stage_operations(self.ws, ops)
+        try:
+            with self.assertRaises(gen.GenerationError):
+                gen.apply_staged_operations(self.ws, stage, approved_overwrite_paths=["approved.txt"])
+        finally:
+            gen.cleanup_stage(stage, self.ws)
+        self.assertEqual(unapproved.read_text(encoding="utf-8"), "preserve")
+
+    def test_validation_output_is_bounded_and_git_write_commands_are_rejected(self):
+        command = gen.ValidationCommand(
+            name="bounded_output", argv=["python", "-c", "print('x' * 50000)"], cwd=".", timeout_seconds=20,
+        )
+        result = gen.run_validation_command(self.ws, command)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertLessEqual(len(result["stdout"].encode("utf-8")), gen.MAX_COMMAND_OUTPUT)
+        self.assertTrue(result["stdout_truncated"])
+        self.assertFalse(gen.allowed_validation_command(["git", "push", "origin", "main"]))
+        self.assertTrue(gen.allowed_validation_command(["python.exe", "-m", "py_compile", "app.py"]))
     def test_duplicate_paths_rejected(self):
         with self.assertRaises(gen.GenerationError):
             gen.validate_file_operations(self.ws, [

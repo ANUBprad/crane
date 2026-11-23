@@ -14,9 +14,8 @@ import stat
 import subprocess
 import tempfile
 import time
-from pathlib import PureWindowsPath
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
 MAX_FILE_BYTES = 512 * 1024
@@ -412,9 +411,21 @@ def summarize_changes(workspace: Path, ops: List[FileOperation]) -> Dict[str, An
     return summary
 
 
-def apply_staged_operations(workspace: Path, stage: Dict[str, Any], approved_overwrites: bool = False) -> Dict[str, Any]:
+def apply_staged_operations(
+    workspace: Path,
+    stage: Dict[str, Any],
+    approved_overwrites: bool = False,
+    approved_overwrite_paths: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     ws = _workspace_root(workspace)
-    stage_root, stage_dir = _validated_stage_dir(ws, stage)
+    _, stage_dir = _validated_stage_dir(ws, stage)
+    approved_paths = set()
+    if approved_overwrite_paths is not None:
+        if not isinstance(approved_overwrite_paths, list) or len(approved_overwrite_paths) > MAX_FILES:
+            raise GenerationError("Approved overwrite path list is invalid.")
+        for approved_path in approved_overwrite_paths:
+            approved_target = validate_relative_path(ws, approved_path)
+            approved_paths.add(_norm_case(approved_target.relative_to(ws).as_posix()))
     _assert_no_reparse_tree(stage_dir)
     files = stage.get("files")
     if not isinstance(files, list) or not files or len(files) > MAX_FILES:
@@ -427,7 +438,7 @@ def apply_staged_operations(workspace: Path, stage: Dict[str, Any], approved_ove
             raise GenerationError("Staging manifest contains an invalid entry.")
         rel = record.get("path")
         operation = record.get("operation")
-        if operation not in {"write", "delete"}:
+        if not isinstance(operation, str) or operation not in {"write", "delete"}:
             raise GenerationError(f"Invalid staged operation: {operation!r}")
         if not isinstance(rel, str):
             raise GenerationError("Staged file path must be a string.")
@@ -448,7 +459,8 @@ def apply_staged_operations(workspace: Path, stage: Dict[str, Any], approved_ove
 
         target_info = _lstat_path(target, rel)
         exists = target_info is not None
-        if exists and not approved_overwrites:
+        overwrite_allowed = approved_overwrites or _norm_case(target.relative_to(ws).as_posix()) in approved_paths
+        if exists and not overwrite_allowed:
             raise GenerationError(f"Overwrite approval required: {rel}")
         if target_info is not None and not stat.S_ISREG(target_info.st_mode):
             raise GenerationError(f"Refusing to replace a non-regular file: {rel}")
@@ -481,11 +493,11 @@ def apply_staged_operations(workspace: Path, stage: Dict[str, Any], approved_ove
             # after collision inspection cannot be overwritten accidentally.
             _safe_directory_tree(ws, parts[:-1], create=False)
             latest = _lstat_path(target, rel)
-            if latest is not None and not approved_overwrites:
+            if latest is not None and not overwrite_allowed:
                 raise GenerationError(f"Target appeared after staging; overwrite approval required: {rel}")
             if latest is not None and not stat.S_ISREG(latest.st_mode):
                 raise GenerationError(f"Target changed to a non-regular file: {rel}")
-            if approved_overwrites:
+            if overwrite_allowed:
                 os.replace(temporary_name, target)
             else:
                 try:
@@ -520,82 +532,104 @@ def cleanup_stage(stage: Dict[str, Any], workspace: Path) -> bool:
 def allowed_validation_command(argv: List[str]) -> bool:
     if not argv or not isinstance(argv, list):
         return False
-    cmd = os.path.basename(str(argv[0])).lower()
-    allowed = {
-        "python", "python3", "py",
-        "pytest",
-        "node", "npm", "npx",
-        "go", "gofmt",
-        "git",  # read-only status/diff checks; execution layer can further restrict
-        "cargo",
-        "dotnet",
-    }
-    return cmd in allowed
+    executable = str(argv[0]).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if executable.endswith(".exe"):
+        executable = executable[:-4]
+    allowed = {"python", "python3", "py", "pytest", "node", "npm", "npx", "go", "gofmt", "cargo", "dotnet"}
+    return executable in allowed
+
+
+def _drain_bounded(stream: Any, limit: int, results: Dict[str, Any], key: str) -> None:
+    captured = bytearray()
+    truncated = False
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            remaining = max(0, limit - len(captured))
+            if remaining:
+                captured.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                truncated = True
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+    results[key] = (bytes(captured), truncated)
 
 
 def run_validation_command(workspace: Path, command: ValidationCommand) -> Dict[str, Any]:
-    ws = workspace.resolve(strict=True)
+    ws = _workspace_root(workspace)
     argv = [str(a) for a in command.argv if str(a)]
     if not argv:
         return {"name": command.name, "status": "failed", "error": "empty command"}
     if not allowed_validation_command(argv):
         return {"name": command.name, "status": "failed", "error": f"command not allowed: {argv[0]}"}
-    # Prevent shell execution; use argument array only.
     cwd = validate_relative_path(ws, command.cwd) if command.cwd not in {"", "."} else ws
-    if cwd.exists() and cwd.is_file():
-        return {"name": command.name, "status": "failed", "error": "cwd must be a directory"}
-    cwd.mkdir(parents=True, exist_ok=True)
+    cwd_info = _lstat_path(cwd, str(cwd))
+    if cwd_info is None or not stat.S_ISDIR(cwd_info.st_mode):
+        return {"name": command.name, "status": "failed", "error": "cwd must be an existing directory inside the workspace"}
 
     timeout = max(1, min(int(command.timeout_seconds or DEFAULT_COMMAND_TIMEOUT_SECONDS), MAX_COMMAND_TIMEOUT_SECONDS))
     env = os.environ.copy()
-    # Avoid leaking common secret env vars to generated project checks where possible? Keep minimal; don't blanket remove PATH.
-    for k in list(env.keys()):
-        if re.search(r"(TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)", k, re.IGNORECASE):
-            env.pop(k, None)
+    for key in list(env.keys()):
+        if re.search(r"(TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)", key, re.IGNORECASE):
+            env.pop(key, None)
 
     start = time.time()
+    process = None
+    results: Dict[str, Any] = {}
+    readers = []
+    timed_out = False
     try:
-        proc = subprocess.run(
-            argv,
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            shell=False,
+        process = subprocess.Popen(
+            argv, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, env=env, shell=False, close_fds=True,
         )
-        stdout = (proc.stdout or "")[:MAX_COMMAND_OUTPUT]
-        stderr = (proc.stderr or "")[:MAX_COMMAND_OUTPUT]
-        return {
-            "name": command.name,
-            "argv": argv,
-            "status": "succeeded" if proc.returncode == 0 else "failed",
-            "exit_code": proc.returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "duration_ms": int((time.time() - start) * 1000),
-        }
-    except subprocess.TimeoutExpired as exc:
-        stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-        stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
-        return {
-            "name": command.name,
-            "argv": argv,
-            "status": "failed",
-            "error": f"timeout after {timeout}s",
-            "stdout": stdout[:MAX_COMMAND_OUTPUT],
-            "stderr": stderr[:MAX_COMMAND_OUTPUT],
-            "duration_ms": int((time.time() - start) * 1000),
-        }
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "name": command.name,
-            "argv": argv,
-            "status": "failed",
-            "error": str(exc),
-            "duration_ms": int((time.time() - start) * 1000),
-        }
+        for key, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
+            if pipe is not None:
+                reader = threading.Thread(target=_drain_bounded, args=(pipe, MAX_COMMAND_OUTPUT, results, key), daemon=True)
+                reader.start()
+                readers.append(reader)
+        try:
+            exit_code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            exit_code = process.wait()
+        for reader in readers:
+            reader.join(timeout=1.0)
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        for reader in readers:
+            reader.join(timeout=0.25)
 
+        stdout_bytes, stdout_truncated = results.get("stdout", (b"", False))
+        stderr_bytes, stderr_truncated = results.get("stderr", (b"", False))
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        base = {
+            "name": command.name, "argv": argv, "exit_code": exit_code,
+            "stdout": stdout, "stderr": stderr,
+            "stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated,
+            "duration_ms": int((time.time() - start) * 1000),
+        }
+        if timed_out:
+            return {**base, "status": "failed", "error": f"timeout after {timeout}s"}
+        return {**base, "status": "succeeded" if exit_code == 0 else "failed"}
+    except Exception as exc:  # noqa: BLE001
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        return {"name": command.name, "argv": argv, "status": "failed", "error": str(exc), "duration_ms": int((time.time() - start) * 1000)}
 
 def default_validation_commands(workspace: Path) -> List[ValidationCommand]:
     ws = workspace.resolve(strict=True)

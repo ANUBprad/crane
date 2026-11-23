@@ -82,7 +82,7 @@ func TestTaskStreamRendererJSONLIsValidAndDeduplicated(t *testing.T) {
 	event := localclient.TaskEvent{
 		TaskID: "task-json", Seq: 1, EventVersion: "1", Type: "step_started",
 		Timestamp: "2026-11-23T00:00:00Z",
-		Payload: json.RawMessage(`{"step_id":"generate"}`),
+		Payload:   json.RawMessage(`{"step_id":"generate"}`),
 	}
 	renderer.HandleEvent(event)
 	renderer.HandleEvent(event)

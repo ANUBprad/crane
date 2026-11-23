@@ -1173,7 +1173,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
         for f in stage.get("files", []):
             if isinstance(f, dict):
                 _event(state.task_id, "generation.file.staged", {"path": f.get("path"), "operation": f.get("operation")})
-        applied = gen.apply_staged_operations(ws, stage, approved_overwrites=True)
+        applied = gen.apply_staged_operations(ws, stage, approved_overwrite_paths=overwrite_paths)
         state.generation["applied"] = applied.get("applied", [])
         state.generation["status"] = "files_applied"
         for rec in state.generation["applied"]:
@@ -1243,28 +1243,43 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             state.generation["pending_approval"] = {"scope": repair_scope, "reason": "Approval required before applying repair changes."}
             _event(state.task_id, "approval_required", {"scope": repair_scope})
             return {"status": "blocked", "error": "approval_required", "approval_scope": repair_scope}
-        state.generation["repair_attempts"] = attempts + 1
-        _event(state.task_id, "repair.started", {"attempt": attempts + 1})
-        # Ask model for focused repair manifest; fallback: report failure.
-        repair_manifest = None
-        if selected_provider() == "ollama":
-            prompt = (
-                "Return ONLY JSON with key 'files' as array of {path, operation, description, content} for minimal repairs. "
-                "Only include files that must change. Paths must be relative to workspace. No placeholders.\n"
-                f"Objective: {state.objective}\n"
-                f"Failures: {json.dumps(failed, ensure_ascii=False)[:12000]}\n"
-                f"Current manifest paths: {json.dumps([m.get('path') for m in (state.generation.get('manifest') or []) if isinstance(m, dict)], ensure_ascii=False)}\n"
-            )
-            obj = await _model_json(state, prompt, "You produce strict JSON minimal repair file operations.")
-            if isinstance(obj, dict) and isinstance(obj.get("files"), list):
-                repair_manifest = obj.get("files")
+        # Reuse the structured repair manifest across approval pauses.
+        repair_manifest = state.generation.get("pending_repair_manifest")
+        if not isinstance(repair_manifest, list) or not repair_manifest:
+            repair_manifest = None
+            if selected_provider() == "ollama":
+                prompt = (
+                    "Return ONLY JSON with key 'files' as array of {path, operation, description, content} for minimal repairs. "
+                    "Only include files that must change. Paths must be relative to workspace. No placeholders.\n"
+                    f"Objective: {state.objective}\n"
+                    f"Failures: {json.dumps(failed, ensure_ascii=False)[:12000]}\n"
+                    f"Current manifest paths: {json.dumps([m.get('path') for m in (state.generation.get('manifest') or []) if isinstance(m, dict)], ensure_ascii=False)}\n"
+                )
+                obj = await _model_json(state, prompt, "You produce strict JSON minimal repair file operations.")
+                if isinstance(obj, dict) and isinstance(obj.get("files"), list):
+                    repair_manifest = obj.get("files")
         if not repair_manifest:
             return {"status": "failed", "error": "Unable to generate repair plan; manual review required", "output": {"validation_results": results}}
         try:
             ops = gen.validate_file_operations(ws, repair_manifest)
+            collisions = gen.inspect_collisions(ws, ops)
+            overwrite_paths = [item["path"] for item in collisions if item.get("exists")]
+            overwrite_scope = _gen_scope(state, "overwrite")
+            if overwrite_paths and not _has_grant(state, overwrite_scope):
+                state.generation["pending_repair_manifest"] = [op.to_dict() for op in ops]
+                state.generation["pending_approval"] = {
+                    "scope": overwrite_scope,
+                    "reason": "Repair will overwrite existing workspace files.",
+                    "paths": overwrite_paths,
+                }
+                _event(state.task_id, "approval_required", {"scope": overwrite_scope, "paths": overwrite_paths[:50], "repair": True})
+                return {"status": "blocked", "error": "approval_required", "approval_scope": overwrite_scope, "paths": overwrite_paths[:50]}
+            state.generation["repair_attempts"] = attempts + 1
+            _event(state.task_id, "repair.started", {"attempt": attempts + 1})
             stage = gen.stage_operations(ws, ops)
-            applied = gen.apply_staged_operations(ws, stage, approved_overwrites=True)
+            applied = gen.apply_staged_operations(ws, stage, approved_overwrite_paths=overwrite_paths)
             gen.cleanup_stage(stage, ws)
+            state.generation.pop("pending_repair_manifest", None)
         except Exception as exc:  # noqa: BLE001
             return {"status": "failed", "error": f"Repair apply failed: {exc}"}
         # Re-run validations
