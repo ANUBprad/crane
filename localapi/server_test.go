@@ -735,7 +735,6 @@ func TestEventStreamReplaysPersistedEventsWithCursor(t *testing.T) {
 	}
 }
 
-
 func TestEventStreamResumesFromLastEventIDHeader(t *testing.T) {
 	state := newTestState(t)
 	firstSeq, err := state.store.AppendTaskEvent("api-running", "step_started", map[string]any{"step_id": "already_seen"})
@@ -790,7 +789,7 @@ func TestEventStreamExpiredCursorReturnsTaskSnapshot(t *testing.T) {
 	}
 	var response struct {
 		Data struct {
-			Reason string `json:"reason"`
+			Reason string                 `json:"reason"`
 			Task   persistence.TaskRecord `json:"task"`
 		} `json:"data"`
 	}
