@@ -336,13 +336,13 @@ function Read-Manifest([string]$path) {
         throw 'This installer only accepts artifacts that explicitly declare no signature; it cannot verify the declared scheme.'
     }
     $artifacts = @(Get-Field $manifest 'artifacts')
-    if ($artifacts.Count -lt 4) { throw 'The release manifest artifact list is incomplete.' }
+    if ($artifacts.Count -lt 5) { throw 'The release manifest artifact list is incomplete.' }
     $seen = @{}
     foreach ($artifact in $artifacts) {
         $name = [string](Get-Field $artifact 'name')
         Assert-SafeArtifactName $name
         $kind = [string](Get-Field $artifact 'kind')
-        if ($kind -notin @('payload', 'installer', 'uninstaller', 'dependency_lock')) { throw "Unknown artifact kind: $kind" }
+        if ($kind -notin @('payload', 'installer', 'uninstaller', 'dependency_lock', 'sbom')) { throw "Unknown artifact kind: $kind" }
         if ($seen.ContainsKey($kind)) { throw "Duplicate artifact kind: $kind" }
         $seen[$kind] = $true
         $hash = [string](Get-Field $artifact 'sha256')
@@ -350,7 +350,7 @@ function Read-Manifest([string]$path) {
         $size = [string](Get-Field $artifact 'size')
         if ($size -notmatch '^\d+$' -or [int64]$size -le 0) { throw "Invalid size for artifact $name." }
     }
-    foreach ($kind in @('payload', 'installer', 'uninstaller', 'dependency_lock')) {
+    foreach ($kind in @('payload', 'installer', 'uninstaller', 'dependency_lock', 'sbom')) {
         if (-not $seen.ContainsKey($kind)) { throw "The release manifest is missing the $kind artifact." }
     }
     return $manifest
