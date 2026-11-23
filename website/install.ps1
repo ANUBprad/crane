@@ -30,13 +30,19 @@ try {
     )
     $assets = @{}
     foreach ($asset in $release.assets) {
-        if ($asset.name -and $asset.browser_download_url) { $assets[$asset.name] = $asset.browser_download_url }
+        if ($asset.name -and $asset.browser_download_url) {
+            $assets[$asset.name] = $asset.browser_download_url
+        }
     }
     foreach ($name in $required) {
-        if (-not $assets.ContainsKey($name)) { throw "Release $($release.tag_name) is incomplete: missing $name." }
+        if (-not $assets.ContainsKey($name)) {
+            throw "Release $($release.tag_name) is incomplete: missing $name."
+        }
     }
     $payload = @($release.assets | Where-Object { $_.name -match '^crane-windows-x64-.+\.zip$' })
-    if ($payload.Count -ne 1) { throw 'Release must contain exactly one Windows x64 runtime archive.' }
+    if ($payload.Count -ne 1) {
+        throw 'Release must contain exactly one Windows x64 runtime archive.'
+    }
     $assets[$payload[0].name] = $payload[0].browser_download_url
 
     foreach ($name in ($required + $payload[0].name)) {
@@ -56,42 +62,22 @@ try {
         throw 'Unexpected release signature metadata. Refusing to continue.'
     }
 
-    # Verify the downloaded installer and payload before executing any release code.
+    # Verify every downloaded artifact before executing any release code.
     $manifestArtifacts = @{}
     foreach ($item in $manifest.artifacts) {
-        if (-not $item.name -or $item.sha256 -notmatch '^[0-9a-fA-F]{64}    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "CRANE installer exited with code $LASTEXITCODE." }
-    Write-Host ''
-    Write-Host 'CRANE installation finished. Open a new PowerShell window and run: agent doctor' -ForegroundColor Green
-}
-catch {
-    Write-Error ("CRANE installation failed: " + $_.Exception.Message)
-    throw
-}
-finally {
-    Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
-}
-) {
+        if ([string]::IsNullOrWhiteSpace([string]$item.name) -or ([string]$item.sha256) -notmatch '^[0-9a-fA-F]{64}$') {
             throw 'Release manifest contains an invalid artifact entry.'
         }
         $manifestArtifacts[$item.name] = $item.sha256.ToLowerInvariant()
     }
+
     $checksumEntries = @{}
     foreach ($line in (Get-Content -LiteralPath (Join-Path $tempRoot 'SHA256SUMS.txt'))) {
-        if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+)    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "CRANE installer exited with code $LASTEXITCODE." }
-    Write-Host ''
-    Write-Host 'CRANE installation finished. Open a new PowerShell window and run: agent doctor' -ForegroundColor Green
-}
-catch {
-    Write-Error ("CRANE installation failed: " + $_.Exception.Message)
-    throw
-}
-finally {
-    Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
-}
-) {
+        if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+)$') {
             $checksumEntries[$Matches[2].Trim()] = $Matches[1].ToLowerInvariant()
         }
     }
+
     foreach ($name in $manifestArtifacts.Keys) {
         if (-not $checksumEntries.ContainsKey($name) -or $checksumEntries[$name] -ne $manifestArtifacts[$name]) {
             throw "SHA256SUMS does not match the release manifest for $name."
@@ -110,7 +96,9 @@ finally {
     $installer = Join-Path $tempRoot 'install.ps1'
     Unblock-File -LiteralPath $installer
     & $installer -Action Install -ReleaseSource $tempRoot
-    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "CRANE installer exited with code $LASTEXITCODE." }
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+        throw "CRANE installer exited with code $LASTEXITCODE."
+    }
     Write-Host ''
     Write-Host 'CRANE installation finished. Open a new PowerShell window and run: agent doctor' -ForegroundColor Green
 }
