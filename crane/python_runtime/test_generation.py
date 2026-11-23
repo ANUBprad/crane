@@ -395,6 +395,31 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             workflow_engine.WorkflowState(task_id="budget", user_input="test", workspace=str(self.ws))
         )))
 
+    async def test_failed_generation_validation_routes_to_repair(self):
+        state = workflow_engine.WorkflowState(
+            task_id="validation-recovery", user_input="test", workspace=str(self.ws),
+        )
+        state.generation["enabled"] = True
+        state.plan = workflow_engine._default_generation_plan(state)
+        for step in state.plan:
+            if step.step_id in {"analyze_requirements", "plan_project", "generate_files", "validate_project"}:
+                step.status = "completed" if step.step_id != "validate_project" else "failed"
+            else:
+                step.status = "pending"
+        workflow_engine._plan_status_sync(state)
+        state.current_step_id = "validate_project"
+        state.evaluation_results = [workflow_engine.EvaluationResult(
+            step_id="validate_project", outcome="failed", summary="pytest failed", next_action="recover",
+        )]
+        with mock.patch("crane.python_runtime.protocol.write_stdout"):
+            result = await workflow_engine.node_recover(workflow_engine.state_to_checkpoint(state))
+        recovered = workflow_engine._as_state(result)
+        validate = next(s for s in recovered.plan if s.step_id == "validate_project")
+        self.assertEqual(validate.status, "failed")
+        runnable = workflow_engine._next_runnable_step(recovered)
+        self.assertIsNotNone(runnable)
+        self.assertEqual(runnable.step_id, "repair_project")
+
     def test_terminal_failure_clears_pending_approval(self):
         state = workflow_engine.WorkflowState(
             task_id="terminal-approval", user_input="test", workspace=str(self.ws),

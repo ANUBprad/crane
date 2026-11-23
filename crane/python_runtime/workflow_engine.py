@@ -1687,7 +1687,17 @@ async def node_recover(raw: Dict[str, Any]) -> Dict[str, Any]:
     action = "fail"
     recovered = False
 
-    if step_retries < MAX_RETRIES_PER_STEP and len(state.tool_calls) < MAX_TOOL_CALLS_PER_TASK and state.graph_steps < MAX_GRAPH_STEPS:
+    generation_validation_failure = (
+        bool(state.generation.get("enabled"))
+        and step.step_id == "validate_project"
+        and outcome == EvaluationOutcome.FAILED.value
+    )
+    if generation_validation_failure:
+        # Re-running the same validation cannot repair generated code. Mark the
+        # step failed so the repair step becomes the next runnable step.
+        classification = "generation_validation"
+        action = "repair_step"
+    elif step_retries < MAX_RETRIES_PER_STEP and len(state.tool_calls) < MAX_TOOL_CALLS_PER_TASK and state.graph_steps < MAX_GRAPH_STEPS:
         if evaluation.next_action in {"retry", "repair_args"}:
             classification = "transient_or_repairable"
             action = "retry_step"
