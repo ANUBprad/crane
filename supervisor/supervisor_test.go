@@ -670,8 +670,10 @@ func TestApprovalCheckpointSurvivesSupervisorRestartAndResumesExactGrant(t *test
 	if err := json.Unmarshal(resumed, &state); err != nil {
 		t.Fatal(err)
 	}
-	resumedCheckpoint, _ := state["checkpoint"].(map[string]any)
-	grants, _ := resumedCheckpoint["granted_approvals"].([]any)
+	if envelopeType, _ := state["type"].(string); envelopeType == python_protocol.TypeTaskState {
+		t.Fatalf("persisted state is a protocol envelope, not a resumable checkpoint: %#v", state)
+	}
+	grants, _ := state["granted_approvals"].([]any)
 	found := false
 	for _, grant := range grants {
 		if grant == scope {
@@ -679,7 +681,10 @@ func TestApprovalCheckpointSurvivesSupervisorRestartAndResumesExactGrant(t *test
 		}
 	}
 	if !found {
-		t.Fatalf("exact approval scope was not forwarded into resumed checkpoint: %#v", resumedCheckpoint)
+		t.Fatalf("exact approval scope was not forwarded into resumed checkpoint: %#v", state)
+	}
+	if currentStep, _ := state["current_step"].(string); currentStep != "repair_project" {
+		t.Fatalf("resumed checkpoint lost workflow step: %#v", state)
 	}
 	if _, err := restarted.CancelTask(taskID); err != nil {
 		t.Fatalf("cancel resumed helper task: %v", err)

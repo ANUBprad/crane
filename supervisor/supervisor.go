@@ -831,7 +831,11 @@ func (s *Supervisor) handleProtocolFrame(id string, task *runningTask, frame []b
 			return true
 		}
 		version := 0
-		if err := s.store.SaveTaskState(id, frame); err == nil {
+		// Persist the workflow checkpoint, not the protocol envelope. The
+		// checkpoint is what a replacement Python runtime consumes on resume;
+		// storing the envelope would lose nested workflow state such as the
+		// plan, generation records and granted approvals.
+		if err := s.store.SaveTaskState(id, state.Checkpoint); err == nil {
 			if latest, ok := s.store.LatestCheckpointVersion(id); ok {
 				version = latest
 			}
