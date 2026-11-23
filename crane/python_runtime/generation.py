@@ -32,6 +32,7 @@ MAX_COMMAND_OUTPUT = 32 * 1024
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
 MAX_COMMAND_TIMEOUT_SECONDS = 300
 MAX_REPAIR_ATTEMPTS = 3
+WRITE_OPERATION_ALIASES = {"create", "add", "update", "overwrite", "replace", "modify", "edit"}
 
 PROTECTED_NAMES = {
     ".git",
@@ -294,6 +295,8 @@ def validate_file_operations(workspace: Path, operations: List[Dict[str, Any]]) 
         if not isinstance(raw, dict):
             raise GenerationError(f"File operation {idx} must be an object.")
         op = str(raw.get("operation") or "write").lower().strip()
+        if op in WRITE_OPERATION_ALIASES:
+            op = "write"
         if op not in {"write", "delete"}:
             raise GenerationError(f"Unsupported operation for {raw.get('path')!r}: {op}")
         rel_path = raw.get("path")

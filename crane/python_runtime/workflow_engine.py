@@ -1137,7 +1137,8 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             prompt = (
                 "Return ONLY JSON with keys: files (array of {path, operation, description, content}), "
                 "validation_commands (array of {name, argv, cwd, timeout_seconds, required}), "
-                "notes (array). Paths must be relative to the authorized workspace. No absolute paths, no .., no .git/env writes. "
+                "notes (array). operation must be exactly \"write\" for new or updated files or exactly \"delete\" for removals. "
+                "Paths must be relative to the authorized workspace. No absolute paths, no .., no .git/env writes. "
                 "Generate complete file contents, no placeholders. "
                 f"Specification: {json.dumps(spec, ensure_ascii=False)[:12000]}\n"
             )
@@ -1283,6 +1284,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             if selected_provider() == "ollama":
                 prompt = (
                     "Return ONLY JSON with key 'files' as array of {path, operation, description, content} for minimal repairs. "
+                    "operation must be exactly \"write\" for new or updated files or exactly \"delete\" for removals. "
                     "Only include files that must change. Paths must be relative to workspace. No placeholders.\n"
                     f"Objective: {state.objective}\n"
                     f"Failures: {json.dumps(failed, ensure_ascii=False)[:12000]}\n"

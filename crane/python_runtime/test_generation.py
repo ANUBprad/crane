@@ -39,6 +39,16 @@ class GenerationSafetyTests(unittest.TestCase):
         with self.assertRaises(gen.GenerationError):
             gen.validate_relative_path(self.ws, "secrets/api.key")
 
+    def test_normalizes_common_write_aliases_but_rejects_unknown_operations(self):
+        ops = gen.validate_file_operations(self.ws, [
+            {"path": "main.py", "operation": "create", "content": "print('ok')\n"},
+        ])
+        self.assertEqual(ops[0].operation, "write")
+        with self.assertRaises(gen.GenerationError):
+            gen.validate_file_operations(self.ws, [
+                {"path": "main.py", "operation": "chmod", "content": ""},
+            ])
+
     def test_rejects_windows_device_ads_and_invalid_names_on_every_host(self):
         invalid_paths = [
             r"C:relative.txt", r"\\server\share\file.txt", r"\\?\C:\Windows\win.ini",
@@ -331,6 +341,27 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         applied = gen.apply_staged_operations(self.ws, stage, approved_overwrites=True)
         self.assertEqual(applied["count"], 1)
         self.assertTrue((self.ws / "README.md").exists())
+
+    async def test_plan_prompt_states_exact_allowed_operations(self):
+        state, step = self._state_and_step("plan_project")
+        prompts = []
+
+        async def capture_prompt(current_state, prompt, system=None):
+            prompts.append(prompt)
+            return {
+                "files": [{"path": "main.py", "operation": "write", "content": "print('ok')\n"}],
+                "validation_commands": [],
+                "notes": [],
+            }
+
+        with mock.patch.dict(os.environ, {"CRANE_MODEL_PROVIDER": "ollama"}), \
+                mock.patch.object(workflow_engine, "_model_json", new=capture_prompt), \
+                mock.patch("crane.python_runtime.protocol.write_stdout"):
+            result = await workflow_engine._exec_generation_step(state, step)
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn('"write"', prompts[0])
+        self.assertIn('"delete"', prompts[0])
 
     def _state_and_step(self, step_id):
         state = workflow_engine.WorkflowState(
