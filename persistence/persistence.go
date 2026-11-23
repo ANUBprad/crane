@@ -235,17 +235,19 @@ type Store struct {
 // TaskRecord is the API-safe view of a persisted task. Raw task input is
 // deliberately omitted.
 type TaskRecord struct {
-	ID            string `json:"id"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
-	StartedAt     string `json:"started_at,omitempty"`
-	CompletedAt   string `json:"completed_at,omitempty"`
-	Status        string `json:"status"`
-	Result        string `json:"result,omitempty"`
-	Error         string `json:"error,omitempty"`
-	WorkflowRef   string `json:"workflow_ref,omitempty"`
-	HasCheckpoint bool   `json:"has_checkpoint"`
-	SchemaVersion string `json:"schema_version,omitempty"`
+	ID                    string `json:"id"`
+	CreatedAt             string `json:"created_at"`
+	UpdatedAt             string `json:"updated_at"`
+	StartedAt             string `json:"started_at,omitempty"`
+	CompletedAt           string `json:"completed_at,omitempty"`
+	Status                string `json:"status"`
+	Result                string `json:"result,omitempty"`
+	Error                 string `json:"error,omitempty"`
+	WorkflowRef           string `json:"workflow_ref,omitempty"`
+	HasCheckpoint         bool   `json:"has_checkpoint"`
+	SchemaVersion         string `json:"schema_version,omitempty"`
+	PendingApprovalScope  string `json:"pending_approval_scope,omitempty"`
+	PendingApprovalReason string `json:"pending_approval_reason,omitempty"`
 }
 
 // TaskEvent is an API-safe, persisted lifecycle or workflow event.
@@ -509,6 +511,11 @@ func (s *Store) GetTaskRecord(id string) (TaskRecord, error) {
 	}
 	record.HasCheckpoint = checkpointAt != ""
 	record.UpdatedAt = latestTimestamp(record.CreatedAt, record.StartedAt, record.CompletedAt, checkpointAt)
+	if record.Status == "waiting_approval" {
+		if snapshot, ok := s.GetLatestTaskState(id); ok {
+			record.PendingApprovalScope, record.PendingApprovalReason = ApprovalPendingFromCheckpoint(snapshot)
+		}
+	}
 	return record, nil
 }
 
@@ -651,6 +658,44 @@ func (s *Store) SaveTaskState(taskID string, snapshot []byte) error {
 		return fmt.Errorf("save checkpoint for task %q: %w", taskID, err)
 	}
 	return tx.Commit()
+}
+
+// ApprovalPendingFromCheckpoint returns the exact approval scope and reason
+// recorded by the workflow before it entered waiting_for_approval.
+func ApprovalPendingFromCheckpoint(snapshot []byte) (string, string) {
+	if len(snapshot) == 0 {
+		return "", ""
+	}
+	var checkpoint map[string]any
+	if err := json.Unmarshal(snapshot, &checkpoint); err != nil {
+		return "", ""
+	}
+	if status, _ := checkpoint["execution_status"].(string); status != "waiting_for_approval" {
+		return "", ""
+	}
+	scope, _ := checkpoint["pending_approval_scope"].(string)
+	reason, _ := checkpoint["pending_approval_reason"].(string)
+	if generation, ok := checkpoint["generation"].(map[string]any); ok {
+		if pending, ok := generation["pending_approval"].(map[string]any); ok {
+			if value, _ := pending["scope"].(string); value != "" {
+				scope = value
+			}
+			if value, _ := pending["reason"].(string); value != "" {
+				reason = value
+			}
+		}
+	}
+	if scope == "" {
+		if persistent, ok := checkpoint["persistent_state"].(map[string]any); ok {
+			if output, ok := persistent["last_action_output"].(map[string]any); ok {
+				scope, _ = output["approval_scope"].(string)
+			}
+		}
+	}
+	if reason == "" {
+		reason, _ = checkpoint["failure_reason"].(string)
+	}
+	return scope, reason
 }
 
 // GetLatestTaskState retrieves the newest checkpoint for a task.

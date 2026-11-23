@@ -1278,6 +1278,9 @@ func taskExecutionStatus(record persistence.TaskRecord) string {
 }
 
 func taskApprovalSummary(record persistence.TaskRecord) string {
+	if reason := strings.TrimSpace(record.PendingApprovalReason); reason != "" {
+		return reason
+	}
 	var payload map[string]any
 	if err := json.Unmarshal([]byte(record.Result), &payload); err != nil {
 		return "Approval required."
@@ -1291,7 +1294,15 @@ func taskApprovalSummary(record persistence.TaskRecord) string {
 	return "Approval required."
 }
 
-func promptApproval(ctx context.Context, client *localclient.Client, record persistence.TaskRecord, stdin io.Reader, stdout, stderr io.Writer) (persistence.TaskRecord, bool, error) {
+type approvalClient interface {
+	ApproveTask(ctx context.Context, id string, approved bool, scope string) (persistence.TaskRecord, error)
+}
+
+func submitApprovalDecision(ctx context.Context, client approvalClient, record persistence.TaskRecord, approved bool) (persistence.TaskRecord, error) {
+	return client.ApproveTask(ctx, record.ID, approved, record.PendingApprovalScope)
+}
+
+func promptApproval(ctx context.Context, client approvalClient, record persistence.TaskRecord, stdin io.Reader, stdout, stderr io.Writer) (persistence.TaskRecord, bool, error) {
 	if !isTerminal(os.Stdin) {
 		return record, false, fmt.Errorf("task %s requires approval: %s", record.ID, taskApprovalSummary(record))
 	}
@@ -1305,8 +1316,7 @@ func promptApproval(ctx context.Context, client *localclient.Client, record pers
 	}
 	answer := strings.ToLower(strings.TrimSpace(line))
 	approved := answer == "y" || answer == "yes"
-	scope := "user_approved"
-	rec, err := client.ApproveTask(ctx, record.ID, approved, scope)
+	rec, err := submitApprovalDecision(ctx, client, record, approved)
 	if err != nil {
 		return record, false, err
 	}

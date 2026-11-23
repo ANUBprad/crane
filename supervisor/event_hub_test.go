@@ -140,6 +140,37 @@ func TestSupervisorPersistedEventsAreDeliveredInSequence(t *testing.T) {
 	}
 }
 
+func TestApproveTaskRejectsMismatchedPendingScope(t *testing.T) {
+	store, err := persistence.NewStore(filepath.Join(t.TempDir(), "scope.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.CreateTask("scope-task", "waiting_approval", "test"); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := []byte(`{"execution_status":"waiting_for_approval","generation":{"pending_approval":{"scope":"generation:apply:scope-task:abc123","reason":"Approve exact changes"}}}`)
+	if err := store.SaveTaskState("scope-task", checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	s := NewWithStore(store)
+	s.started.Store(true)
+	if _, err := s.ApproveTask("scope-task", true, "user_approved"); err == nil || !strings.Contains(err.Error(), "approval_scope_mismatch") {
+		t.Fatalf("ApproveTask() error = %v, want approval_scope_mismatch", err)
+	}
+	record, err := store.GetTaskRecord("scope-task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "waiting_approval" {
+		t.Fatalf("status = %q, want waiting_approval", record.Status)
+	}
+	after, ok := store.GetLatestTaskState("scope-task")
+	if !ok || !strings.Contains(string(after), "generation:apply:scope-task:abc123") || strings.Contains(string(after), "user_approved") {
+		t.Fatalf("checkpoint changed after rejected approval: %s", after)
+	}
+}
+
 func TestApprovalRejectionEmitsTerminalEvent(t *testing.T) {
 	store, err := persistence.NewStore(filepath.Join(t.TempDir(), "approval.db"))
 	if err != nil {

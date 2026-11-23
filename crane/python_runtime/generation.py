@@ -6,12 +6,18 @@ and runs controlled validation commands inside the authorized workspace.
 """
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import hashlib
+import hmac
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -42,10 +48,34 @@ PROTECTED_NAMES = {
 }
 PROTECTED_PREFIXES = (".git/", ".git\\", ".ssh/", ".ssh\\")
 WINDOWS_RESERVED = {
-    "CON", "PRN", "AUX", "NUL",
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "LPT0",
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
+    "COM¹", "COM²", "COM³",
 }
+MAX_VALIDATION_ARGV = 64
+MAX_VALIDATION_ARG_CHARS = 4096
+VALIDATION_ENV_KEYS = (
+    "SYSTEMROOT", "SystemRoot", "PATH", "Path", "TEMP", "TMP", "TMPDIR",
+    "HOME", "USERPROFILE", "LANG", "LC_ALL", "PYTHONIOENCODING", "PYTHONUTF8",
+)
+_REDACTION_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)\b(token|secret|password|api[_-]?key|credential|database_url|credential_file)[A-Z0-9_]*\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,;&}\)]+)"),
+)
+
+# Executable locations are captured once at runtime startup. A later PATH change
+# cannot redirect an allowlisted validation command to a hostile shim.
+_TRUSTED_PATH = os.environ.get("PATH", "")
+_TRUSTED_EXECUTABLES: Dict[str, Path] = {name: Path(sys.executable).resolve() for name in ("python", "python3", "py")}
+for _tool in ("node", "npm", "npx", "go", "gofmt", "cargo", "dotnet"):
+    _located = shutil.which(_tool, path=_TRUSTED_PATH)
+    if _located and Path(_located).suffix.lower() not in {".cmd", ".bat", ".ps1", ".sh"}:
+        try:
+            _TRUSTED_EXECUTABLES[_tool] = Path(_located).resolve(strict=True)
+        except OSError:
+            pass
 
 
 class GenerationError(ValueError):
@@ -116,8 +146,8 @@ def canonicalize_workspace(workspace: str) -> Path:
 
 
 def _check_reserved_name(name: str) -> None:
-    base = name.split(".")[0].upper()
-    if base in WINDOWS_RESERVED:
+    base = name.split(".", 1)[0].upper()
+    if base in WINDOWS_RESERVED or re.fullmatch(r"(?:COM[0-9¹²³]|LPT[0-9])(?:\..*)?", base):
         raise GenerationError(f"Reserved Windows filename is not allowed: {name}")
 
 
@@ -326,6 +356,34 @@ def _validated_stage_dir(workspace: Path, stage: Dict[str, Any]) -> Tuple[Path, 
     return stage_root, stage_dir
 
 
+def _stage_manifest_digest(workspace: Path, stage: Dict[str, Any]) -> str:
+    stage_dir = Path(str(stage.get("stage_dir") or "")).resolve(strict=True)
+    payload = {
+        "workspace": _norm_case(str(workspace.resolve(strict=True))),
+        "stage_id": stage_dir.name,
+        "files": stage.get("files"),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _verify_stage_manifest(workspace: Path, stage: Dict[str, Any]) -> None:
+    supplied = stage.get("manifest_digest")
+    if not isinstance(supplied, str) or not re.fullmatch(r"[0-9a-f]{64}", supplied):
+        raise GenerationError("Staging manifest integrity metadata is missing.")
+    if not hmac.compare_digest(supplied, _stage_manifest_digest(workspace, stage)):
+        raise GenerationError("Staging manifest integrity check failed.")
+
+
+def _remove_validated_stage_dir(stage_dir: Path) -> bool:
+    try:
+        _assert_no_reparse_tree(stage_dir)
+        shutil.rmtree(stage_dir)
+        return True
+    except (GenerationError, OSError):
+        return False
+
+
 def _assert_no_reparse_tree(root: Path) -> None:
     for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
         current_path = Path(current)
@@ -392,9 +450,11 @@ def stage_operations(workspace: Path, ops: List[FileOperation]) -> Dict[str, Any
                 record["bytes"] = 0
             staged.append(record)
     except Exception:
-        cleanup_stage({"stage_dir": str(stage_dir)}, ws)
+        _remove_validated_stage_dir(stage_dir)
         raise
-    return {"stage_dir": str(stage_dir), "created_at": time.time(), "files": staged}
+    stage = {"stage_dir": str(stage_dir), "created_at": time.time(), "files": staged}
+    stage["manifest_digest"] = _stage_manifest_digest(ws, stage)
+    return stage
 
 
 def summarize_changes(workspace: Path, ops: List[FileOperation]) -> Dict[str, Any]:
@@ -420,6 +480,7 @@ def apply_staged_operations(
 ) -> Dict[str, Any]:
     ws = _workspace_root(workspace)
     _, stage_dir = _validated_stage_dir(ws, stage)
+    _verify_stage_manifest(ws, stage)
     approved_paths = set()
     if approved_overwrite_paths is not None:
         if not isinstance(approved_overwrite_paths, list) or len(approved_overwrite_paths) > MAX_FILES:
@@ -522,22 +583,135 @@ def apply_staged_operations(
 def cleanup_stage(stage: Dict[str, Any], workspace: Path) -> bool:
     try:
         _, stage_dir = _validated_stage_dir(workspace, stage)
-        _assert_no_reparse_tree(stage_dir)
-        shutil.rmtree(stage_dir)
-        return True
+        _verify_stage_manifest(workspace, stage)
+        return _remove_validated_stage_dir(stage_dir)
     except (GenerationError, OSError):
         # Invalid or tampered staging metadata must never trigger arbitrary cleanup.
         return False
 
 
+def _resolved_validation_argv(argv: Any) -> Optional[List[str]]:
+    if not isinstance(argv, (list, tuple)) or not argv or len(argv) > MAX_VALIDATION_ARGV:
+        return None
+    values = [str(arg) for arg in argv if str(arg)]
+    if not values or any(len(arg) > MAX_VALIDATION_ARG_CHARS for arg in values):
+        return None
+    raw = values[0].replace("\\", "/")
+    basename = raw.rsplit("/", 1)[-1]
+    key = basename[:-4].lower() if basename.lower().endswith(".exe") else basename.lower()
+    trusted = _TRUSTED_EXECUTABLES.get(key)
+    if trusted is None:
+        return None
+    if "/" in raw or re.match(r"^[A-Za-z]:", raw):
+        try:
+            candidate = Path(raw).resolve(strict=True)
+        except OSError:
+            return None
+        if candidate != trusted:
+            return None
+    else:
+        candidate = trusted
+    return [str(candidate), *values[1:]]
+
+
 def allowed_validation_command(argv: List[str]) -> bool:
-    if not argv or not isinstance(argv, list):
-        return False
-    executable = str(argv[0]).replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if executable.endswith(".exe"):
-        executable = executable[:-4]
-    allowed = {"python", "python3", "py", "pytest", "node", "npm", "npx", "go", "gofmt", "cargo", "dotnet"}
-    return executable in allowed
+    return _resolved_validation_argv(argv) is not None
+
+
+def _validation_environment() -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    for key in VALIDATION_ENV_KEYS:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    env["PATH"] = _TRUSTED_PATH
+    return env
+
+
+def _redact_validation_text(text: str) -> str:
+    result = text
+    for pattern in _REDACTION_PATTERNS:
+        result = pattern.sub("[redacted]", result)
+    return result
+
+
+def _redact_validation_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _redact_validation_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_validation_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_validation_text(value)
+    return value
+
+
+def redact_validation_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply durable-output redaction to every validation result field."""
+    cleaned = _redact_validation_value(result)
+    return cleaned if isinstance(cleaned, dict) else {"status": "failed", "error": "invalid validation result"}
+
+
+def _create_windows_job(process: subprocess.Popen[Any]) -> Tuple[Any, Any]:
+    from ctypes import wintypes
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class BasicLimit(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class ExtendedLimit(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimit),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    create_job = getattr(kernel32, "CreateJobObjectW")
+    create_job.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    create_job.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    job = create_job(None, None)
+    if not job:
+        raise OSError("could not create validation process job")
+    info = ExtendedLimit()
+    info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        kernel32.CloseHandle(job)
+        raise OSError("could not configure validation process job")
+    if not kernel32.AssignProcessToJobObject(job, process._handle):
+        kernel32.CloseHandle(job)
+        raise OSError("could not assign validation process to job")
+    return job, kernel32
 
 
 def _drain_bounded(stream: Any, limit: int, results: Dict[str, Any], key: str) -> None:
@@ -564,33 +738,52 @@ def _drain_bounded(stream: Any, limit: int, results: Dict[str, Any], key: str) -
 
 
 def run_validation_command(workspace: Path, command: ValidationCommand) -> Dict[str, Any]:
+    def failed(error: str, argv: Optional[List[str]] = None) -> Dict[str, Any]:
+        return redact_validation_result({
+            "name": command.name, "argv": argv or [], "status": "failed", "error": error,
+        })
+
     ws = _workspace_root(workspace)
-    argv = [str(a) for a in command.argv if str(a)]
-    if not argv:
-        return {"name": command.name, "status": "failed", "error": "empty command"}
-    if not allowed_validation_command(argv):
-        return {"name": command.name, "status": "failed", "error": f"command not allowed: {argv[0]}"}
+    original_argv = [str(arg) for arg in command.argv if str(arg)]
+    resolved = _resolved_validation_argv(original_argv)
+    if not original_argv:
+        return failed("empty command")
+    if resolved is None:
+        return failed(f"command not allowed: {original_argv[0]}", original_argv)
+    argv = resolved
     cwd = validate_relative_path(ws, command.cwd) if command.cwd not in {"", "."} else ws
     cwd_info = _lstat_path(cwd, str(cwd))
     if cwd_info is None or not stat.S_ISDIR(cwd_info.st_mode):
-        return {"name": command.name, "status": "failed", "error": "cwd must be an existing directory inside the workspace"}
+        return failed("cwd must be an existing directory inside the workspace", argv)
 
     timeout = max(1, min(int(command.timeout_seconds or DEFAULT_COMMAND_TIMEOUT_SECONDS), MAX_COMMAND_TIMEOUT_SECONDS))
-    env = os.environ.copy()
-    for key in list(env.keys()):
-        if re.search(r"(TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)", key, re.IGNORECASE):
-            env.pop(key, None)
+    env = _validation_environment()
+    popen_kwargs: Dict[str, Any] = {}
+    if _is_windows():
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
 
     start = time.time()
     process = None
+    job = None
+    kernel32 = None
     results: Dict[str, Any] = {}
     readers = []
     timed_out = False
     try:
         process = subprocess.Popen(
             argv, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL, env=env, shell=False, close_fds=True,
+            stdin=subprocess.DEVNULL, env=env, shell=False, close_fds=True, **popen_kwargs,
         )
+        if _is_windows():
+            try:
+                job, kernel32 = _create_windows_job(process)
+            except Exception:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                raise
         for key, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
             if pipe is not None:
                 reader = threading.Thread(target=_drain_bounded, args=(pipe, MAX_COMMAND_OUTPUT, results, key), daemon=True)
@@ -600,8 +793,14 @@ def run_validation_command(workspace: Path, command: ValidationCommand) -> Dict[
             exit_code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            process.kill()
-            exit_code = process.wait()
+            if job is not None and kernel32 is not None:
+                kernel32.TerminateJobObject(job, 1)
+            elif _is_windows():
+                process.kill()
+            else:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            exit_code = process.wait(timeout=10)
         for reader in readers:
             reader.join(timeout=1.0)
         for pipe in (process.stdout, process.stderr):
@@ -615,18 +814,19 @@ def run_validation_command(workspace: Path, command: ValidationCommand) -> Dict[
 
         stdout_bytes, stdout_truncated = results.get("stdout", (b"", False))
         stderr_bytes, stderr_truncated = results.get("stderr", (b"", False))
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
         base = {
             "name": command.name, "argv": argv, "exit_code": exit_code,
-            "stdout": stdout, "stderr": stderr,
+            "stdout": stdout_bytes.decode("utf-8", errors="replace"),
+            "stderr": stderr_bytes.decode("utf-8", errors="replace"),
             "stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated,
             "duration_ms": int((time.time() - start) * 1000),
         }
         if timed_out:
-            return {**base, "status": "failed", "error": f"timeout after {timeout}s"}
-        return {**base, "status": "succeeded" if exit_code == 0 else "failed"}
+            return redact_validation_result({**base, "status": "failed", "error": f"timeout after {timeout}s"})
+        return redact_validation_result({**base, "status": "succeeded" if exit_code == 0 else "failed"})
     except Exception as exc:  # noqa: BLE001
+        return failed(str(exc), argv)
+    finally:
         if process is not None:
             if process.poll() is None:
                 process.kill()
@@ -639,7 +839,8 @@ def run_validation_command(workspace: Path, command: ValidationCommand) -> Dict[
                         pass
         for reader in readers:
             reader.join(timeout=1.0)
-        return {"name": command.name, "argv": argv, "status": "failed", "error": str(exc), "duration_ms": int((time.time() - start) * 1000)}
+        if job is not None and kernel32 is not None:
+            kernel32.CloseHandle(job)
 
 def default_validation_commands(workspace: Path) -> List[ValidationCommand]:
     ws = workspace.resolve(strict=True)
@@ -648,9 +849,9 @@ def default_validation_commands(workspace: Path) -> List[ValidationCommand]:
         # Syntax check only; no install.
         py_files = [p.relative_to(ws).as_posix() for p in ws.rglob("*.py") if ".crane-staging" not in p.parts][:50]
         if py_files:
-            cmds.append(ValidationCommand(name="python_syntax", argv=[os.environ.get("PYTHON", "python"), "-m", "py_compile", *py_files], timeout_seconds=120))
+            cmds.append(ValidationCommand(name="python_syntax", argv=[sys.executable, "-m", "py_compile", *py_files], timeout_seconds=120))
         if (ws / "tests").exists() or any(ws.rglob("test_*.py")):
-            cmds.append(ValidationCommand(name="pytest", argv=[os.environ.get("PYTHON", "python"), "-m", "pytest", "-q"], timeout_seconds=180, required=False))
+            cmds.append(ValidationCommand(name="pytest", argv=[sys.executable, "-m", "pytest", "-q"], timeout_seconds=180, required=False))
     if (ws / "package.json").exists():
         cmds.append(ValidationCommand(name="npm_test", argv=["npm", "test", "--", "--runInBand"], timeout_seconds=180, required=False))
     if (ws / "go.mod").exists():

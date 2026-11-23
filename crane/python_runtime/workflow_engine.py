@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ from langgraph.graph import END, START, StateGraph
 
 from crane.mcp_runtime import (
     MCPManager,
+    canonical_json,
     classify_tool,
     configure_manager,
     connect_all,
@@ -973,20 +975,42 @@ async def _execute_tool_direct(state: WorkflowState, step: PlanStep, manager: MC
         state.selected_tool = None
 
 
-def _gen_scope(state: WorkflowState, name: str) -> str:
-    return f"generation:{name}:{state.task_id}"
+def _generation_digest(state: WorkflowState, action: str, payload: Any) -> str:
+    workspace = os.path.normcase(str(state.workspace)).lower() if os.name == "nt" else str(state.workspace)
+    bound = {"task_id": state.task_id, "workspace": workspace, "action": action, "payload": payload}
+    return hashlib.sha256(canonical_json(bound).encode("utf-8")).hexdigest()[:16]
+
+
+def _gen_scope(state: WorkflowState, name: str, digest: str = "") -> str:
+    base = f"generation:{name}:{state.task_id}"
+    return f"{base}:{digest}" if digest else base
 
 
 def _has_grant(state: WorkflowState, scope: str) -> bool:
     return scope in (state.granted_approvals or []) or scope in (state.generation.get("approvals_granted") or [])
 
 
-def _grant(state: WorkflowState, scope: str) -> None:
-    if scope not in state.granted_approvals:
-        state.granted_approvals.append(scope)
-    g = state.generation.setdefault("approvals_granted", [])
-    if scope not in g:
-        g.append(scope)
+def _set_pending_approval(state: WorkflowState, scope: str, digest: str, action: str, **details: Any) -> None:
+    state.generation["pending_approval"] = {
+        "scope": scope, "digest": digest, "action": action, **details,
+    }
+
+
+def _pending_scope_matches(state: WorkflowState, scope: str, digest: str) -> bool:
+    pending = state.generation.get("pending_approval")
+    return isinstance(pending, dict) and pending.get("scope") == scope and pending.get("digest") == digest
+
+
+def _consume_grant(state: WorkflowState, scope: str) -> bool:
+    if not _has_grant(state, scope):
+        return False
+    state.granted_approvals = [g for g in (state.granted_approvals or []) if g != scope]
+    existing = [g for g in (state.generation.get("approvals_granted") or []) if g != scope]
+    state.generation["approvals_granted"] = existing
+    consumed = state.generation.setdefault("consumed_approvals", [])
+    if scope not in consumed:
+        consumed.append(scope)
+    return True
 
 
 def _parse_model_json(text: str) -> Optional[Dict[str, Any]]:
@@ -1145,25 +1169,29 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
         collisions = gen.inspect_collisions(ws, ops)
         overwrite_paths = [c["path"] for c in collisions if c.get("exists")]
         needs_overwrite = any(c.get("exists") for c in collisions)
-        apply_scope = _gen_scope(state, "apply")
-        overwrite_scope = _gen_scope(state, "overwrite")
-        if needs_overwrite and not _has_grant(state, overwrite_scope):
-            state.generation["pending_approval"] = {
-                "scope": overwrite_scope,
-                "reason": "Applying generated files will overwrite existing workspace files.",
-                "paths": overwrite_paths,
-            }
-            _event(state.task_id, "approval_required", {"scope": overwrite_scope, "paths": overwrite_paths[:50]})
-            return {"status": "blocked", "error": "approval_required", "approval_scope": overwrite_scope, "paths": overwrite_paths[:50]}
-        if not _has_grant(state, apply_scope) and not _has_grant(state, overwrite_scope):
-            state.generation["pending_approval"] = {
-                "scope": apply_scope,
-                "reason": "Approval required before writing generated files to the authorized workspace.",
-                "paths": [op.path for op in ops],
-            }
-            _event(state.task_id, "approval_required", {"scope": apply_scope, "file_count": len(ops)})
-            return {"status": "blocked", "error": "approval_required", "approval_scope": apply_scope, "file_count": len(ops)}
+        action_payload = {
+            "manifest": [op.to_dict() for op in ops],
+            "overwrite_paths": overwrite_paths,
+            "plan_only": bool(state.generation.get("plan_only")),
+        }
+        digest = _generation_digest(state, "apply", action_payload)
+        apply_scope = _gen_scope(state, "apply", digest)
+        overwrite_scope = _gen_scope(state, "overwrite", digest)
+        required_scope = overwrite_scope if needs_overwrite else apply_scope
+        if not (_has_grant(state, required_scope) and _pending_scope_matches(state, required_scope, digest)):
+            if needs_overwrite:
+                reason = "Applying generated files will overwrite existing workspace files."
+                details = {"paths": overwrite_paths}
+            else:
+                reason = "Approval required before writing generated files to the authorized workspace."
+                details = {"paths": [op.path for op in ops], "file_count": len(ops)}
+            _set_pending_approval(state, required_scope, digest, "overwrite" if needs_overwrite else "apply", reason=reason, **details)
+            _event(state.task_id, "approval_required", {"scope": required_scope, "digest": digest, **details})
+            return {"status": "blocked", "error": "approval_required", "approval_scope": required_scope, "paths": details.get("paths", [])[:50]}
 
+        if not _consume_grant(state, required_scope):
+            return {"status": "failed", "error": "generation approval grant is stale"}
+        state.generation.pop("pending_approval", None)
         if state.generation.get("plan_only"):
             state.generation["status"] = "plan_only"
             return {"status": "succeeded", "output": {"plan_only": True, "planned_files": [op.path for op in ops], "file_count": len(ops)}}
@@ -1186,13 +1214,6 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
         if state.generation.get("plan_only"):
             state.generation["validation_results"] = [{"name": "plan_only", "status": "skipped", "reason": "Plan-only mode; no files applied."}]
             return {"status": "succeeded", "output": {"skipped": True, "reason": "plan_only"}}
-        validate_scope = _gen_scope(state, "validate")
-        if not _has_grant(state, validate_scope):
-            cmds = state.generation.get("validation_plan")
-            cmd_names = [c.get("name") for c in cmds] if isinstance(cmds, list) else []
-            state.generation["pending_approval"] = {"scope": validate_scope, "reason": "Approval required before executing validation commands in the workspace."}
-            _event(state.task_id, "approval_required", {"scope": validate_scope, "commands": cmd_names})
-            return {"status": "blocked", "error": "approval_required", "approval_scope": validate_scope}
         commands = []
         raw_cmds = state.generation.get("validation_plan")
         if isinstance(raw_cmds, list) and raw_cmds:
@@ -1215,6 +1236,20 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             state.generation["validation_results"] = [{"name": "no_validation", "status": "skipped", "reason": "No applicable validation commands detected."}]
             _event(state.task_id, "validation.completed", {"status": "skipped"})
             return {"status": "succeeded", "output": {"validation_results": state.generation["validation_results"]}}
+        command_payload = [cmd.to_dict() for cmd in commands]
+        digest = _generation_digest(state, "validate", command_payload)
+        validate_scope = _gen_scope(state, "validate", digest)
+        if not (_has_grant(state, validate_scope) and _pending_scope_matches(state, validate_scope, digest)):
+            _set_pending_approval(
+                state, validate_scope, digest, "validate",
+                reason="Approval required before executing validation commands in the workspace.",
+                commands=[cmd.name for cmd in commands],
+            )
+            _event(state.task_id, "approval_required", {"scope": validate_scope, "digest": digest, "commands": [cmd.name for cmd in commands]})
+            return {"status": "blocked", "error": "approval_required", "approval_scope": validate_scope}
+        if not _consume_grant(state, validate_scope):
+            return {"status": "failed", "error": "validation approval grant is stale"}
+        state.generation.pop("pending_approval", None)
         results = []
         for cmd in commands:
             _event(state.task_id, "validation.started", {"name": cmd.name, "argv": cmd.argv})
@@ -1223,10 +1258,11 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             _event(state.task_id, "validation.completed", {"name": cmd.name, "status": res.get("status"), "exit_code": res.get("exit_code")})
             if res.get("status") != "succeeded" and cmd.required:
                 break
-        state.generation["validation_results"] = results
+        safe_results = [gen.redact_validation_result(r) if isinstance(r, dict) else r for r in results]
+        state.generation["validation_results"] = safe_results
         ok = all(r.get("status") == "succeeded" for r in results if r.get("status") != "skipped")
         state.generation["status"] = "validated" if ok else "validation_failed"
-        return {"status": "succeeded" if ok else "failed", "output": {"validation_results": results}}
+        return {"status": "succeeded" if ok else "failed", "output": {"validation_results": safe_results}}
 
     if sid == "repair_project":
         if state.generation.get("plan_only"):
@@ -1238,12 +1274,9 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
         attempts = int(state.generation.get("repair_attempts") or 0)
         if attempts >= gen.MAX_REPAIR_ATTEMPTS:
             return {"status": "failed", "error": f"Repair attempt limit reached ({gen.MAX_REPAIR_ATTEMPTS})", "output": {"validation_results": results}}
-        repair_scope = _gen_scope(state, "repair")
-        if not _has_grant(state, repair_scope):
-            state.generation["pending_approval"] = {"scope": repair_scope, "reason": "Approval required before applying repair changes."}
-            _event(state.task_id, "approval_required", {"scope": repair_scope})
-            return {"status": "blocked", "error": "approval_required", "approval_scope": repair_scope}
-        # Reuse the structured repair manifest across approval pauses.
+
+        # The exact repair manifest is produced before approval and persisted in
+        # the checkpoint. A grant can never authorize a regenerated manifest.
         repair_manifest = state.generation.get("pending_repair_manifest")
         if not isinstance(repair_manifest, list) or not repair_manifest:
             repair_manifest = None
@@ -1262,24 +1295,48 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             return {"status": "failed", "error": "Unable to generate repair plan; manual review required", "output": {"validation_results": results}}
         try:
             ops = gen.validate_file_operations(ws, repair_manifest)
-            collisions = gen.inspect_collisions(ws, ops)
-            overwrite_paths = [item["path"] for item in collisions if item.get("exists")]
-            overwrite_scope = _gen_scope(state, "overwrite")
-            if overwrite_paths and not _has_grant(state, overwrite_scope):
-                state.generation["pending_repair_manifest"] = [op.to_dict() for op in ops]
-                state.generation["pending_approval"] = {
-                    "scope": overwrite_scope,
-                    "reason": "Repair will overwrite existing workspace files.",
-                    "paths": overwrite_paths,
-                }
-                _event(state.task_id, "approval_required", {"scope": overwrite_scope, "paths": overwrite_paths[:50], "repair": True})
-                return {"status": "blocked", "error": "approval_required", "approval_scope": overwrite_scope, "paths": overwrite_paths[:50]}
-            state.generation["repair_attempts"] = attempts + 1
-            _event(state.task_id, "repair.started", {"attempt": attempts + 1})
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "failed", "error": f"Invalid repair manifest: {exc}"}
+        normalized = [op.to_dict() for op in ops]
+        collisions = gen.inspect_collisions(ws, ops)
+        overwrite_paths = [item["path"] for item in collisions if item.get("exists")]
+        digest = _generation_digest(state, "repair", {
+            "manifest": normalized, "overwrite_paths": overwrite_paths, "attempt": attempts + 1,
+        })
+        stored_digest = state.generation.get("pending_repair_digest")
+        if stored_digest is not None and stored_digest != digest:
+            return {"status": "failed", "error": "Repair manifest changed after approval", "output": {"validation_results": results}}
+        state.generation["pending_repair_manifest"] = normalized
+        state.generation["pending_repair_digest"] = digest
+        repair_scope = _gen_scope(state, "repair", digest)
+        if not (_has_grant(state, repair_scope) and _pending_scope_matches(state, repair_scope, digest)):
+            reason = ("Repair will overwrite existing workspace files." if overwrite_paths
+                      else "Approval required before applying repair changes.")
+            _set_pending_approval(
+                state, repair_scope, digest, "repair", reason=reason,
+                paths=overwrite_paths, file_count=len(ops),
+            )
+            _event(state.task_id, "approval_required", {
+                "scope": repair_scope, "digest": digest, "paths": overwrite_paths[:50], "repair": True,
+            })
+            return {
+                "status": "blocked", "error": "approval_required", "approval_scope": repair_scope,
+                "paths": overwrite_paths[:50],
+            }
+        if not _consume_grant(state, repair_scope):
+            return {"status": "failed", "error": "repair approval grant is stale", "output": {"validation_results": results}}
+        state.generation.pop("pending_approval", None)
+
+        state.generation["repair_attempts"] = attempts + 1
+        _event(state.task_id, "repair.started", {"attempt": attempts + 1, "digest": digest})
+        try:
             stage = gen.stage_operations(ws, ops)
-            applied = gen.apply_staged_operations(ws, stage, approved_overwrite_paths=overwrite_paths)
-            gen.cleanup_stage(stage, ws)
+            try:
+                applied = gen.apply_staged_operations(ws, stage, approved_overwrite_paths=overwrite_paths)
+            finally:
+                gen.cleanup_stage(stage, ws)
             state.generation.pop("pending_repair_manifest", None)
+            state.generation.pop("pending_repair_digest", None)
         except Exception as exc:  # noqa: BLE001
             return {"status": "failed", "error": f"Repair apply failed: {exc}"}
         # Re-run validations
@@ -1291,18 +1348,18 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                     cmds.append(gen.ValidationCommand(name=str(c.get("name") or "command"), argv=[str(a) for a in c.get("argv")], cwd=str(c.get("cwd") or "."), timeout_seconds=int(c.get("timeout_seconds") or gen.DEFAULT_COMMAND_TIMEOUT_SECONDS), required=bool(c.get("required", True))))
         if not cmds:
             cmds = gen.default_validation_commands(ws)
-        results2 = []
+        safe_results2 = []
         for cmd in cmds:
             _event(state.task_id, "validation.started", {"name": cmd.name, "argv": cmd.argv, "repair_attempt": attempts + 1})
-            res = gen.run_validation_command(ws, cmd)
-            results2.append(res)
+            res = gen.redact_validation_result(gen.run_validation_command(ws, cmd))
+            safe_results2.append(res)
             _event(state.task_id, "validation.completed", {"name": cmd.name, "status": res.get("status"), "exit_code": res.get("exit_code"), "repair_attempt": attempts + 1})
             if res.get("status") != "succeeded" and cmd.required:
                 break
-        state.generation["validation_results"] = results2
-        ok = all(r.get("status") == "succeeded" for r in results2 if r.get("status") != "skipped")
+        state.generation["validation_results"] = safe_results2
+        ok = all(r.get("status") == "succeeded" for r in safe_results2 if r.get("status") != "skipped")
         state.generation["status"] = "validated" if ok else "validation_failed"
-        return {"status": "succeeded" if ok else "failed", "output": {"applied": applied.get("applied", []), "validation_results": results2, "attempt": attempts + 1}}
+        return {"status": "succeeded" if ok else "failed", "output": {"applied": applied.get("applied", []), "validation_results": safe_results2, "attempt": attempts + 1}}
 
     if sid == "final_report":
         spec = state.generation.get("spec") if isinstance(state.generation.get("spec"), dict) else {}
@@ -1912,6 +1969,10 @@ def _build_initial_state(
         state.objective = state.objective or _normalize_objective(state.user_input)
         state.conversation_id = conversation_id or state.conversation_id
         if workspace:
+            original = os.path.normcase(os.path.abspath(str(state.workspace))) if state.workspace else ""
+            supplied = os.path.normcase(os.path.abspath(str(workspace)))
+            if original and original != supplied:
+                raise ValueError("resume cannot change the authorized workspace")
             state.workspace = workspace
     else:
         state = WorkflowState(task_id=task_id, user_input=user_input, objective=_normalize_objective(user_input), conversation_id=conversation_id, workspace=(workspace or ""))
@@ -1978,9 +2039,15 @@ async def execute_task(
     state = _build_initial_state(user_input, task_id, resume, checkpoint, conversation_id, conversation_messages, workspace)
     if python_runtime_pid is not None:
         state.python_runtime_pid = python_runtime_pid
+    env_restore: Dict[str, Optional[str]] = {}
     try:
         if env:
-            os.environ.update({str(k): str(v) for k, v in env.items() if k and v is not None})
+            for key, value in env.items():
+                name = str(key)
+                if not name or value is None:
+                    continue
+                env_restore[name] = os.environ.get(name)
+                os.environ[name] = str(value)
         # Connect MCP before planning so tool discovery is real.
         manager = await _build_manager(task_id, mcp_servers, granted_approvals)
         tools = _available_tools(manager)
@@ -2090,6 +2157,11 @@ async def execute_task(
         }
         _persist_task_state(state)
     finally:
+        for name, previous in env_restore.items():
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
         _unregister_cancellation(task_id)
         _pop_manager(task_id)
         if manager is not None:

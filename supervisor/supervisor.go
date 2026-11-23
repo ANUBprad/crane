@@ -403,6 +403,15 @@ func (s *Supervisor) ApproveTask(id string, approved bool, scope string) (persis
 	if !waiting {
 		return record, errors.New("task is not waiting for approval")
 	}
+	pendingScope, pendingReason := persistence.ApprovalPendingFromCheckpoint(checkpoint)
+	if pendingScope != "" {
+		if scope != pendingScope {
+			return record, fmt.Errorf("approval_scope_mismatch: expected %q", pendingScope)
+		}
+	} else if pendingReason != "" {
+		// Keep reason-only approvals informative without inventing a scope.
+		scope = ""
+	}
 	if !approved {
 		s.emitEvent(id, "approval_rejected", map[string]any{"scope": scope})
 		if err := s.finalize(id, "failed", record.Result, "approval rejected by user", nil); err != nil {

@@ -41,6 +41,27 @@ func TestDBPathMigratesLegacyDatabaseOnce(t *testing.T) {
 	}
 }
 
+func TestTaskRecordExposesExactPendingApprovalScope(t *testing.T) {
+	store := newTestStore(t)
+	if _, err := store.CreateTask("approval-scope-task", "waiting_approval", "test"); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := []byte(`{"execution_status":"waiting_for_approval","generation":{"pending_approval":{"scope":"generation:apply:approval-scope-task:abc123","reason":"Approve exact changes"}}}`)
+	if err := store.SaveTaskState("approval-scope-task", checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.GetTaskRecord("approval-scope-task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.PendingApprovalScope != "generation:apply:approval-scope-task:abc123" {
+		t.Fatalf("PendingApprovalScope = %q", record.PendingApprovalScope)
+	}
+	if record.PendingApprovalReason != "Approve exact changes" {
+		t.Fatalf("PendingApprovalReason = %q", record.PendingApprovalReason)
+	}
+}
+
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := NewStore(t.TempDir() + "/nested/crane.db")

@@ -534,6 +534,10 @@ func (s *Server) handleTaskApprove(w http.ResponseWriter, r *http.Request, id st
 			writeError(w, http.StatusConflict, "task_not_waiting_for_approval")
 			return
 		}
+		if strings.Contains(err.Error(), "approval_scope_mismatch") {
+			writeError(w, http.StatusConflict, "approval_scope_mismatch")
+			return
+		}
 		fmt.Fprintln(os.Stderr, "CRANE local API: task approval failed")
 		writeError(w, http.StatusServiceUnavailable, "task_approval_unavailable")
 		return

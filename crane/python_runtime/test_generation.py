@@ -2,9 +2,12 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from crane.python_runtime import generation as gen
 from crane.python_runtime import workflow_engine
@@ -38,9 +41,11 @@ class GenerationSafetyTests(unittest.TestCase):
 
     def test_rejects_windows_device_ads_and_invalid_names_on_every_host(self):
         invalid_paths = [
-            r"C:relative.txt", r"\\\\server\\share\\file.txt", r"\\\\?\\C:\\Windows\\win.ini",
+            r"C:relative.txt", r"\\server\share\file.txt", r"\\?\C:\Windows\win.ini",
             "src/file.txt:secret", "folder/NUL.txt", "folder/COM1.log",
-            "folder/name. ", "folder/name.", "folder/bad?.txt", "folder/../escape.txt",
+            "folder/COM0", "folder/LPT0.txt", "folder/CONIN$", "folder/CONOUT$.log",
+            "folder/COM¹", "folder/name. ", "folder/name.", "folder/bad?.txt",
+            "folder/../escape.txt",
         ]
         for invalid in invalid_paths:
             with self.subTest(path=invalid):
@@ -195,6 +200,98 @@ class GenerationSafetyTests(unittest.TestCase):
         self.assertFalse(gen.allowed_validation_command(["git", "push", "origin", "main"]))
         self.assertTrue(gen.allowed_validation_command(["python.exe", "-m", "py_compile", "app.py"]))
 
+    def test_validation_executable_is_pinned_and_python_env_is_ignored(self):
+        shim_dir = self.ws / "shim"
+        shim_dir.mkdir()
+        shim = shim_dir / ("python.exe" if os.name == "nt" else "python")
+        marker = shim_dir / "executed"
+        if os.name == "nt":
+            shim.write_text(f"echo hijacked > \"{marker}\"\n", encoding="utf-8")
+        else:
+            shim.write_text(f"#!/bin/sh\necho hijacked > {marker}\n", encoding="utf-8")
+        previous_path = os.environ.get("PATH", "")
+        previous_python = os.environ.get("PYTHON")
+        os.environ["PATH"] = str(shim_dir) + os.pathsep + previous_path
+        os.environ["PYTHON"] = str(shim)
+        try:
+            command = gen.ValidationCommand(
+                name="pinned_python",
+                argv=["python", "-c", "import sys; print(sys.executable)"],
+                cwd=".",
+                timeout_seconds=20,
+            )
+            result = gen.run_validation_command(self.ws, command)
+            self.assertEqual(result["status"], "succeeded", result)
+            self.assertEqual(Path(result["stdout"].strip()).resolve(), Path(sys.executable).resolve())
+            self.assertFalse(marker.exists())
+            self.assertFalse(gen.allowed_validation_command([str(shim), "-c", "pass"]))
+            (self.ws / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            for cmd in gen.default_validation_commands(self.ws):
+                if cmd.name in {"python_syntax", "pytest"}:
+                    self.assertEqual(Path(cmd.argv[0]).resolve(), Path(sys.executable).resolve())
+        finally:
+            os.environ["PATH"] = previous_path
+            if previous_python is None:
+                os.environ.pop("PYTHON", None)
+            else:
+                os.environ["PYTHON"] = previous_python
+
+    def test_validation_environment_is_minimal_and_output_is_redacted(self):
+        previous = {key: os.environ.get(key) for key in ("MY_CREDENTIAL", "DATABASE_URL")}
+        os.environ["MY_CREDENTIAL"] = "canary-credential"
+        os.environ["DATABASE_URL"] = "postgres://canary-host/db"
+        try:
+            command = gen.ValidationCommand(
+                name="scrubbed_env",
+                argv=["python", "-c", "import os; print(os.environ.get('MY_CREDENTIAL', '')); print(os.environ.get('DATABASE_URL', '')); print('SECRET_CANARY=canary-secret')"],
+                cwd=".",
+                timeout_seconds=20,
+            )
+            result = gen.run_validation_command(self.ws, command)
+            self.assertEqual(result["status"], "succeeded", result)
+            self.assertNotIn("canary-credential", result["stdout"])
+            self.assertNotIn("canary-host", result["stdout"])
+            self.assertNotIn("canary-secret", result["stdout"])
+            self.assertEqual(os.environ["MY_CREDENTIAL"], "canary-credential")
+            self.assertEqual(os.environ["DATABASE_URL"], "postgres://canary-host/db")
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_stage_manifest_tampering_is_rejected(self):
+        ops = gen.validate_file_operations(self.ws, [{"path": "app.py", "operation": "write", "content": "safe"}])
+        stage = gen.stage_operations(self.ws, ops)
+        extra = self.ws / ".crane-staging" / Path(stage["stage_dir"]).name / "extra.txt"
+        extra.write_text("not approved", encoding="utf-8")
+        stage["files"].append({
+            "path": "extra.txt", "operation": "write", "staged_path": str(extra), "bytes": 12,
+        })
+        try:
+            with self.assertRaises(gen.GenerationError):
+                gen.apply_staged_operations(self.ws, stage)
+            self.assertFalse((self.ws / "extra.txt").exists())
+            self.assertFalse(gen.cleanup_stage(stage, self.ws))
+        finally:
+            gen._remove_validated_stage_dir(Path(stage["stage_dir"]))
+
+    def test_validation_timeout_terminates_process_tree(self):
+        if os.name != "nt":
+            self.skipTest("Windows process-tree termination")
+        marker = self.ws / "child-marker.txt"
+        child = f"import time; time.sleep(3); open({str(marker)!r}, 'w').write('alive')"
+        script = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(10)"
+        command = gen.ValidationCommand(
+            name="tree_timeout", argv=["python", "-c", script], cwd=".", timeout_seconds=1,
+        )
+        result = gen.run_validation_command(self.ws, command)
+        self.assertEqual(result["status"], "failed", result)
+        self.assertIn("timeout", result.get("error", ""))
+        time.sleep(3.5)
+        self.assertFalse(marker.exists(), "timed-out descendant process survived")
+
     def test_duplicate_paths_rejected(self):
         with self.assertRaises(gen.GenerationError):
             gen.validate_file_operations(self.ws, [
@@ -234,6 +331,136 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         applied = gen.apply_staged_operations(self.ws, stage, approved_overwrites=True)
         self.assertEqual(applied["count"], 1)
         self.assertTrue((self.ws / "README.md").exists())
+
+    def _state_and_step(self, step_id):
+        state = workflow_engine.WorkflowState(
+            task_id="approval-task", user_input="Create a project", workspace=str(self.ws),
+        )
+        step = workflow_engine.PlanStep(
+            step_id=step_id, description="test step", expected_outcome="test outcome",
+        )
+        return state, step
+
+    async def test_generate_files_requires_exact_digest_bound_scope(self):
+        state, step = self._state_and_step("generate_files")
+        ops = gen.validate_file_operations(self.ws, [
+            {"path": "README.md", "operation": "write", "content": "# Hello\n"},
+        ])
+        state.generation["manifest"] = [op.to_dict() for op in ops]
+        wrong_scope = "generation:apply:approval-task:deadbeefdeadbeef"
+        state.granted_approvals = [wrong_scope]
+        with mock.patch("crane.python_runtime.protocol.write_stdout"):
+            blocked = await workflow_engine._exec_generation_step(state, step)
+            self.assertEqual(blocked["status"], "blocked", blocked)
+            scope = blocked["approval_scope"]
+            self.assertNotEqual(scope, wrong_scope)
+            self.assertEqual(state.generation["pending_approval"]["scope"], scope)
+            self.assertFalse((self.ws / "README.md").exists())
+
+            state.granted_approvals = [scope]
+            state.generation["approvals_granted"] = [scope]
+            applied = await workflow_engine._exec_generation_step(state, step)
+            self.assertEqual(applied["status"], "succeeded", applied)
+            self.assertEqual((self.ws / "README.md").read_text(encoding="utf-8"), "# Hello\n")
+            self.assertNotIn(scope, state.granted_approvals)
+
+            replayed = await workflow_engine._exec_generation_step(state, step)
+            self.assertEqual(replayed["status"], "blocked", replayed)
+            self.assertNotEqual(replayed["approval_scope"], scope)
+
+    async def test_validation_requires_exact_command_digest_scope(self):
+        state, step = self._state_and_step("validate_project")
+        state.generation["validation_plan"] = [{
+            "name": "safe_check", "argv": ["python", "-c", "print('validated')"],
+            "cwd": ".", "timeout_seconds": 20, "required": True,
+        }]
+        wrong_scope = "generation:validate:approval-task:deadbeefdeadbeef"
+        state.granted_approvals = [wrong_scope]
+        with mock.patch("crane.python_runtime.protocol.write_stdout"):
+            blocked = await workflow_engine._exec_generation_step(state, step)
+            self.assertEqual(blocked["status"], "blocked", blocked)
+            scope = blocked["approval_scope"]
+            self.assertNotEqual(scope, wrong_scope)
+            self.assertEqual(state.generation["pending_approval"]["scope"], scope)
+
+            state.granted_approvals = [scope]
+            state.generation["approvals_granted"] = [scope]
+            ok = await workflow_engine._exec_generation_step(state, step)
+            self.assertEqual(ok["status"], "succeeded", ok)
+            self.assertIn("validated", ok["output"]["validation_results"][0]["stdout"])
+            self.assertNotIn(scope, state.granted_approvals)
+
+            replayed = await workflow_engine._exec_generation_step(state, step)
+            self.assertEqual(replayed["status"], "blocked", replayed)
+            self.assertEqual(replayed["approval_scope"], scope)
+            self.assertNotIn(scope, state.granted_approvals)
+
+    async def test_repair_requires_exact_manifest_digest_and_never_regenerates_under_grant(self):
+        state, step = self._state_and_step("repair_project")
+        state.generation["validation_results"] = [{"name": "test", "status": "failed"}]
+        ops = gen.validate_file_operations(self.ws, [
+            {"path": "app.py", "operation": "write", "content": "fixed = True\n"},
+        ])
+        normalized = [op.to_dict() for op in ops]
+        state.generation["pending_repair_manifest"] = normalized
+        with mock.patch("crane.python_runtime.protocol.write_stdout"), \
+                mock.patch.object(workflow_engine, "_model_json", new=mock.AsyncMock(side_effect=AssertionError("model called under grant"))):
+            blocked = await workflow_engine._exec_generation_step(state, step)
+            self.assertEqual(blocked["status"], "blocked", blocked)
+            scope = blocked["approval_scope"]
+            self.assertIn("generation:repair:approval-task:", scope)
+            self.assertEqual(state.generation["pending_repair_digest"], scope.rsplit(":", 1)[1])
+            self.assertFalse((self.ws / "app.py").exists())
+
+            state.granted_approvals = [scope]
+            state.generation["approvals_granted"] = [scope]
+            repaired = await workflow_engine._exec_generation_step(state, step)
+            self.assertEqual(repaired["status"], "succeeded", repaired)
+            self.assertEqual((self.ws / "app.py").read_text(encoding="utf-8"), "fixed = True\n")
+            self.assertNotIn(scope, state.granted_approvals)
+
+    async def test_tampered_repair_manifest_is_rejected_after_approval(self):
+        state, step = self._state_and_step("repair_project")
+        state.generation["validation_results"] = [{"name": "test", "status": "failed"}]
+        ops = gen.validate_file_operations(self.ws, [
+            {"path": "app.py", "operation": "write", "content": "approved = True\n"},
+        ])
+        state.generation["pending_repair_manifest"] = [op.to_dict() for op in ops]
+        with mock.patch("crane.python_runtime.protocol.write_stdout"):
+            blocked = await workflow_engine._exec_generation_step(state, step)
+            scope = blocked["approval_scope"]
+            state.granted_approvals = [scope]
+            state.generation["approvals_granted"] = [scope]
+            state.generation["pending_repair_manifest"][0]["content"] = "tampered = True\n"
+            result = await workflow_engine._exec_generation_step(state, step)
+            self.assertEqual(result["status"], "failed", result)
+            self.assertIn("changed after approval", result["error"])
+            self.assertFalse((self.ws / "app.py").exists())
+
+    async def test_task_env_is_restored_and_resume_workspace_cannot_be_redirected(self):
+        original = os.environ.get("CRANE_TEST_ENV_CANARY")
+        checkpoint = workflow_engine.state_to_checkpoint(
+            workflow_engine.WorkflowState(task_id="resume-task", user_input="test", workspace=str(self.ws))
+        )
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        try:
+            with mock.patch("crane.python_runtime.protocol.write_stdout"):
+                await workflow_engine.execute_task(
+                    "echo test", task_id="env-task", env={"CRANE_TEST_ENV_CANARY": "injected"},
+                    workspace=str(self.ws),
+                )
+            self.assertIsNone(os.environ.get("CRANE_TEST_ENV_CANARY"))
+            with self.assertRaises(ValueError):
+                await workflow_engine.execute_task(
+                    "echo test", task_id="resume-task", resume=True,
+                    checkpoint=checkpoint, workspace=other.name,
+                )
+        finally:
+            if original is None:
+                os.environ.pop("CRANE_TEST_ENV_CANARY", None)
+            else:
+                os.environ["CRANE_TEST_ENV_CANARY"] = original
 
 
 if __name__ == "__main__":
