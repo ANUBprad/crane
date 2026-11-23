@@ -28,6 +28,7 @@ from crane.mcp_runtime import (
 )
 from crane.python_runtime import protocol
 from crane.python_runtime.context import build_runtime_context
+from crane.python_runtime import generation as gen
 from crane.python_runtime.provider import (
     ProviderError,
     invoke as invoke_provider,
@@ -293,6 +294,97 @@ def _validate_plan(state: WorkflowState, plan: List[PlanStep], tools_by_name: Di
     return True, ""
 
 
+GENERATION_INTENT_RE = re.compile(
+    r"\b(create|build|generate|scaffold|bootstrap|implement|make|develop|write)\b.{0,80}\b(app|application|project|service|api|cli|website|web app|backend|frontend|full[- ]?stack|script|tool|library|repo|repository|codebase)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_generation_task(state: WorkflowState) -> bool:
+    if state.generation.get("enabled"):
+        return True
+    if not state.workspace:
+        return False
+    obj = state.objective or state.user_input or ""
+    if GENERATION_INTENT_RE.search(obj):
+        return True
+    # Explicit create-style commands often come through agent create with workspace.
+    if state.runtime_context.get("task_kind") == "create":
+        return True
+    return False
+
+
+def _default_generation_plan(state: WorkflowState) -> List[PlanStep]:
+    return [
+        PlanStep(
+            step_id="analyze_requirements",
+            description="Analyze the software requirement and produce a structured project specification.",
+            expected_outcome="A validated project specification with objective, stack, structure, and validation requirements.",
+            dependencies=[],
+            required_capabilities=["reasoning"],
+            required_tools=[],
+            risk_classification="low",
+            approval_required=False,
+            completion_criteria="Project specification is complete enough to plan file generation.",
+        ),
+        PlanStep(
+            step_id="plan_project",
+            description="Create a validated project plan and file manifest for the authorized workspace.",
+            expected_outcome="A concrete file manifest and validation plan with no unsafe paths.",
+            dependencies=["analyze_requirements"],
+            required_capabilities=["planning"],
+            required_tools=[],
+            risk_classification="low",
+            approval_required=False,
+            completion_criteria="Plan includes file manifest, validations, and risk classification.",
+        ),
+        PlanStep(
+            step_id="generate_files",
+            description="Generate project source files as structured file operations and stage them in the authorized workspace.",
+            expected_outcome="All planned files are generated, validated, and staged for review/apply.",
+            dependencies=["plan_project"],
+            required_capabilities=["filesystem_write"],
+            required_tools=[],
+            risk_classification="high",
+            approval_required=True,
+            completion_criteria="Staged files exist and pass manifest/path validation.",
+        ),
+        PlanStep(
+            step_id="validate_project",
+            description="Run applicable validation checks against the generated project in the authorized workspace.",
+            expected_outcome="Validation commands execute and produce captured results.",
+            dependencies=["generate_files"],
+            required_capabilities=["controlled_execution"],
+            required_tools=[],
+            risk_classification="medium",
+            approval_required=True,
+            completion_criteria="Validation results are captured with actual command outputs.",
+        ),
+        PlanStep(
+            step_id="repair_project",
+            description="Diagnose validation failures and apply bounded focused repairs if needed.",
+            expected_outcome="Failures are repaired within limits or reported truthfully.",
+            dependencies=["validate_project"],
+            required_capabilities=["filesystem_write", "controlled_execution"],
+            required_tools=[],
+            risk_classification="high",
+            approval_required=True,
+            completion_criteria="Project is revalidated or repair limit/failure is recorded.",
+        ),
+        PlanStep(
+            step_id="final_report",
+            description="Produce a verified final project report based on actual files and validation results.",
+            expected_outcome="Final report includes location, files, checks, and limitations.",
+            dependencies=["repair_project"],
+            required_capabilities=["verification"],
+            required_tools=[],
+            risk_classification="low",
+            approval_required=False,
+            completion_criteria="Report reflects actual task state and verification outcomes.",
+        ),
+    ]
+
+
 def _default_plan(objective: str, tools_by_name: Dict[str, Dict[str, Any]]) -> List[PlanStep]:
     text = objective.lower()
     steps: List[PlanStep] = []
@@ -524,10 +616,53 @@ async def node_normalize(raw: Dict[str, Any]) -> Dict[str, Any]:
         "max_tool_output_chars": MAX_TOOL_OUTPUT_CHARS,
         "max_model_context_chars": MAX_MODEL_CONTEXT_CHARS,
     })
+
+    if state.workspace:
+        try:
+            ws = gen.canonicalize_workspace(state.workspace)
+            state.workspace = str(ws)
+            state.runtime_context.setdefault("workspace", {})
+            state.runtime_context["workspace"] = {"path": state.workspace, "authorized": True}
+        except Exception as exc:  # noqa: BLE001
+            _mark_terminal(state, ExecutionStatus.FAILED, "Invalid or unauthorized workspace", str(exc))
+            state.current_step = "workspace_invalid"
+            _event(state.task_id, "task_failed", {"error": str(exc)})
+            _persist_task_state(state)
+            return state_to_checkpoint(state)
+
+    if _is_generation_task(state):
+        state.generation = dict(state.generation or {})
+        plan_only = bool(state.generation.get("plan_only")) or "[PLAN ONLY]" in (state.user_input or "").upper()
+        state.generation.update({
+            "enabled": True,
+            "plan_only": plan_only,
+            "status": state.generation.get("status") or "planning",
+            "workspace": state.workspace,
+            "spec": state.generation.get("spec") or {},
+            "manifest": state.generation.get("manifest") or [],
+            "staged": state.generation.get("staged") or {},
+            "applied": state.generation.get("applied") or [],
+            "validation_results": state.generation.get("validation_results") or [],
+            "repair_attempts": int(state.generation.get("repair_attempts") or 0),
+            "max_repair_attempts": gen.MAX_REPAIR_ATTEMPTS,
+            "approvals": state.generation.get("approvals") or {},
+            "report": state.generation.get("report") or {},
+        })
+        if not state.generation.get("resumed"):
+            _event(state.task_id, "generation.started", {"workspace": state.workspace, "plan_only": plan_only})
+
+    # Resume: reset waiting approval/input steps if approvals/grants present.
+    if state.granted_approvals or state.execution_status in {ExecutionStatus.WAITING_FOR_APPROVAL.value, ExecutionStatus.WAITING_FOR_USER_INPUT.value}:
+        for s in state.plan:
+            if s.status in {"waiting_approval", "waiting_input"}:
+                s.status = "pending"
+        if state.execution_status in {ExecutionStatus.WAITING_FOR_APPROVAL.value, ExecutionStatus.WAITING_FOR_USER_INPUT.value}:
+            state.failure_reason = None
+
     state.state = TaskState.RUNNING
     state.execution_status = ExecutionStatus.RUNNING.value
     _record_transition(state, "start", "normalize", "task accepted")
-    _event(state.task_id, "workflow_started", {"provider": details.get("name"), "objective": state.objective})
+    _event(state.task_id, "workflow_started", {"provider": details.get("name"), "objective": state.objective, "generation": bool(state.generation.get("enabled"))})
     _persist_task_state(state)
     return state_to_checkpoint(state)
 
@@ -597,10 +732,25 @@ async def node_plan(raw: Dict[str, Any]) -> Dict[str, Any]:
     tools_by_name = _tool_index(manager)
     tools = _available_tools(manager)
     has_mcp = bool(manager is not None and manager.configs())
-    use_model_planning = selected_provider() == "ollama" and not has_mcp
-    plan = _build_plan_with_model(state, tools) if use_model_planning else None
-    if plan is None:
-        plan = _default_plan(state.objective, tools_by_name)
+
+    # Resume: preserve existing plan/progress when possible.
+    if state.plan and (state.plan_revisions > 0 or any(s.status != "pending" for s in state.plan) or state.generation.get("manifest")):
+        _plan_status_sync(state)
+        state.current_step = "planning_resumed"
+        _event(state.task_id, "plan_resumed", {"steps": [s.step_id for s in state.plan]})
+        _persist_task_state(state)
+        return state_to_checkpoint(state)
+
+    if _is_generation_task(state):
+        state.generation["enabled"] = True
+        state.generation["status"] = "planned"
+        state.generation["workspace"] = state.workspace
+        plan = _default_generation_plan(state)
+    else:
+        use_model_planning = selected_provider() == "ollama" and not has_mcp
+        plan = _build_plan_with_model(state, tools) if use_model_planning else None
+        if plan is None:
+            plan = _default_plan(state.objective, tools_by_name)
 
     ok, err = _validate_plan(state, plan, tools_by_name)
     if not ok:
@@ -709,9 +859,13 @@ async def node_select_next(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _invoke_model_for_step(state: WorkflowState, step: PlanStep, manager: Optional[MCPManager], tools: List[Any]) -> Dict[str, Any]:
-    runtime_tool_list = _available_tools(manager)
     conversation_messages = state.persistent_state.get("conversation_messages") or []
     system_prompt = (state.runtime_context.get("system_prompt") or "")
+
+    def _on_delta(text: str) -> None:
+        if text:
+            _event(state.task_id, "assistant.delta", {"delta": text})
+
     if selected_provider() == "ollama":
         prepare_provider()
         warm_provider()
@@ -725,6 +879,9 @@ async def _invoke_model_for_step(state: WorkflowState, step: PlanStep, manager: 
                 system_prompt=system_prompt,
                 messages=conversation_messages,
             )
+            model_output = str((out or {}).get("model_output") or "")
+            if model_output:
+                _on_delta(model_output)
             return out
         out = await asyncio.to_thread(
             invoke_provider,
@@ -733,6 +890,7 @@ async def _invoke_model_for_step(state: WorkflowState, step: PlanStep, manager: 
             system_prompt,
             conversation_messages,
             state.runtime_context,
+            _on_delta,
         )
         return out
     # local/deterministic path
@@ -743,6 +901,7 @@ async def _invoke_model_for_step(state: WorkflowState, step: PlanStep, manager: 
         system_prompt,
         conversation_messages,
         state.runtime_context,
+        _on_delta,
     )
     return out
 
@@ -814,6 +973,343 @@ async def _execute_tool_direct(state: WorkflowState, step: PlanStep, manager: MC
         state.selected_tool = None
 
 
+def _gen_scope(state: WorkflowState, name: str) -> str:
+    return f"generation:{name}:{state.task_id}"
+
+
+def _has_grant(state: WorkflowState, scope: str) -> bool:
+    return scope in (state.granted_approvals or []) or scope in (state.generation.get("approvals_granted") or [])
+
+
+def _grant(state: WorkflowState, scope: str) -> None:
+    if scope not in state.granted_approvals:
+        state.granted_approvals.append(scope)
+    g = state.generation.setdefault("approvals_granted", [])
+    if scope not in g:
+        g.append(scope)
+
+
+def _parse_model_json(text: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(text, str):
+        return None
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+async def _model_json(state: WorkflowState, prompt: str, system: str) -> Optional[Dict[str, Any]]:
+    if selected_provider() != "ollama":
+        return None
+    try:
+        prepare_provider()
+        warm_provider()
+        state.model_calls += 1
+        if state.model_calls > MAX_MODEL_CALLS_PER_TASK:
+            return None
+        out = await asyncio.to_thread(invoke_provider, prompt, None, system, state.persistent_state.get("conversation_messages") or [], state.runtime_context)
+        return _parse_model_json(str((out or {}).get("model_output") or ""))
+    except Exception:
+        return None
+
+
+def _default_generation_spec(state: WorkflowState) -> Dict[str, Any]:
+    obj = state.objective
+    lower = obj.lower()
+    stack = "python"
+    project_type = "python_app"
+    if "fastapi" in lower:
+        stack = "python-fastapi"
+        project_type = "api_service"
+    elif "react" in lower or "next.js" in lower or "nextjs" in lower or "typescript" in lower:
+        stack = "node-react-typescript" if "react" in lower else "node-typescript"
+        project_type = "web_app"
+    elif "go" in lower and "cli" in lower:
+        stack = "go"
+        project_type = "cli_tool"
+    name = re.sub(r"[^A-Za-z0-9_-]+", "-", obj.lower()).strip("-")[:40] or "generated-project"
+    return {
+        "project_name": name,
+        "project_type": project_type,
+        "objective": obj,
+        "features": [],
+        "stack": stack,
+        "runtime_requirements": [],
+        "structure": [],
+        "dependencies": [],
+        "validation_requirements": [],
+        "security_considerations": ["no secrets", "authorized workspace only"],
+        "assumptions": ["Generated minimal verifiable scaffold based on request; user should review and extend."],
+    }
+
+
+def _default_generation_manifest(state: WorkflowState, spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    stack = str(spec.get("stack") or "").lower()
+    name = str(spec.get("project_name") or "generated-project")
+    obj = str(spec.get("objective") or state.objective)
+    if "fastapi" in stack or ("python" in stack and "api" in str(spec.get("project_type") or "")):
+        return [
+            {"path": "README.md", "operation": "write", "description": "Project overview", "content": f"# {name}\n\n{obj}\n\n## Run\n\n```bash\npython -m venv .venv\n# install dependencies with approval\n# uvicorn app.main:app --reload\n```\n\n## Tests\n\n```bash\npython -m pytest -q\n```\n"},
+            {"path": "requirements.txt", "operation": "write", "description": "Python dependencies", "content": "fastapi\nuvicorn\npytest\nhttpx\n"},
+            {"path": "app/__init__.py", "operation": "write", "description": "App package", "content": ""},
+            {"path": "app/main.py", "operation": "write", "description": "FastAPI app", "content": "from fastapi import FastAPI, HTTPException\nfrom pydantic import BaseModel, Field\n\napp = FastAPI(title=\"Task API\")\n\nclass TaskIn(BaseModel):\n    title: str = Field(min_length=1, max_length=200)\n    completed: bool = False\n\nclass Task(TaskIn):\n    id: int\n\n_tasks: dict[int, Task] = {}\n_next_id = 1\n\n@app.get('/health')\ndef health():\n    return {'status': 'ok'}\n\n@app.get('/tasks', response_model=list[Task])\ndef list_tasks():\n    return list(_tasks.values())\n\n@app.post('/tasks', response_model=Task, status_code=201)\ndef create_task(payload: TaskIn):\n    global _next_id\n    task = Task(id=_next_id, **payload.model_dump())\n    _tasks[_next_id] = task\n    _next_id += 1\n    return task\n\n@app.get('/tasks/{task_id}', response_model=Task)\ndef get_task(task_id: int):\n    task = _tasks.get(task_id)\n    if not task:\n        raise HTTPException(status_code=404, detail='Task not found')\n    return task\n\n@app.put('/tasks/{task_id}', response_model=Task)\ndef update_task(task_id: int, payload: TaskIn):\n    if task_id not in _tasks:\n        raise HTTPException(status_code=404, detail='Task not found')\n    task = Task(id=task_id, **payload.model_dump())\n    _tasks[task_id] = task\n    return task\n\n@app.delete('/tasks/{task_id}', status_code=204)\ndef delete_task(task_id: int):\n    if task_id not in _tasks:\n        raise HTTPException(status_code=404, detail='Task not found')\n    del _tasks[task_id]\n    return None\n"},
+            {"path": "tests/test_app.py", "operation": "write", "description": "Basic API tests", "content": "from fastapi.testclient import TestClient\nfrom app.main import app\n\nclient = TestClient(app)\n\ndef test_health():\n    r = client.get('/health')\n    assert r.status_code == 200\n    assert r.json()['status'] == 'ok'\n\ndef test_crud():\n    r = client.post('/tasks', json={'title': 'Write tests', 'completed': False})\n    assert r.status_code == 201\n    task = r.json()\n    tid = task['id']\n    r = client.get(f'/tasks/{tid}')\n    assert r.status_code == 200\n    r = client.put(f'/tasks/{tid}', json={'title': 'Write tests', 'completed': True})\n    assert r.status_code == 200\n    assert r.json()['completed'] is True\n    r = client.delete(f'/tasks/{tid}')\n    assert r.status_code == 204\n    r = client.get(f'/tasks/{tid}')\n    assert r.status_code == 404\n"},
+        ]
+    if "go" in stack:
+        return [
+            {"path": "README.md", "operation": "write", "description": "Project overview", "content": f"# {name}\n\n{obj}\n\n## Run\n\n```bash\ngo run .\n```\n\n## Test\n\n```bash\ngo test ./...\n```\n"},
+            {"path": "go.mod", "operation": "write", "description": "Go module", "content": "module example.com/generated\n\ngo 1.22\n"},
+            {"path": "main.go", "operation": "write", "description": "CLI entrypoint", "content": "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc Run(args []string) string {\n\tif len(args) == 0 {\n\t\treturn \"generated CLI: ok\"\n\t}\n\treturn fmt.Sprintf(\"generated CLI: %s\", args[0])\n}\n\nfunc main() {\n\tfmt.Fprintln(os.Stdout, Run(os.Args[1:]))\n}\n"},
+            {"path": "main_test.go", "operation": "write", "description": "Basic test", "content": "package main\n\nimport \"testing\"\n\nfunc TestRun(t *testing.T) {\n\tif got := Run(nil); got != \"generated CLI: ok\" {\n\t\tt.Fatalf(\"unexpected: %s\", got)\n\t}\n}\n"},
+        ]
+    # Generic Python scaffold
+    return [
+        {"path": "README.md", "operation": "write", "description": "Project overview", "content": f"# {name}\n\n{obj}\n\n## Run\n\n```bash\npython -m app\n```\n"},
+        {"path": "app/__init__.py", "operation": "write", "description": "Package", "content": ""},
+        {"path": "app/__main__.py", "operation": "write", "description": "Entrypoint", "content": "from .core import summarize\n\nif __name__ == '__main__':\n    print(summarize())\n"},
+        {"path": "app/core.py", "operation": "write", "description": "Core logic", "content": f"def summarize() -> str:\n    return {obj!r}\n"},
+        {"path": "tests/test_core.py", "operation": "write", "description": "Basic test", "content": "from app.core import summarize\n\ndef test_summarize():\n    assert isinstance(summarize(), str)\n    assert summarize()\n"},
+    ]
+
+
+async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[str, Any]:
+    if not state.workspace:
+        return {"status": "failed", "error": "No authorized workspace provided for generation task"}
+    try:
+        ws = gen.canonicalize_workspace(state.workspace)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "failed", "error": str(exc)}
+
+    state.generation.setdefault("enabled", True)
+    state.generation.setdefault("approvals_granted", list(state.granted_approvals))
+    sid = step.step_id
+
+    if sid == "analyze_requirements":
+        spec = None
+        if selected_provider() == "ollama":
+            prompt = (
+                "Return ONLY JSON for a software project specification with keys: "
+                "project_name, project_type, objective, features (array), stack, runtime_requirements (array), "
+                "structure (array), dependencies (array), validation_requirements (array), security_considerations (array), assumptions (array). "
+                f"User request: {state.user_input}\nAuthorized workspace: {state.workspace}\n"
+            )
+            spec = await _model_json(state, prompt, "You produce strict JSON project specifications. No markdown.")
+        if not isinstance(spec, dict):
+            spec = _default_generation_spec(state)
+        spec["objective"] = spec.get("objective") or state.objective
+        state.generation["spec"] = spec
+        state.generation["status"] = "spec_ready"
+        _event(state.task_id, "generation.spec_ready", {"project_name": spec.get("project_name"), "stack": spec.get("stack")})
+        return {"status": "succeeded", "output": {"spec": spec}}
+
+    if sid == "plan_project":
+        spec = state.generation.get("spec") if isinstance(state.generation.get("spec"), dict) else _default_generation_spec(state)
+        manifest = None
+        if selected_provider() == "ollama":
+            prompt = (
+                "Return ONLY JSON with keys: files (array of {path, operation, description, content}), "
+                "validation_commands (array of {name, argv, cwd, timeout_seconds, required}), "
+                "notes (array). Paths must be relative to the authorized workspace. No absolute paths, no .., no .git/env writes. "
+                "Generate complete file contents, no placeholders. "
+                f"Specification: {json.dumps(spec, ensure_ascii=False)[:12000]}\n"
+            )
+            obj = await _model_json(state, prompt, "You produce strict JSON file manifests for safe project generation.")
+            if isinstance(obj, dict) and isinstance(obj.get("files"), list):
+                manifest = obj.get("files")
+                state.generation["validation_plan"] = obj.get("validation_commands") if isinstance(obj.get("validation_commands"), list) else []
+                state.generation["plan_notes"] = obj.get("notes") if isinstance(obj.get("notes"), list) else []
+        if not isinstance(manifest, list) or not manifest:
+            manifest = _default_generation_manifest(state, spec)
+            state.generation.setdefault("validation_plan", [])
+        try:
+            ops = gen.validate_file_operations(ws, manifest)
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "failed", "error": f"Invalid file manifest: {exc}"}
+        state.generation["manifest"] = [op.to_dict() for op in ops]
+        state.generation["status"] = "planned"
+        _event(state.task_id, "plan.ready", {"file_count": len(ops)})
+        return {"status": "succeeded", "output": {"file_count": len(ops), "files": [op.path for op in ops]}}
+
+    if sid == "generate_files":
+        manifest = state.generation.get("manifest") if isinstance(state.generation.get("manifest"), list) else []
+        if not manifest:
+            return {"status": "failed", "error": "No validated file manifest available"}
+        try:
+            ops = gen.validate_file_operations(ws, manifest)
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "failed", "error": f"Manifest validation failed: {exc}"}
+        collisions = gen.inspect_collisions(ws, ops)
+        overwrite_paths = [c["path"] for c in collisions if c.get("exists")]
+        needs_overwrite = any(c.get("exists") for c in collisions)
+        apply_scope = _gen_scope(state, "apply")
+        overwrite_scope = _gen_scope(state, "overwrite")
+        if needs_overwrite and not _has_grant(state, overwrite_scope):
+            state.generation["pending_approval"] = {
+                "scope": overwrite_scope,
+                "reason": "Applying generated files will overwrite existing workspace files.",
+                "paths": overwrite_paths,
+            }
+            _event(state.task_id, "approval_required", {"scope": overwrite_scope, "paths": overwrite_paths[:50]})
+            return {"status": "blocked", "error": "approval_required", "approval_scope": overwrite_scope, "paths": overwrite_paths[:50]}
+        if not _has_grant(state, apply_scope) and not _has_grant(state, overwrite_scope):
+            state.generation["pending_approval"] = {
+                "scope": apply_scope,
+                "reason": "Approval required before writing generated files to the authorized workspace.",
+                "paths": [op.path for op in ops],
+            }
+            _event(state.task_id, "approval_required", {"scope": apply_scope, "file_count": len(ops)})
+            return {"status": "blocked", "error": "approval_required", "approval_scope": apply_scope, "file_count": len(ops)}
+
+        if state.generation.get("plan_only"):
+            state.generation["status"] = "plan_only"
+            return {"status": "succeeded", "output": {"plan_only": True, "planned_files": [op.path for op in ops], "file_count": len(ops)}}
+
+        stage = gen.stage_operations(ws, ops)
+        state.generation["staged"] = stage
+        for f in stage.get("files", []):
+            if isinstance(f, dict):
+                _event(state.task_id, "generation.file.staged", {"path": f.get("path"), "operation": f.get("operation")})
+        applied = gen.apply_staged_operations(ws, stage, approved_overwrites=True)
+        state.generation["applied"] = applied.get("applied", [])
+        state.generation["status"] = "files_applied"
+        for rec in state.generation["applied"]:
+            if isinstance(rec, dict):
+                _event(state.task_id, "generation.file.written", {"path": rec.get("path"), "operation": rec.get("operation")})
+        gen.cleanup_stage(stage)
+        return {"status": "succeeded", "output": {"applied_count": applied.get("count", 0), "files": [r.get("path") for r in state.generation["applied"] if isinstance(r, dict)]}}
+
+    if sid == "validate_project":
+        if state.generation.get("plan_only"):
+            state.generation["validation_results"] = [{"name": "plan_only", "status": "skipped", "reason": "Plan-only mode; no files applied."}]
+            return {"status": "succeeded", "output": {"skipped": True, "reason": "plan_only"}}
+        validate_scope = _gen_scope(state, "validate")
+        if not _has_grant(state, validate_scope):
+            cmds = state.generation.get("validation_plan")
+            cmd_names = [c.get("name") for c in cmds] if isinstance(cmds, list) else []
+            state.generation["pending_approval"] = {"scope": validate_scope, "reason": "Approval required before executing validation commands in the workspace."}
+            _event(state.task_id, "approval_required", {"scope": validate_scope, "commands": cmd_names})
+            return {"status": "blocked", "error": "approval_required", "approval_scope": validate_scope}
+        commands = []
+        raw_cmds = state.generation.get("validation_plan")
+        if isinstance(raw_cmds, list) and raw_cmds:
+            for c in raw_cmds:
+                if not isinstance(c, dict):
+                    continue
+                argv = c.get("argv") if isinstance(c.get("argv"), list) else []
+                if not argv:
+                    continue
+                commands.append(gen.ValidationCommand(
+                    name=str(c.get("name") or "command"),
+                    argv=[str(a) for a in argv],
+                    cwd=str(c.get("cwd") or "."),
+                    timeout_seconds=int(c.get("timeout_seconds") or gen.DEFAULT_COMMAND_TIMEOUT_SECONDS),
+                    required=bool(c.get("required", True)),
+                ))
+        if not commands:
+            commands = gen.default_validation_commands(ws)
+        if not commands:
+            state.generation["validation_results"] = [{"name": "no_validation", "status": "skipped", "reason": "No applicable validation commands detected."}]
+            _event(state.task_id, "validation.completed", {"status": "skipped"})
+            return {"status": "succeeded", "output": {"validation_results": state.generation["validation_results"]}}
+        results = []
+        for cmd in commands:
+            _event(state.task_id, "validation.started", {"name": cmd.name, "argv": cmd.argv})
+            res = gen.run_validation_command(ws, cmd)
+            results.append(res)
+            _event(state.task_id, "validation.completed", {"name": cmd.name, "status": res.get("status"), "exit_code": res.get("exit_code")})
+            if res.get("status") != "succeeded" and cmd.required:
+                break
+        state.generation["validation_results"] = results
+        ok = all(r.get("status") == "succeeded" for r in results if r.get("status") != "skipped")
+        state.generation["status"] = "validated" if ok else "validation_failed"
+        return {"status": "succeeded" if ok else "failed", "output": {"validation_results": results}}
+
+    if sid == "repair_project":
+        if state.generation.get("plan_only"):
+            return {"status": "succeeded", "output": {"skipped": True, "reason": "plan_only"}}
+        results = state.generation.get("validation_results") if isinstance(state.generation.get("validation_results"), list) else []
+        failed = [r for r in results if isinstance(r, dict) and r.get("status") == "failed"]
+        if not failed:
+            return {"status": "succeeded", "output": {"message": "No repairs needed"}}
+        attempts = int(state.generation.get("repair_attempts") or 0)
+        if attempts >= gen.MAX_REPAIR_ATTEMPTS:
+            return {"status": "failed", "error": f"Repair attempt limit reached ({gen.MAX_REPAIR_ATTEMPTS})", "output": {"validation_results": results}}
+        repair_scope = _gen_scope(state, "repair")
+        if not _has_grant(state, repair_scope):
+            state.generation["pending_approval"] = {"scope": repair_scope, "reason": "Approval required before applying repair changes."}
+            _event(state.task_id, "approval_required", {"scope": repair_scope})
+            return {"status": "blocked", "error": "approval_required", "approval_scope": repair_scope}
+        state.generation["repair_attempts"] = attempts + 1
+        _event(state.task_id, "repair.started", {"attempt": attempts + 1})
+        # Ask model for focused repair manifest; fallback: report failure.
+        repair_manifest = None
+        if selected_provider() == "ollama":
+            prompt = (
+                "Return ONLY JSON with key 'files' as array of {path, operation, description, content} for minimal repairs. "
+                "Only include files that must change. Paths must be relative to workspace. No placeholders.\n"
+                f"Objective: {state.objective}\n"
+                f"Failures: {json.dumps(failed, ensure_ascii=False)[:12000]}\n"
+                f"Current manifest paths: {json.dumps([m.get('path') for m in (state.generation.get('manifest') or []) if isinstance(m, dict)], ensure_ascii=False)}\n"
+            )
+            obj = await _model_json(state, prompt, "You produce strict JSON minimal repair file operations.")
+            if isinstance(obj, dict) and isinstance(obj.get("files"), list):
+                repair_manifest = obj.get("files")
+        if not repair_manifest:
+            return {"status": "failed", "error": "Unable to generate repair plan; manual review required", "output": {"validation_results": results}}
+        try:
+            ops = gen.validate_file_operations(ws, repair_manifest)
+            stage = gen.stage_operations(ws, ops)
+            applied = gen.apply_staged_operations(ws, stage, approved_overwrites=True)
+            gen.cleanup_stage(stage)
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "failed", "error": f"Repair apply failed: {exc}"}
+        # Re-run validations
+        cmds = []
+        raw_cmds = state.generation.get("validation_plan")
+        if isinstance(raw_cmds, list) and raw_cmds:
+            for c in raw_cmds:
+                if isinstance(c, dict) and isinstance(c.get("argv"), list):
+                    cmds.append(gen.ValidationCommand(name=str(c.get("name") or "command"), argv=[str(a) for a in c.get("argv")], cwd=str(c.get("cwd") or "."), timeout_seconds=int(c.get("timeout_seconds") or gen.DEFAULT_COMMAND_TIMEOUT_SECONDS), required=bool(c.get("required", True))))
+        if not cmds:
+            cmds = gen.default_validation_commands(ws)
+        results2 = []
+        for cmd in cmds:
+            _event(state.task_id, "validation.started", {"name": cmd.name, "argv": cmd.argv, "repair_attempt": attempts + 1})
+            res = gen.run_validation_command(ws, cmd)
+            results2.append(res)
+            _event(state.task_id, "validation.completed", {"name": cmd.name, "status": res.get("status"), "exit_code": res.get("exit_code"), "repair_attempt": attempts + 1})
+            if res.get("status") != "succeeded" and cmd.required:
+                break
+        state.generation["validation_results"] = results2
+        ok = all(r.get("status") == "succeeded" for r in results2 if r.get("status") != "skipped")
+        state.generation["status"] = "validated" if ok else "validation_failed"
+        return {"status": "succeeded" if ok else "failed", "output": {"applied": applied.get("applied", []), "validation_results": results2, "attempt": attempts + 1}}
+
+    if sid == "final_report":
+        spec = state.generation.get("spec") if isinstance(state.generation.get("spec"), dict) else {}
+        applied = state.generation.get("applied") if isinstance(state.generation.get("applied"), list) else []
+        validations = state.generation.get("validation_results") if isinstance(state.generation.get("validation_results"), list) else []
+        report = {
+            "workspace": state.workspace,
+            "project_name": spec.get("project_name"),
+            "stack": spec.get("stack"),
+            "files": [a.get("path") for a in applied if isinstance(a, dict)],
+            "applied_operations": applied,
+            "validations": validations,
+            "repair_attempts": state.generation.get("repair_attempts", 0),
+            "status": state.generation.get("status"),
+        }
+        state.generation["report"] = report
+        _event(state.task_id, "generation.completed", {"status": report["status"], "file_count": len(report["files"])})
+        return {"status": "succeeded", "output": report}
+
+    return {"status": "failed", "error": f"Unknown generation step: {sid}"}
+
+
 async def node_execute_step(raw: Dict[str, Any]) -> Dict[str, Any]:
     state = _as_state(raw)
     _check_cancelled(state.task_id)
@@ -834,6 +1330,40 @@ async def node_execute_step(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     state.current_step = f"executing:{step.step_id}"
     _event(state.task_id, "step_started", {"step_id": step.step_id, "description": step.description})
+
+    if state.generation.get("enabled") and step.step_id in {
+        "analyze_requirements", "plan_project", "generate_files", "validate_project", "repair_project", "final_report",
+    }:
+        try:
+            out = await _exec_generation_step(state, step)
+            # Normalize for evaluation.
+            if isinstance(out, dict):
+                if "output" in out and "result" not in out:
+                    out["result"] = out["output"]
+                if out.get("status") == "succeeded" and not out.get("model_output"):
+                    out["model_output"] = _text(out.get("result") or out.get("output") or "Generation step completed", 4000)
+                if out.get("status") == "blocked":
+                    state.persistent_state["last_action_output"] = out
+                    step.status = "waiting_approval"
+                    state.execution_status = ExecutionStatus.WAITING_FOR_APPROVAL.value
+                    state.failure_reason = str(out.get("reason") or out.get("error") or "Approval required")
+                    _event(state.task_id, "approval_required", {"step_id": step.step_id, "scope": out.get("approval_scope")})
+                    _persist_task_state(state)
+                    return state_to_checkpoint(state)
+            state.persistent_state["last_action_output"] = out
+            if isinstance(out, dict):
+                state.persistent_state["last_model_output"] = {
+                    "execution_mode": "generation_runtime",
+                    "provider": selected_provider(),
+                    "model_output": out.get("model_output") or _text(out.get("result") or out.get("output") or "", 4000),
+                }
+        except WorkflowCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("generation step failed for %s", state.task_id)
+            state.persistent_state["last_action_output"] = {"status": "failed", "error": f"Generation step failed: {type(exc).__name__}"}
+        _persist_task_state(state)
+        return state_to_checkpoint(state)
 
     # If there are MCP tools and provider is local, do not pretend autonomous execution.
     if manager is not None and manager.configs() and selected_provider() == "local" and _step_needs_tool(step, tools_by_name):
@@ -1213,6 +1743,31 @@ async def node_verify(raw: Dict[str, Any]) -> Dict[str, Any]:
     # Back-compat: deterministic local should report execution_mode clearly and not claim LLM output.
     if state.result.get("execution_mode") == "deterministic_local" and state.result.get("model_output") is None:
         pass
+    if state.generation.get("enabled"):
+        report = state.generation.get("report") or {
+            "workspace": state.workspace,
+            "status": state.generation.get("status"),
+            "files": [a.get("path") for a in (state.generation.get("applied") or []) if isinstance(a, dict)],
+            "validations": state.generation.get("validation_results") or [],
+            "repair_attempts": state.generation.get("repair_attempts", 0),
+        }
+        state.result["generation"] = report
+        state.result["workspace"] = state.workspace
+        # Provide a clear model_output for CLI display.
+        if not str(state.result.get("model_output") or "").strip() or state.result.get("model_output") == final.get("model_output"):
+            lines = [
+                f"Generation status: {state.execution_status}",
+                f"Workspace: {state.workspace}",
+                f"Files: {len(report.get('files') or [])}",
+            ]
+            vals = report.get("validations") or []
+            if vals:
+                ok = sum(1 for v in vals if isinstance(v, dict) and v.get("status") == "succeeded")
+                lines.append(f"Validations: {ok}/{len(vals)} succeeded")
+            if report.get("repair_attempts"):
+                lines.append(f"Repair attempts: {report.get('repair_attempts')}")
+            state.result["model_output"] = "\n".join(lines)
+            final["model_output"] = state.result["model_output"]
     state.current_step = "verified"
     _event(state.task_id, "verification_completed", {"execution_status": state.execution_status})
     _persist_task_state(state)
@@ -1333,6 +1888,7 @@ def _build_initial_state(
     checkpoint: Optional[Dict[str, Any]],
     conversation_id: Optional[str],
     conversation_messages: Optional[List[Dict[str, Any]]],
+    workspace: Optional[str] = None,
 ) -> WorkflowState:
     if resume and isinstance(checkpoint, dict):
         state = state_from_checkpoint(checkpoint)
@@ -1340,16 +1896,19 @@ def _build_initial_state(
         state.user_input = user_input or state.user_input
         state.objective = state.objective or _normalize_objective(state.user_input)
         state.conversation_id = conversation_id or state.conversation_id
+        if workspace:
+            state.workspace = workspace
     else:
-        state = WorkflowState(task_id=task_id, user_input=user_input, objective=_normalize_objective(user_input), conversation_id=conversation_id)
+        state = WorkflowState(task_id=task_id, user_input=user_input, objective=_normalize_objective(user_input), conversation_id=conversation_id, workspace=(workspace or ""))
     state.python_runtime_pid = os.getpid()
-    # Build runtime context. Use manager later after connection.
     runtime_context = build_runtime_context(
         user_input=state.user_input,
         conversation_id=state.conversation_id,
         conversation_messages=conversation_messages or [],
         mcp_tools=[],
     )
+    if state.workspace:
+        runtime_context["workspace"] = {"path": state.workspace, "authorized": True}
     state.runtime_context = runtime_context
     state.persistent_state["conversation_messages"] = list(conversation_messages or [])[-MAX_CONTEXT_MESSAGES:]
     return state
@@ -1390,6 +1949,7 @@ async def execute_task(
     conversation_messages: Optional[List[Dict[str, Any]]] = None,
     python_runtime_pid: Optional[int] = None,
     resume_checkpoint: Optional[Dict[str, Any]] = None,
+    workspace: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute a task through the LangGraph System 2 workflow.
 
@@ -1400,7 +1960,7 @@ async def execute_task(
     cancel_event = threading.Event()
     _register_cancellation(task_id, cancel_event)
     manager: Optional[MCPManager] = None
-    state = _build_initial_state(user_input, task_id, resume, checkpoint, conversation_id, conversation_messages)
+    state = _build_initial_state(user_input, task_id, resume, checkpoint, conversation_id, conversation_messages, workspace)
     if python_runtime_pid is not None:
         state.python_runtime_pid = python_runtime_pid
     try:
@@ -1415,6 +1975,8 @@ async def execute_task(
             conversation_messages=conversation_messages or [],
             mcp_tools=tools,
         )
+        if state.workspace:
+            state.runtime_context["workspace"] = {"path": state.workspace, "authorized": True}
         _set_manager(task_id, manager)
 
         # Fail fast for impossible provider/tool combinations.

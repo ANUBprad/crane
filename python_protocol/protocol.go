@@ -219,6 +219,7 @@ type TaskSubmission struct {
 	GrantedApprovals     []string                 `json:"granted_approvals,omitempty"`
 	ConversationID       string                   `json:"conversation_id,omitempty"`
 	ConversationMessages []ConversationMessage    `json:"conversation_messages,omitempty"`
+	Workspace            string                   `json:"workspace,omitempty"`
 }
 
 // TaskCancellation propagates a Go-owned cancellation decision to Python.

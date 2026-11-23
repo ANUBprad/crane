@@ -43,9 +43,10 @@ var (
 	ErrTaskNotActive = errors.New("task has no active runtime")
 )
 
-type conversationContext struct {
+type taskContext struct {
 	ConversationID string
 	Messages       []python_protocol.ConversationMessage
+	Workspace      string
 }
 
 type runningTask struct {
@@ -146,7 +147,7 @@ type Supervisor struct {
 	limits            chan struct{}
 	activeMu          sync.Mutex
 	active            map[string]*runningTask
-	conversations     map[string]conversationContext
+	taskContexts      map[string]taskContext
 	events            *eventHub
 }
 
@@ -170,7 +171,7 @@ func NewWithStore(store *persistence.Store) *Supervisor {
 		shutdownTimeout: 10 * time.Second,
 		limits:          make(chan struct{}, maxConcurrentTasks),
 		active:          make(map[string]*runningTask),
-		conversations:   make(map[string]conversationContext),
+		taskContexts:    make(map[string]taskContext),
 		events:          newEventHub(store),
 	}
 }
@@ -268,11 +269,11 @@ func (s *Supervisor) HealthCheck() error {
 
 // AdmitTask durably accepts one task and then schedules bounded execution.
 func (s *Supervisor) AdmitTask(id, input string) (persistence.TaskRecord, error) {
-	return s.AdmitTaskWithContext(id, input, "", nil)
+	return s.AdmitTaskWithContext(id, input, "", nil, "")
 }
 
-// AdmitTaskWithContext durably accepts one task with optional conversation context.
-func (s *Supervisor) AdmitTaskWithContext(id, input string, conversationID string, conversationMessages []python_protocol.ConversationMessage) (persistence.TaskRecord, error) {
+// AdmitTaskWithContext durably accepts one task with optional conversation context and workspace.
+func (s *Supervisor) AdmitTaskWithContext(id, input string, conversationID string, conversationMessages []python_protocol.ConversationMessage, workspace string) (persistence.TaskRecord, error) {
 	if !s.IsRunning() {
 		return persistence.TaskRecord{}, errors.New("supervisor is not running")
 	}
@@ -291,9 +292,14 @@ func (s *Supervisor) AdmitTaskWithContext(id, input string, conversationID strin
 	if _, err := s.store.CreateTask(id, "queued", input); err != nil {
 		return persistence.TaskRecord{}, err
 	}
-	if conversationID != "" || len(conversationMessages) > 0 {
+	workspace = strings.TrimSpace(workspace)
+	if conversationID != "" || len(conversationMessages) > 0 || workspace != "" {
 		s.activeMu.Lock()
-		s.conversations[id] = conversationContext{ConversationID: conversationID, Messages: append([]python_protocol.ConversationMessage(nil), conversationMessages...)}
+		s.taskContexts[id] = taskContext{
+			ConversationID: conversationID,
+			Messages:       append([]python_protocol.ConversationMessage(nil), conversationMessages...),
+			Workspace:      workspace,
+		}
 		s.activeMu.Unlock()
 	}
 	s.emitEvent(id, "task_admitted", map[string]any{"status": "queued"})
@@ -352,6 +358,86 @@ func (s *Supervisor) CancelTask(id string) (persistence.TaskRecord, error) {
 	return s.store.GetTaskRecord(id)
 }
 
+// ApproveTask grants an approval scope and resumes a waiting-for-approval task.
+// If approved is false, the task remains terminal/failed with a clear rejection.
+func (s *Supervisor) ApproveTask(id string, approved bool, scope string) (persistence.TaskRecord, error) {
+	if !s.IsRunning() {
+		return persistence.TaskRecord{}, errors.New("supervisor is not running")
+	}
+	if !persistence.ValidTaskID(id) {
+		return persistence.TaskRecord{}, persistence.ErrTaskNotFound
+	}
+	record, err := s.store.GetTaskRecord(id)
+	if err != nil {
+		return persistence.TaskRecord{}, err
+	}
+	checkpoint, hasCheckpoint := s.store.GetLatestTaskState(id)
+	var ckpt map[string]any
+	if hasCheckpoint && json.Valid(checkpoint) {
+		_ = json.Unmarshal(checkpoint, &ckpt)
+	}
+	execStatus, _ := ckpt["execution_status"].(string)
+	waiting := execStatus == "waiting_for_approval" || record.Status == "waiting_approval"
+	if !waiting {
+		return record, errors.New("task is not waiting for approval")
+	}
+	if !approved {
+		_ = s.store.CompleteTask(id, "failed", record.Result, "approval rejected by user")
+		s.emitEvent(id, "approval_rejected", map[string]any{"scope": scope})
+		return s.store.GetTaskRecord(id)
+	}
+
+	// Merge granted approvals in checkpoint.
+	grants := []string{}
+	if existing, ok := ckpt["granted_approvals"].([]any); ok {
+		for _, g := range existing {
+			if gs, ok := g.(string); ok && gs != "" {
+				grants = append(grants, gs)
+			}
+		}
+	}
+	if scope != "" {
+		found := false
+		for _, g := range grants {
+			if g == scope {
+				found = true
+				break
+			}
+		}
+		if !found {
+			grants = append(grants, scope)
+		}
+	}
+	if ckpt == nil {
+		ckpt = map[string]any{}
+	}
+	ckpt["granted_approvals"] = grants
+	ckpt["execution_status"] = "running"
+	ckpt["state"] = "running"
+	ckpt["failure_reason"] = nil
+	ckpt["resumable"] = true
+	updatedCheckpoint, _ := json.Marshal(ckpt)
+	_ = s.store.SaveTaskState(id, updatedCheckpoint)
+	if err := s.store.UpdateTaskStatus(id, "queued"); err != nil {
+		return persistence.TaskRecord{}, err
+	}
+	// Restore context if missing.
+	s.activeMu.Lock()
+	if _, ok := s.taskContexts[id]; !ok {
+		ws, _ := ckpt["workspace"].(string)
+		convID, _ := ckpt["conversation_id"].(string)
+		s.taskContexts[id] = taskContext{ConversationID: convID, Workspace: ws}
+	}
+	s.activeMu.Unlock()
+	task, err := s.store.GetTask(id)
+	if err != nil {
+		return persistence.TaskRecord{}, err
+	}
+	s.emitEvent(id, "approval_granted", map[string]any{"scope": scope})
+	s.enqueue(id, task["input"], updatedCheckpoint, true)
+	return s.store.GetTaskRecord(id)
+}
+
 // SubscribeTaskEvents replays persisted events after a cursor and delivers
 // live events. Disconnecting never cancels the underlying task.
 func (s *Supervisor) SubscribeTaskEvents(id string, after int64) (<-chan persistence.TaskEvent, func(), error) {
@@ -368,12 +454,29 @@ func (s *Supervisor) SubscribeTaskEvents(id string, after int64) (<-chan persist
 }
 
 func (s *Supervisor) emitEvent(taskID, eventType string, payload any) {
-	event, err := s.store.AppendTaskEvent(taskID, eventType, payload)
-	if err != nil {
-		return
+	s.emitEventWithPersist(taskID, eventType, payload, !ephemeralEventType(eventType))
+}
+
+func ephemeralEventType(eventType string) bool {
+	switch eventType {
+	case "assistant.delta":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Supervisor) emitEventWithPersist(taskID, eventType string, payload any, persist bool) {
+	var id int64
+	if persist {
+		var err error
+		id, err = s.store.AppendTaskEvent(taskID, eventType, payload)
+		if err != nil {
+			return
+		}
 	}
 	s.events.publish(persistence.TaskEvent{
-		ID: event, TaskID: taskID, Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		ID: id, TaskID: taskID, Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 		Type: eventType, Payload: mustJSON(payload),
 	})
 }
@@ -448,6 +551,7 @@ func (s *Supervisor) executeTask(id, input string, checkpoint []byte, resume boo
 		s.activeMu.Lock()
 		if s.active[id] == task {
 			delete(s.active, id)
+			delete(s.taskContexts, id)
 		}
 		s.activeMu.Unlock()
 	}()
@@ -459,7 +563,7 @@ func (s *Supervisor) executeTask(id, input string, checkpoint []byte, resume boo
 		return
 	}
 	s.activeMu.Lock()
-	convCtx := s.conversations[id]
+	ctxMeta := s.taskContexts[id]
 	s.activeMu.Unlock()
 	submission := python_protocol.TaskSubmission{
 		Message:              python_protocol.Message{Version: python_protocol.ProtocolVersion, Type: python_protocol.TypeTaskSubmission},
@@ -470,8 +574,9 @@ func (s *Supervisor) executeTask(id, input string, checkpoint []byte, resume boo
 		TimeoutMs:            taskExecutionTimeout.Milliseconds(),
 		MCPServers:           servers,
 		GrantedApprovals:     grants,
-		ConversationID:       convCtx.ConversationID,
-		ConversationMessages: convCtx.Messages,
+		ConversationID:       ctxMeta.ConversationID,
+		ConversationMessages: ctxMeta.Messages,
+		Workspace:            ctxMeta.Workspace,
 	}
 	if err := task.send(submission); err != nil {
 		cancel()

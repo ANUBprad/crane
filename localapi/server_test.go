@@ -49,10 +49,10 @@ func newMockController(store *persistence.Store) *mockController {
 }
 
 func (m *mockController) AdmitTask(id, input string) (persistence.TaskRecord, error) {
-	return m.AdmitTaskWithContext(id, input, "", nil)
+	return m.AdmitTaskWithContext(id, input, "", nil, "")
 }
 
-func (m *mockController) AdmitTaskWithContext(id, input string, conversationID string, conversationMessages []python_protocol.ConversationMessage) (persistence.TaskRecord, error) {
+func (m *mockController) AdmitTaskWithContext(id, input string, conversationID string, conversationMessages []python_protocol.ConversationMessage, workspace string) (persistence.TaskRecord, error) {
 	if _, err := m.store.CreateTask(id, "queued", input); err != nil {
 		return persistence.TaskRecord{}, err
 	}
@@ -68,6 +68,18 @@ func (m *mockController) CancelTask(id string) (persistence.TaskRecord, error) {
 		return persistence.TaskRecord{}, err
 	}
 	m.cancelled <- id
+	return m.store.GetTaskRecord(id)
+}
+
+func (m *mockController) ApproveTask(id string, approved bool, scope string) (persistence.TaskRecord, error) {
+	if _, err := m.store.GetTaskRecord(id); err != nil {
+		return persistence.TaskRecord{}, err
+	}
+	if approved {
+		_ = m.store.UpdateTaskStatus(id, "queued")
+	} else {
+		_ = m.store.CompleteTask(id, "failed", "", "approval rejected")
+	}
 	return m.store.GetTaskRecord(id)
 }
 

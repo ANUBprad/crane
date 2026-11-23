@@ -166,6 +166,12 @@ def parse_task_submission(message: Dict[str, Any]) -> Dict[str, Any]:
             content = content.encode("utf-8")[: 16 * 1024].decode("utf-8", errors="ignore")
         normalized_messages.append({"role": role, "content": content})
 
+    workspace = message.get("workspace")
+    if workspace is not None:
+        if not isinstance(workspace, str) or len(workspace) > 4096:
+            raise ProtocolError("workspace must be a bounded string")
+        workspace = workspace.strip()
+
     return {
         "task_id": task_id,
         "input": user_input,
@@ -175,6 +181,7 @@ def parse_task_submission(message: Dict[str, Any]) -> Dict[str, Any]:
         "granted_approvals": approvals,
         "conversation_id": conversation_id,
         "conversation_messages": normalized_messages,
+        "workspace": workspace or "",
     }
 
 

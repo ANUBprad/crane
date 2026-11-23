@@ -3,6 +3,7 @@
 package localclient
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,7 +56,7 @@ func (c *Client) Health(ctx context.Context) (localapi.HealthResponse, error) {
 
 // CreateTask submits one task to the running supervisor.
 func (c *Client) CreateTask(ctx context.Context, id, input string) (persistence.TaskRecord, error) {
-	return c.CreateTaskWithContext(ctx, id, input, "", nil)
+	return c.CreateTaskWithContext(ctx, id, input, "", nil, "")
 }
 
 // ConversationMessage mirrors the API conversation message payload.
@@ -63,8 +65,8 @@ type ConversationMessage struct {
 	Content string `json:"content"`
 }
 
-// CreateTaskWithContext submits one task with optional conversation context.
-func (c *Client) CreateTaskWithContext(ctx context.Context, id, input, conversationID string, messages []ConversationMessage) (persistence.TaskRecord, error) {
+// CreateTaskWithContext submits one task with optional conversation context and workspace.
+func (c *Client) CreateTaskWithContext(ctx context.Context, id, input, conversationID string, messages []ConversationMessage, workspace string) (persistence.TaskRecord, error) {
 	var response struct {
 		Task persistence.TaskRecord `json:"task"`
 	}
@@ -74,6 +76,9 @@ func (c *Client) CreateTaskWithContext(ctx context.Context, id, input, conversat
 	}
 	if len(messages) > 0 {
 		payload["conversation_messages"] = messages
+	}
+	if strings.TrimSpace(workspace) != "" {
+		payload["workspace"] = workspace
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -123,6 +128,134 @@ func (c *Client) CancelTask(ctx context.Context, id string) (persistence.TaskRec
 		return response.Task, err
 	}
 	return response.Task, nil
+}
+
+// ApproveTask approves or rejects a waiting approval and resumes if approved.
+func (c *Client) ApproveTask(ctx context.Context, id string, approved bool, scope string) (persistence.TaskRecord, error) {
+	var response struct {
+		Task persistence.TaskRecord `json:"task"`
+	}
+	if !persistence.ValidTaskID(id) {
+		return response.Task, persistence.ErrTaskNotFound
+	}
+	payload := map[string]any{"approved": approved, "scope": scope}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return response.Task, err
+	}
+	data, err := c.do(ctx, http.MethodPost, "/v1/tasks/"+id+"/approve", body)
+	if err != nil {
+		return response.Task, err
+	}
+	if err := unmarshalEnvelope(data, &response); err != nil {
+		return response.Task, err
+	}
+	return response.Task, nil
+}
+
+// TaskEvent is a streamed task event from the local API SSE endpoint.
+type TaskEvent struct {
+	ID        int64           `json:"id"`
+	TaskID    string          `json:"task_id"`
+	Timestamp string          `json:"timestamp"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+// StreamTaskEvents subscribes to task SSE events and calls onEvent for each event.
+// It returns when context is cancelled, the stream ends, or an error occurs.
+func (c *Client) StreamTaskEvents(ctx context.Context, taskID string, after int64, onEvent func(TaskEvent) error) error {
+	if !persistence.ValidTaskID(taskID) {
+		return persistence.ErrTaskNotFound
+	}
+	if err := c.auth.Load(); err != nil {
+		return errors.New("installation token is unavailable; start the CRANE supervisor first")
+	}
+	token, err := c.auth.CurrentToken()
+	if err != nil {
+		return errors.New("installation token is unavailable; start the CRANE supervisor first")
+	}
+	path := "/v1/tasks/" + taskID + "/events"
+	if after > 0 {
+		path += "?cursor=" + strconv.FormatInt(after, 10)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "text/event-stream")
+	if after > 0 {
+		req.Header.Set("Last-Event-ID", strconv.FormatInt(after, 10))
+	}
+	streamClient := &http.Client{Timeout: 0}
+	resp, err := streamClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		code := apiErrorCode(data)
+		if code == "" {
+			code = http.StatusText(resp.StatusCode)
+		}
+		return fmt.Errorf("local API: %s", code)
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	var eventType string
+	var dataLines []string
+	var eventID int64
+	dispatch := func() error {
+		if eventType == "" && len(dataLines) == 0 {
+			return nil
+		}
+		data := strings.Join(dataLines, "\n")
+		ev := TaskEvent{ID: eventID, TaskID: taskID, Type: eventType, Payload: json.RawMessage(data)}
+		eventType = ""
+		dataLines = nil
+		eventID = 0
+		if ev.Type == "" {
+			return nil
+		}
+		return onEvent(ev)
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if err := dispatch(); err != nil {
+				return err
+			}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if strings.HasPrefix(line, "id:") {
+			if v, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(line, "id:")), 10, 64); err == nil {
+				eventID = v
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	if err := dispatch(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // MCPStatus reports live MCP controller state.

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -63,6 +64,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runTask(args[1:], stdout, stderr)
 	case "run":
 		return runTaskPrompt(args[1:], stdout, stderr)
+	case "create":
+		return runCreate(args[1:], stdout, stderr)
 	case "chat":
 		return runChat(args[1:], stdout, stderr)
 	case "auth":
@@ -89,7 +92,8 @@ func printUsage(stdout io.Writer) {
 	fmt.Fprintln(stdout, "")
 	fmt.Fprintln(stdout, "Usage:")
 	fmt.Fprintln(stdout, "  agent                      Start the supervisor and local API")
-	fmt.Fprintln(stdout, "  agent run \"task\"            Submit a task and print its ID")
+	fmt.Fprintln(stdout, "  agent run \"task\"            Submit a task and follow live progress")
+	fmt.Fprintln(stdout, "  agent create \"objective\" --workspace <dir>  Generate a project in an authorized workspace")
 	fmt.Fprintln(stdout, "  agent chat [flags]         Start or resume a persistent conversation")
 	fmt.Fprintln(stdout, "  agent status <task-id>     Report persisted task status")
 	fmt.Fprintln(stdout, "  agent result <task-id>     Print a completed task result")
@@ -286,27 +290,163 @@ func runTaskPrompt(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if _, err := client.Health(ctx); err != nil {
+	ctx := context.Background()
+	healthCtx, healthCancel := context.WithTimeout(ctx, 30*time.Second)
+	if _, err := client.Health(healthCtx); err != nil {
 		executable, execErr := os.Executable()
 		if execErr != nil {
+			healthCancel()
 			return execErr
 		}
 		if startErr := startDetachedServe(executable); startErr != nil {
+			healthCancel()
 			return startErr
 		}
-		if err := waitForSupervisor(ctx, client); err != nil {
+		if err := waitForSupervisor(healthCtx, client); err != nil {
+			healthCancel()
 			return err
 		}
 	}
-	created, err := client.CreateTask(ctx, id, input)
+	healthCancel()
+
+	submitCtx, submitCancel := context.WithTimeout(ctx, 30*time.Second)
+	created, err := client.CreateTask(submitCtx, id, input)
+	submitCancel()
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "task %s %s\n", created.ID, created.Status)
-	return nil
+
+	for {
+		renderer, cancelStream := streamTaskOutput(ctx, client, created.ID, stdout, stderr)
+		record, err := waitForTaskCompletion(ctx, client, created.ID, 10*time.Minute)
+		cancelStream()
+		time.Sleep(150 * time.Millisecond)
+		if err != nil {
+			return err
+		}
+		if taskExecutionStatus(record) == "waiting_for_approval" {
+			_, approved, aerr := promptApproval(ctx, client, record, os.Stdin, stdout, stderr)
+			if aerr != nil {
+				return aerr
+			}
+			if !approved {
+				return errors.New("approval rejected")
+			}
+			continue
+		}
+		answer := renderer.FinalAnswer(record)
+		if !renderer.SawDelta() {
+			fmt.Fprintln(stdout, answer)
+		} else if !strings.HasSuffix(answer, "\n") {
+			fmt.Fprintln(stdout)
+		}
+		if record.Status == "failed" {
+			if record.Error != "" {
+				return fmt.Errorf("%s", record.Error)
+			}
+			return errors.New("task failed")
+		}
+		if record.Status == "cancelled" {
+			return errors.New("task cancelled")
+		}
+		return nil
+	}
+}
+
+func runCreate(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("create", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	workspace := flags.String("workspace", "", "Authorized workspace directory for generated project files")
+	planOnly := flags.Bool("plan-only", false, "Plan the generation task without applying file changes")
+	if err := flags.Parse(args); err != nil {
+		return errors.New("usage: agent create \"<objective>\" --workspace <dir>")
+	}
+	objective := strings.TrimSpace(strings.Join(flags.Args(), " "))
+	if objective == "" {
+		return errors.New("usage: agent create \"<objective>\" --workspace <dir>")
+	}
+	if strings.TrimSpace(*workspace) == "" {
+		return errors.New("create requires --workspace <dir>")
+	}
+	if *planOnly {
+		objective = "[PLAN ONLY] " + objective
+	}
+
+	if err := runtimeenv.EnsureDataDirectories(); err != nil {
+		return err
+	}
+	id, err := newTaskID()
+	if err != nil {
+		return err
+	}
+	client, err := localclient.New()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	healthCtx, healthCancel := context.WithTimeout(ctx, 30*time.Second)
+	if _, err := client.Health(healthCtx); err != nil {
+		executable, execErr := os.Executable()
+		if execErr != nil {
+			healthCancel()
+			return execErr
+		}
+		if startErr := startDetachedServe(executable); startErr != nil {
+			healthCancel()
+			return startErr
+		}
+		if err := waitForSupervisor(healthCtx, client); err != nil {
+			healthCancel()
+			return err
+		}
+	}
+	healthCancel()
+
+	fmt.Fprintf(stderr, "workspace: %s\n", *workspace)
+	submitCtx, submitCancel := context.WithTimeout(ctx, 30*time.Second)
+	created, err := client.CreateTaskWithContext(submitCtx, id, objective, "", nil, *workspace)
+	submitCancel()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "task %s %s\n", created.ID, created.Status)
+
+	for {
+		renderer, cancelStream := streamTaskOutput(ctx, client, created.ID, stdout, stderr)
+		record, err := waitForTaskCompletion(ctx, client, created.ID, 15*time.Minute)
+		cancelStream()
+		time.Sleep(150 * time.Millisecond)
+		if err != nil {
+			return err
+		}
+		if taskExecutionStatus(record) == "waiting_for_approval" {
+			_, approved, aerr := promptApproval(ctx, client, record, os.Stdin, stdout, stderr)
+			if aerr != nil {
+				return aerr
+			}
+			if !approved {
+				return errors.New("approval rejected")
+			}
+			continue
+		}
+		answer := renderer.FinalAnswer(record)
+		if !renderer.SawDelta() {
+			fmt.Fprintln(stdout, answer)
+		} else if !strings.HasSuffix(answer, "\n") {
+			fmt.Fprintln(stdout)
+		}
+		if record.Status == "failed" {
+			if record.Error != "" {
+				return fmt.Errorf("%s", record.Error)
+			}
+			return errors.New("task failed")
+		}
+		if record.Status == "cancelled" {
+			return errors.New("task cancelled")
+		}
+		return nil
+	}
 }
 
 func newTaskID() (string, error) {
@@ -512,12 +652,203 @@ func chatHistory(ctx context.Context, client *localclient.Client, conversationID
 	return nil
 }
 
+type taskStreamRenderer struct {
+	stdout   io.Writer
+	stderr   io.Writer
+	tty      bool
+	mu       sync.Mutex
+	sawDelta bool
+	deltaBuf strings.Builder
+	lastLine string
+}
+
+func newTaskStreamRenderer(stdout, stderr io.Writer) *taskStreamRenderer {
+	return &taskStreamRenderer{stdout: stdout, stderr: stderr, tty: isTerminalWriter(stdout)}
+}
+
+func isTerminalWriter(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func (r *taskStreamRenderer) HandleEvent(ev localclient.TaskEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch ev.Type {
+	case "assistant.delta":
+		var p struct {
+			Delta string `json:"delta"`
+			Text  string `json:"text"`
+		}
+		_ = json.Unmarshal(ev.Payload, &p)
+		delta := p.Delta
+		if delta == "" {
+			delta = p.Text
+		}
+		if delta == "" {
+			return
+		}
+		r.sawDelta = true
+		r.deltaBuf.WriteString(delta)
+		fmt.Fprint(r.stdout, delta)
+	case "assistant.completed":
+		// Final assistant message is persisted by task result; avoid duplicate print.
+	default:
+		line := renderProgressEvent(ev)
+		if line == "" || line == r.lastLine {
+			return
+		}
+		r.lastLine = line
+		if r.tty {
+			// Keep progress separate from streamed assistant text.
+			if r.sawDelta {
+				fmt.Fprintln(r.stderr, "\n"+line)
+			} else {
+				fmt.Fprintln(r.stderr, line)
+			}
+		} else {
+			fmt.Fprintf(r.stdout, "event\t%s\t%s\n", ev.Type, line)
+		}
+	}
+}
+
+func (r *taskStreamRenderer) SawDelta() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sawDelta
+}
+
+func (r *taskStreamRenderer) FinalAnswer(record persistence.TaskRecord) string {
+	r.mu.Lock()
+	sawDelta := r.sawDelta
+	deltaText := strings.TrimSpace(r.deltaBuf.String())
+	r.mu.Unlock()
+	if sawDelta && deltaText != "" {
+		return deltaText
+	}
+	answer := strings.TrimSpace(record.Result)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(record.Result), &parsed); err == nil {
+		if mo, _ := parsed["model_output"].(string); strings.TrimSpace(mo) != "" {
+			answer = strings.TrimSpace(mo)
+		} else if summary, _ := parsed["summary"].(string); strings.TrimSpace(summary) != "" {
+			answer = strings.TrimSpace(summary)
+		}
+	}
+	if answer == "" {
+		answer = "(no result)"
+	}
+	return answer
+}
+
+func renderProgressEvent(ev localclient.TaskEvent) string {
+	var p map[string]any
+	_ = json.Unmarshal(ev.Payload, &p)
+	get := func(k string) string {
+		v, _ := p[k].(string)
+		return v
+	}
+	switch ev.Type {
+	case "snapshot":
+		return ""
+	case "task_admitted":
+		return "queued"
+	case "task_starting":
+		return "starting"
+	case "checkpoint":
+		step := get("step")
+		state := get("state")
+		if step != "" {
+			return "step: " + step
+		}
+		if state != "" {
+			return "state: " + state
+		}
+		return "checkpoint"
+	case "task_finished":
+		status := get("status")
+		if status != "" {
+			return "finished: " + status
+		}
+		return "finished"
+	case "plan_created", "plan_repaired":
+		return "plan ready"
+	case "step_selected":
+		if id := get("step_id"); id != "" {
+			return "selected step: " + id
+		}
+		return "step selected"
+	case "step_started":
+		if id := get("step_id"); id != "" {
+			return "running step: " + id
+		}
+		return "step started"
+	case "tool_selected":
+		if name := get("tool_name"); name != "" {
+			return "tool: " + name
+		}
+		return "tool selected"
+	case "mcp_tool_result":
+		name := get("tool_name")
+		status := get("status")
+		if name != "" {
+			return "tool result: " + name + " (" + status + ")"
+		}
+		return "tool result"
+	case "approval_required", "waiting_approval":
+		return "waiting for approval"
+	case "recovery_attempt", "replanned":
+		return "recovering/replanning"
+	case "provider_result":
+		return "model response received"
+	case "provider_failed":
+		return "model provider failed"
+	case "validation_started":
+		return "validation started"
+	case "validation_completed":
+		if status := get("status"); status != "" {
+			return "validation: " + status
+		}
+		return "validation completed"
+	case "generation.file.staged", "generation.file.written":
+		if path := get("path"); path != "" {
+			return ev.Type + ": " + path
+		}
+		return ev.Type
+	case "task_event":
+		return ""
+	default:
+		if strings.HasPrefix(ev.Type, "assistant.") {
+			return ""
+		}
+		// Keep unknown events quiet by default to avoid flooding.
+		return ""
+	}
+}
+
+func streamTaskOutput(ctx context.Context, client *localclient.Client, taskID string, stdout, stderr io.Writer) (*taskStreamRenderer, context.CancelFunc) {
+	renderer := newTaskStreamRenderer(stdout, stderr)
+	streamCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		_ = client.StreamTaskEvents(streamCtx, taskID, 0, func(ev localclient.TaskEvent) error {
+			renderer.HandleEvent(ev)
+			return nil
+		})
+	}()
+	return renderer, cancel
+}
+
 func chatTurn(ctx context.Context, client *localclient.Client, conversationID, prompt string, stdout, stderr io.Writer) error {
-	// Persist user message.
 	if _, err := client.AppendConversationMessage(ctx, conversationID, "user", prompt, ""); err != nil {
 		return fmt.Errorf("persist user message: %w", err)
 	}
-	// Load recent context for the model.
 	recent, err := client.GetConversationMessages(ctx, conversationID, 40)
 	if err != nil {
 		return fmt.Errorf("load conversation context: %w", err)
@@ -532,37 +863,101 @@ func chatTurn(ctx context.Context, client *localclient.Client, conversationID, p
 		return err
 	}
 	submitCtx, submitCancel := context.WithTimeout(ctx, 30*time.Second)
-	_, err = client.CreateTaskWithContext(submitCtx, taskID, prompt, conversationID, contextMessages)
+	_, err = client.CreateTaskWithContext(submitCtx, taskID, prompt, conversationID, contextMessages, "")
 	submitCancel()
 	if err != nil {
 		return fmt.Errorf("submit chat task: %w", err)
 	}
 
-	record, err := waitForTaskCompletion(ctx, client, taskID, 5*time.Minute)
-	if err != nil {
-		return err
-	}
-	if record.Status == "failed" {
-		msg := record.Error
-		if msg == "" {
-			msg = "task failed"
+	for {
+		renderer, cancelStream := streamTaskOutput(ctx, client, taskID, stdout, stderr)
+		record, err := waitForTaskCompletion(ctx, client, taskID, 10*time.Minute)
+		cancelStream()
+		time.Sleep(150 * time.Millisecond)
+		if err != nil {
+			return err
 		}
-		_, _ = client.AppendConversationMessage(ctx, conversationID, "assistant", "Error: "+msg, `{"task_id":"`+taskID+`","status":"failed"}`)
-		return fmt.Errorf("%s", msg)
+		if taskExecutionStatus(record) == "waiting_for_approval" {
+			rec, approved, aerr := promptApproval(ctx, client, record, os.Stdin, stdout, stderr)
+			if aerr != nil {
+				return aerr
+			}
+			if !approved {
+				_, _ = client.AppendConversationMessage(ctx, conversationID, "assistant", "Approval rejected.", `{"task_id":"`+taskID+`","status":"failed"}`)
+				return errors.New("approval rejected")
+			}
+			_ = rec
+			continue
+		}
+		if record.Status == "failed" {
+			msg := record.Error
+			if msg == "" {
+				msg = "task failed"
+			}
+			_, _ = client.AppendConversationMessage(ctx, conversationID, "assistant", "Error: "+msg, `{"task_id":"`+taskID+`","status":"failed"}`)
+			return fmt.Errorf("%s", msg)
+		}
+		if record.Status == "cancelled" {
+			_, _ = client.AppendConversationMessage(ctx, conversationID, "assistant", "Task cancelled.", `{"task_id":"`+taskID+`","status":"cancelled"}`)
+			return errors.New("task cancelled")
+		}
+		answer := renderer.FinalAnswer(record)
+		if !renderer.SawDelta() {
+			fmt.Fprintln(stdout, answer)
+		} else if !strings.HasSuffix(answer, "\n") {
+			fmt.Fprintln(stdout)
+		}
+		if _, err := client.AppendConversationMessage(ctx, conversationID, "assistant", answer, `{"task_id":"`+taskID+`","status":"succeeded"}`); err != nil {
+			fmt.Fprintf(stderr, "warning: failed to persist assistant message: %v\n", err)
+		}
+		return nil
 	}
-	if record.Status == "cancelled" {
-		_, _ = client.AppendConversationMessage(ctx, conversationID, "assistant", "Task cancelled.", `{"task_id":"`+taskID+`","status":"cancelled"}`)
-		return errors.New("task cancelled")
+}
+
+func taskExecutionStatus(record persistence.TaskRecord) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(record.Result), &payload); err == nil {
+		if s, _ := payload["execution_status"].(string); s != "" {
+			return s
+		}
 	}
-	answer := strings.TrimSpace(record.Result)
-	if answer == "" {
-		answer = "(no result)"
+	return ""
+}
+
+func taskApprovalSummary(record persistence.TaskRecord) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(record.Result), &payload); err != nil {
+		return "Approval required."
 	}
-	if _, err := client.AppendConversationMessage(ctx, conversationID, "assistant", answer, `{"task_id":"`+taskID+`","status":"succeeded"}`); err != nil {
-		fmt.Fprintf(stderr, "warning: failed to persist assistant message: %v\n", err)
+	if reason, _ := payload["failure_reason"].(string); strings.TrimSpace(reason) != "" {
+		return reason
 	}
-	fmt.Fprintln(stdout, answer)
-	return nil
+	if summary, _ := payload["summary"].(string); strings.TrimSpace(summary) != "" {
+		return summary
+	}
+	return "Approval required."
+}
+
+func promptApproval(ctx context.Context, client *localclient.Client, record persistence.TaskRecord, stdin io.Reader, stdout, stderr io.Writer) (persistence.TaskRecord, bool, error) {
+	if !isTerminal(os.Stdin) {
+		return record, false, fmt.Errorf("task %s requires approval: %s", record.ID, taskApprovalSummary(record))
+	}
+	fmt.Fprintf(stderr, "\nApproval required for task %s\n", record.ID)
+	fmt.Fprintf(stderr, "Reason: %s\n", taskApprovalSummary(record))
+	fmt.Fprint(stderr, "Approve? [y/N]: ")
+	reader := bufio.NewReader(stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return record, false, err
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	approved := answer == "y" || answer == "yes"
+	scope := "user_approved"
+	rec, err := client.ApproveTask(ctx, record.ID, approved, scope)
+	if err != nil {
+		return record, false, err
+	}
+	return rec, approved, nil
 }
 
 func waitForTaskCompletion(ctx context.Context, client *localclient.Client, taskID string, timeout time.Duration) (persistence.TaskRecord, error) {

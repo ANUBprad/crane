@@ -142,6 +142,7 @@ class ProtocolRuntime:
                         granted_approvals=command["granted_approvals"],
                         conversation_id=command.get("conversation_id"),
                         conversation_messages=command.get("conversation_messages"),
+                        workspace=command.get("workspace"),
                     ),
                 )
             if future is not None:

@@ -293,6 +293,7 @@ class WorkflowState:
     user_input: str
     python_runtime_pid: Optional[int] = None
     conversation_id: Optional[str] = None
+    workspace: str = ""
     runtime_context: Dict[str, Any] = field(default_factory=dict)
 
     # State
@@ -345,6 +346,7 @@ class WorkflowState:
 
     # Context for LangGraph
     persistent_state: Dict[str, Any] = field(default_factory=dict)
+    generation: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -352,6 +354,7 @@ class WorkflowState:
             "user_input": self.user_input,
             "objective": self.objective or self.user_input,
             "conversation_id": self.conversation_id,
+            "workspace": self.workspace,
             "runtime_context": self.runtime_context,
             "python_runtime_pid": self.python_runtime_pid,
             "state": self.state.value if isinstance(self.state, TaskState) else str(self.state),
@@ -396,6 +399,7 @@ class WorkflowState:
             "checkpoint_version": self.checkpoint_version,
             "resumable": self.resumable,
             "persistent_state": {k: v for k, v in self.persistent_state.items() if not k.startswith("_")},
+            "generation": dict(self.generation) if isinstance(self.generation, dict) else {},
         }
 
     @classmethod
@@ -441,6 +445,7 @@ class WorkflowState:
             user_input=str(data.get("user_input", "")),
             objective=objective,
             conversation_id=data.get("conversation_id"),
+            workspace=str(data.get("workspace") or ""),
             runtime_context=dict(data.get("runtime_context") or {}) if isinstance(data.get("runtime_context"), dict) else {},
             python_runtime_pid=data.get("python_runtime_pid"),
             state=state,
@@ -477,6 +482,7 @@ class WorkflowState:
             checkpoint_version=int(data.get("checkpoint_version", 0)),
             resumable=bool(data.get("resumable", True)),
             persistent_state=dict(data.get("persistent_state", {})),
+            generation=dict(data.get("generation") or {}) if isinstance(data.get("generation"), dict) else {},
         )
 
 

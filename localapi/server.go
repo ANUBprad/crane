@@ -51,8 +51,9 @@ type ConversationStore interface {
 // HTTP transport so the Go supervisor owns all task lifecycle decisions.
 type TaskController interface {
 	AdmitTask(id, input string) (persistence.TaskRecord, error)
-	AdmitTaskWithContext(id, input string, conversationID string, conversationMessages []python_protocol.ConversationMessage) (persistence.TaskRecord, error)
+	AdmitTaskWithContext(id, input string, conversationID string, conversationMessages []python_protocol.ConversationMessage, workspace string) (persistence.TaskRecord, error)
 	CancelTask(id string) (persistence.TaskRecord, error)
+	ApproveTask(id string, approved bool, scope string) (persistence.TaskRecord, error)
 	SubscribeTaskEvents(id string, after int64) (<-chan persistence.TaskEvent, func(), error)
 }
 
@@ -310,6 +311,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			s.handleTaskCancel(w, id)
 
+		case strings.HasSuffix(rest, "/approve"):
+			if r.Method != http.MethodPost {
+				methodNotAllowed(w, http.MethodPost)
+				return
+			}
+			id := strings.TrimSuffix(rest, "/approve")
+			if !validTaskPathID(id) {
+				writeError(w, http.StatusNotFound, "not_found")
+				return
+			}
+			s.handleTaskApprove(w, r, id)
+
 		case !strings.Contains(rest, "/"):
 			if r.Method != http.MethodGet {
 				methodNotAllowed(w, http.MethodGet)
@@ -403,6 +416,7 @@ type taskSubmissionRequest struct {
 	Input                string                                `json:"input"`
 	ConversationID       string                                `json:"conversation_id,omitempty"`
 	ConversationMessages []python_protocol.ConversationMessage `json:"conversation_messages,omitempty"`
+	Workspace            string                                `json:"workspace,omitempty"`
 }
 
 func (s *Server) handleTaskCreate(w http.ResponseWriter, r *http.Request) {
@@ -449,7 +463,7 @@ func (s *Server) handleTaskCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	record, err := s.controller.AdmitTaskWithContext(request.ID, request.Input, request.ConversationID, request.ConversationMessages)
+	record, err := s.controller.AdmitTaskWithContext(request.ID, request.Input, request.ConversationID, request.ConversationMessages, request.Workspace)
 	if errors.Is(err, persistence.ErrDuplicateTask) {
 		writeError(w, http.StatusConflict, "task_already_exists")
 		return
@@ -477,6 +491,51 @@ func (s *Server) handleTaskCancel(w http.ResponseWriter, id string) {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "CRANE local API: task cancellation failed")
 		writeError(w, http.StatusServiceUnavailable, "task_cancel_unavailable")
+		return
+	}
+	writeData(w, http.StatusOK, struct {
+		Task persistence.TaskRecord `json:"task"`
+	}{Task: record})
+}
+
+type taskApprovalRequest struct {
+	Approved bool   `json:"approved"`
+	Scope    string `json:"scope,omitempty"`
+}
+
+func (s *Server) handleTaskApprove(w http.ResponseWriter, r *http.Request, id string) {
+	if s.controller == nil {
+		writeError(w, http.StatusServiceUnavailable, "task_control_unavailable")
+		return
+	}
+	var req taskApprovalRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	if len(req.Scope) > 512 {
+		writeError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	record, err := s.controller.ApproveTask(id, req.Approved, req.Scope)
+	if errors.Is(err, persistence.ErrTaskNotFound) {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	if err != nil {
+		if strings.Contains(err.Error(), "not waiting for approval") {
+			writeError(w, http.StatusConflict, "task_not_waiting_for_approval")
+			return
+		}
+		fmt.Fprintln(os.Stderr, "CRANE local API: task approval failed")
+		writeError(w, http.StatusServiceUnavailable, "task_approval_unavailable")
 		return
 	}
 	writeData(w, http.StatusOK, struct {

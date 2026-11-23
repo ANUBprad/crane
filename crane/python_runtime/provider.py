@@ -459,26 +459,75 @@ def _build_messages(user_input: str, system_prompt: str = "", messages: Optional
     return built
 
 
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, list):
+        return _tool_output_text(content)
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    return _tool_output_text(content)
+
+
 def _invoke_ollama(
     user_input: str,
     env: Optional[Mapping[str, str]] = None,
     system_prompt: str = "",
     messages: Optional[List[Dict[str, str]]] = None,
+    on_delta: Optional[Any] = None,
 ) -> Dict[str, Any]:
     config = load_ollama_config(env)
     preflight_ollama(config)
     chat_model = _create_chat_model(config)
     prompt_messages = _build_messages(user_input, system_prompt=system_prompt, messages=messages)
     try:
-        response = chat_model.invoke(prompt_messages)
+        if on_delta is None or not hasattr(chat_model, "stream"):
+            response = chat_model.invoke(prompt_messages)
+            content = _content_to_text(getattr(response, "content", response))
+            if on_delta and content:
+                try:
+                    on_delta(content)
+                except Exception:
+                    pass
+        else:
+            try:
+                chunks: List[str] = []
+                emitted = False
+                for chunk in chat_model.stream(prompt_messages):
+                    text = _content_to_text(getattr(chunk, "content", ""))
+                    if not text:
+                        continue
+                    chunks.append(text)
+                    try:
+                        on_delta(text)
+                        emitted = True
+                    except Exception:
+                        emitted = True
+                content = "".join(chunks)
+                if not content.strip() and not emitted:
+                    response = chat_model.invoke(prompt_messages)
+                    content = _content_to_text(getattr(response, "content", response))
+                    if content:
+                        try:
+                            on_delta(content)
+                        except Exception:
+                            pass
+            except Exception:
+                # Fall back to non-streaming invoke for compatibility.
+                response = chat_model.invoke(prompt_messages)
+                content = _content_to_text(getattr(response, "content", response))
+                if content:
+                    try:
+                        on_delta(content)
+                    except Exception:
+                        pass
+    except ProviderError:
+        raise
     except Exception as exc:  # noqa: BLE001 - provider errors must be actionable, not leaked verbatim
         raise ProviderError(
             "provider_invocation_failed",
             f"The configured Ollama model {config.model!r} did not complete the request. Confirm the model supports chat, is loaded locally, and CRANE_OLLAMA_INVOKE_TIMEOUT_SECONDS allows enough time.",
         ) from exc
-    content = getattr(response, "content", response)
-    if isinstance(content, list):
-        content = _tool_output_text(content)
     if not isinstance(content, str) or not content.strip():
         raise ProviderError("provider_empty_response", "The configured model returned an empty response.")
     return {
@@ -599,13 +648,26 @@ def invoke(
     system_prompt: str = "",
     messages: Optional[List[Dict[str, str]]] = None,
     context: Optional[Dict[str, Any]] = None,
+    on_delta: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Execute the configured provider path. No fallback is permitted."""
     provider = selected_provider(env)
     if provider == "local":
-        return deterministic_result(user_input, provider_details(env), context=context)
+        result = deterministic_result(user_input, provider_details(env), context=context)
+        if on_delta and isinstance(result.get("model_output"), str) and result["model_output"]:
+            try:
+                on_delta(result["model_output"])
+            except Exception:
+                pass
+        return result
     if provider == "ollama":
-        return _invoke_ollama(user_input, env, system_prompt=system_prompt, messages=messages)
+        return _invoke_ollama(
+            user_input,
+            env,
+            system_prompt=system_prompt,
+            messages=messages,
+            on_delta=on_delta,
+        )
     raise ProviderError(
         "provider_not_supported",
         f"Model provider {provider!r} is not supported. Configure CRANE_MODEL_PROVIDER=local or =ollama.",
