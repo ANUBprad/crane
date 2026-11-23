@@ -42,14 +42,24 @@ func TestHelperRuntime(t *testing.T) {
 	scanner.Buffer(make([]byte, 0, 64<<10), python_protocol.MaxMessageBytes)
 	for scanner.Scan() {
 		var message struct {
-			Type   string `json:"type"`
-			TaskID string `json:"task_id"`
+			Type       string          `json:"type"`
+			TaskID     string          `json:"task_id"`
+			Checkpoint json.RawMessage `json:"checkpoint"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &message) != nil {
 			continue
 		}
 		switch message.Type {
 		case python_protocol.TypeTaskSubmission:
+			if mode == "approval-wait" {
+				write(map[string]any{
+					"version": python_protocol.ProtocolVersion, "type": python_protocol.TypeTaskState,
+					"task_id": message.TaskID, "state": "running", "current_step": "resumed_after_approval",
+					"graph_steps": 1, "wall_clock_ms": 1, "cancelled": false,
+					"checkpoint": message.Checkpoint,
+				})
+				continue
+			}
 			if mode == "wait" {
 				write(taskStateMessage(message.TaskID, "running", "executing", false))
 				continue
@@ -606,6 +616,72 @@ func TestCancelImmediatelyAfterAdmissionStaysCancelled(t *testing.T) {
 func TestTaskExecutionTimeoutAllowsBoundedLocalInference(t *testing.T) {
 	if taskExecutionTimeout < 180*time.Second || taskExecutionTimeout > 300*time.Second {
 		t.Fatalf("taskExecutionTimeout = %s, want a bounded timeout that allows a cold local model", taskExecutionTimeout)
+	}
+}
+
+func TestApprovalCheckpointSurvivesSupervisorRestartAndResumesExactGrant(t *testing.T) {
+	s, store := newHelperSupervisor(t, "approval-wait")
+	taskID := "restart-approval-task"
+	scope := "generation:repair:restart-approval-task:abc123"
+	if _, err := store.CreateTask(taskID, "queued", "continue the approved repair"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateTaskStatus(taskID, "waiting_approval"); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := []byte(`{"state":"waiting_for_approval","execution_status":"waiting_for_approval","current_step":"repair_project","generation":{"pending_approval":{"scope":"generation:repair:restart-approval-task:abc123","reason":"Approve the generated repair"}}}`)
+	if err := store.SaveTaskState(taskID, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, store, taskID, "waiting_approval")
+	s.Stop()
+
+	// A fresh supervisor instance must rediscover the persisted approval scope.
+	restarted := NewWithStore(store)
+	restarted.pythonRuntimePath = os.Args[0]
+	restarted.pythonArgs = []string{"-test.run=^TestHelperRuntime$"}
+	if err := restarted.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Stop()
+	record, err := store.GetTaskRecord(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "waiting_approval" || record.PendingApprovalScope != scope ||
+		record.PendingApprovalReason != "Approve the generated repair" {
+		t.Fatalf("approval request was not preserved after restart: %#v", record)
+	}
+	if _, err := restarted.ApproveTask(taskID, true, scope+"-wrong"); err == nil {
+		t.Fatal("approval with a different scope must be rejected after restart")
+	}
+	if _, err := restarted.ApproveTask(taskID, true, scope); err != nil {
+		t.Fatalf("ApproveTask() after restart: %v", err)
+	}
+	waitForStatus(t, store, taskID, "running")
+	resumed, ok := store.GetLatestTaskState(taskID)
+	if !ok {
+		t.Fatal("resumed checkpoint was not persisted")
+	}
+	var state map[string]any
+	if err := json.Unmarshal(resumed, &state); err != nil {
+		t.Fatal(err)
+	}
+	grants, _ := state["granted_approvals"].([]any)
+	found := false
+	for _, grant := range grants {
+		if grant == scope {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("exact approval scope was not forwarded into resumed checkpoint: %#v", state)
+	}
+	if _, err := restarted.CancelTask(taskID); err != nil {
+		t.Fatalf("cancel resumed helper task: %v", err)
 	}
 }
 
