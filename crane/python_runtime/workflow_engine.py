@@ -530,6 +530,10 @@ def _mark_terminal(state: WorkflowState, execution_status: ExecutionStatus, summ
     state.failure_reason = failure_reason
     state.completed_at = state.completed_at or time.time()
     state.wall_clock_ms = _elapsed_ms(state)
+    if execution_status != ExecutionStatus.WAITING_FOR_APPROVAL:
+        # A terminal state must not retain an approval checkpoint that would
+        # make a failed or completed task look resumable through a stale scope.
+        state.generation.pop("pending_approval", None)
     if execution_status == ExecutionStatus.FULLY_COMPLETED:
         state.state = TaskState.SUCCEEDED
     elif execution_status == ExecutionStatus.CANCELLED:

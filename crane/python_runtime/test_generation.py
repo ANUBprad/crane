@@ -390,6 +390,25 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(runnable)
         self.assertEqual(runnable.step_id, "repair_project")
 
+    def test_graph_step_budget_covers_generation_approval_cycles(self):
+        self.assertGreaterEqual(workflow_engine.MAX_GRAPH_STEPS, 4 * len(workflow_engine._default_generation_plan(
+            workflow_engine.WorkflowState(task_id="budget", user_input="test", workspace=str(self.ws))
+        )))
+
+    def test_terminal_failure_clears_pending_approval(self):
+        state = workflow_engine.WorkflowState(
+            task_id="terminal-approval", user_input="test", workspace=str(self.ws),
+        )
+        state.execution_status = workflow_engine.ExecutionStatus.WAITING_FOR_APPROVAL.value
+        state.generation["pending_approval"] = {
+            "scope": "generation:repair:terminal-approval:abc123", "reason": "Approve repair",
+        }
+        workflow_engine._mark_terminal(
+            state, workflow_engine.ExecutionStatus.FAILED, "Repair failed", "graph step limit",
+        )
+        self.assertEqual(state.execution_status, workflow_engine.ExecutionStatus.FAILED.value)
+        self.assertNotIn("pending_approval", state.generation)
+
     def _state_and_step(self, step_id):
         state = workflow_engine.WorkflowState(
             task_id="approval-task", user_input="Create a project", workspace=str(self.ws),

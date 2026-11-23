@@ -56,7 +56,10 @@ class EvaluationOutcome(str, Enum):
 # Workflow configuration / limits
 # ---------------------------------------------------------------------------
 
-MAX_GRAPH_STEPS = 24
+# A generation task can cross several approval round-trips (apply, overwrite,
+# validate and repair). Each resume replans through the graph and consumes steps,
+# so the bound must leave room for a full repair cycle and its revalidation.
+MAX_GRAPH_STEPS = 96
 MAX_WALL_CLOCK_MS = 180_000  # 180 seconds overall task timeout
 DEFAULT_RETRY_LIMIT = 2
 MAX_PLAN_REVISIONS = 3
