@@ -683,8 +683,10 @@ func isTerminalTaskEvent(event persistence.TaskEvent) bool {
 }
 
 func drainSSEEvents(w http.ResponseWriter, flusher http.Flusher, events <-chan persistence.TaskEvent, timeout time.Duration) {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
+	idle := time.NewTimer(timeout)
+	hard := time.NewTimer(10 * timeout)
+	defer idle.Stop()
+	defer hard.Stop()
 	for {
 		select {
 		case event, open := <-events:
@@ -700,7 +702,16 @@ func drainSSEEvents(w http.ResponseWriter, flusher http.Flusher, events <-chan p
 			if isTerminalTaskEvent(event) {
 				return
 			}
-		case <-timer.C:
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(timeout)
+		case <-idle.C:
+			return
+		case <-hard.C:
 			return
 		}
 	}

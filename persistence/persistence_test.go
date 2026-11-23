@@ -184,4 +184,10 @@ func TestTaskEventsArePerTaskSequenced(t *testing.T) {
 	if !errors.Is(err, ErrEventCursorExpired) {
 		t.Fatalf("expected ErrEventCursorExpired, got %v", err)
 	}
+	if _, err := store.GetTaskEventsAfter("seq-task", 0, 10); !errors.Is(err, ErrEventCursorExpired) {
+		t.Fatalf("expected cursor=0 to be expired after history trim, got %v", err)
+	}
+	if _, err := store.GetTaskEventsAfter("seq-task", int64(maxEventsPerTask+100), 10); !errors.Is(err, ErrEventCursorExpired) {
+		t.Fatalf("expected future cursor to be rejected, got %v", err)
+	}
 }

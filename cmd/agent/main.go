@@ -19,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"crane/internal/ghauth"
 	"crane/internal/localclient"
@@ -331,18 +332,16 @@ func runTaskPrompt(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "task %s %s\n", created.ID, created.Status)
 	}
 
-	lastSeq := int64(0)
+	var previous *taskStreamRenderer
 	for {
-		renderer, cancelStream := streamTaskOutput(ctx, client, created.ID, stdout, stderr, mode, lastSeq)
+		renderer, cancelStream := streamTaskOutput(ctx, client, created.ID, stdout, stderr, mode, previous)
 		record, err := waitForTaskCompletion(ctx, client, created.ID, 10*time.Minute)
 		cancelStream()
 		time.Sleep(150 * time.Millisecond)
 		if err != nil {
 			return err
 		}
-		if seq := renderer.LastSeq(); seq > lastSeq {
-			lastSeq = seq
-		}
+		previous = renderer
 		if taskExecutionStatus(record) == "waiting_for_approval" {
 			_, approved, aerr := promptApproval(ctx, client, record, os.Stdin, stdout, stderr)
 			if aerr != nil {
@@ -424,18 +423,16 @@ func runCreate(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "task %s %s\n", created.ID, created.Status)
 	}
 
-	lastSeq := int64(0)
+	var previous *taskStreamRenderer
 	for {
-		renderer, cancelStream := streamTaskOutput(ctx, client, created.ID, stdout, stderr, mode, lastSeq)
+		renderer, cancelStream := streamTaskOutput(ctx, client, created.ID, stdout, stderr, mode, previous)
 		record, err := waitForTaskCompletion(ctx, client, created.ID, 15*time.Minute)
 		cancelStream()
 		time.Sleep(150 * time.Millisecond)
 		if err != nil {
 			return err
 		}
-		if seq := renderer.LastSeq(); seq > lastSeq {
-			lastSeq = seq
-		}
+		previous = renderer
 		if taskExecutionStatus(record) == "waiting_for_approval" {
 			_, approved, aerr := promptApproval(ctx, client, record, os.Stdin, stdout, stderr)
 			if aerr != nil {
@@ -690,6 +687,82 @@ func newTaskStreamRenderer(stdout, stderr io.Writer, mode outputMode) *taskStrea
 	return &taskStreamRenderer{stdout: stdout, stderr: stderr, mode: mode, tty: tty, seenSeq: make(map[int64]struct{})}
 }
 
+func sanitizeTerminalText(value string) string {
+	var clean strings.Builder
+	runes := []rune(value)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if r == '\x1b' {
+			if i+1 >= len(runes) {
+				continue
+			}
+			switch runes[i+1] {
+			case '[': // CSI: skip parameters/intermediates and final byte.
+				i += 2
+				for i < len(runes) && !(runes[i] >= 0x40 && runes[i] <= 0x7e) {
+					i++
+				}
+			case ']': // OSC: skip until BEL or ST.
+				i += 2
+				for i < len(runes) {
+					if runes[i] == '\a' {
+						break
+					}
+					if runes[i] == '\x1b' && i+1 < len(runes) && runes[i+1] == '\\' {
+						i++
+						break
+					}
+					i++
+				}
+			default: // Drop the escape and the following single-byte sequence.
+				i++
+			}
+			continue
+		}
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			continue
+		}
+		clean.WriteRune(r)
+	}
+	return clean.String()
+}
+
+// adoptState carries the dedup cursor and cumulative assistant text into the
+// replacement renderer created after an approval pause/resume.
+func (r *taskStreamRenderer) adoptState(previous *taskStreamRenderer) {
+	if previous == nil || previous == r {
+		return
+	}
+	previous.mu.Lock()
+	defer previous.mu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sawDelta = previous.sawDelta
+	r.deltaBuf.Reset()
+	r.deltaBuf.WriteString(previous.deltaBuf.String())
+	r.lastLine = previous.lastLine
+	r.lastSeq = previous.lastSeq
+	r.seenSeq = make(map[int64]struct{}, len(previous.seenSeq))
+	for seq := range previous.seenSeq {
+		r.seenSeq[seq] = struct{}{}
+	}
+	r.terminalSeen = false
+}
+
+// absorbSnapshot treats snapshots as cumulative text. It returns only the
+// portion that has not already been printed, so reconnect replay cannot
+// duplicate assistant output.
+func (r *taskStreamRenderer) absorbSnapshot(text string) string {
+	prior := r.deltaBuf.String()
+	r.deltaBuf.Reset()
+	r.deltaBuf.WriteString(text)
+	r.sawDelta = true
+	if prior == "" || !strings.HasPrefix(text, prior) {
+		return text
+	}
+	return strings.TrimPrefix(text, prior)
+}
+
 func isTerminalWriter(w io.Writer) bool {
 	f, ok := w.(*os.File)
 	if !ok {
@@ -736,11 +809,8 @@ func (r *taskStreamRenderer) HandleEvent(ev localclient.TaskEvent) {
 		if strings.TrimSpace(p.Text) == "" {
 			return
 		}
-		if !r.sawDelta {
-			r.sawDelta = true
-			r.deltaBuf.Reset()
-			r.deltaBuf.WriteString(p.Text)
-			fmt.Fprint(r.stdout, p.Text)
+		if suffix := r.absorbSnapshot(p.Text); suffix != "" {
+			fmt.Fprint(r.stdout, sanitizeTerminalText(suffix))
 		}
 		return
 	case "assistant.delta":
@@ -756,13 +826,14 @@ func (r *taskStreamRenderer) HandleEvent(ev localclient.TaskEvent) {
 		if delta == "" {
 			return
 		}
+		delta = sanitizeTerminalText(delta)
 		r.sawDelta = true
 		r.deltaBuf.WriteString(delta)
 		fmt.Fprint(r.stdout, delta)
 	case "assistant.completed":
 		// Final assistant message is persisted by task result; avoid duplicate print.
 	default:
-		line := renderProgressEvent(ev)
+		line := sanitizeTerminalText(renderProgressEvent(ev))
 		if line == "" || line == r.lastLine {
 			return
 		}
@@ -785,10 +856,8 @@ func (r *taskStreamRenderer) handleEventJSONLocked(ev localclient.TaskEvent) {
 			Text string `json:"text"`
 		}
 		_ = json.Unmarshal(ev.Payload, &p)
-		if strings.TrimSpace(p.Text) != "" && !r.sawDelta {
-			r.sawDelta = true
-			r.deltaBuf.Reset()
-			r.deltaBuf.WriteString(p.Text)
+		if strings.TrimSpace(p.Text) != "" {
+			r.absorbSnapshot(p.Text)
 		}
 	case "assistant.delta":
 		var p struct {
@@ -801,6 +870,7 @@ func (r *taskStreamRenderer) handleEventJSONLocked(ev localclient.TaskEvent) {
 			delta = p.Text
 		}
 		if delta != "" {
+			delta = sanitizeTerminalText(delta)
 			r.sawDelta = true
 			r.deltaBuf.WriteString(delta)
 		}
@@ -972,13 +1042,9 @@ func renderProgressEvent(ev localclient.TaskEvent) string {
 	}
 }
 
-func streamTaskOutput(ctx context.Context, client *localclient.Client, taskID string, stdout, stderr io.Writer, mode outputMode, after int64) (*taskStreamRenderer, context.CancelFunc) {
+func streamTaskOutput(ctx context.Context, client *localclient.Client, taskID string, stdout, stderr io.Writer, mode outputMode, previous *taskStreamRenderer) (*taskStreamRenderer, context.CancelFunc) {
 	renderer := newTaskStreamRenderer(stdout, stderr, mode)
-	if after > 0 {
-		renderer.mu.Lock()
-		renderer.lastSeq = after
-		renderer.mu.Unlock()
-	}
+	renderer.adoptState(previous)
 	streamCtx, cancel := context.WithCancel(ctx)
 	go func() {
 		backoff := 250 * time.Millisecond
@@ -1154,18 +1220,16 @@ func chatTurn(ctx context.Context, client *localclient.Client, conversationID, p
 		return fmt.Errorf("submit chat task: %w", err)
 	}
 
-	lastSeq := int64(0)
+	var previous *taskStreamRenderer
 	for {
-		renderer, cancelStream := streamTaskOutput(ctx, client, taskID, stdout, stderr, outputText, lastSeq)
+		renderer, cancelStream := streamTaskOutput(ctx, client, taskID, stdout, stderr, outputText, previous)
 		record, err := waitForTaskCompletion(ctx, client, taskID, 10*time.Minute)
 		cancelStream()
 		time.Sleep(150 * time.Millisecond)
 		if err != nil {
 			return err
 		}
-		if seq := renderer.LastSeq(); seq > lastSeq {
-			lastSeq = seq
-		}
+		previous = renderer
 		if taskExecutionStatus(record) == "waiting_for_approval" {
 			rec, approved, aerr := promptApproval(ctx, client, record, os.Stdin, stdout, stderr)
 			if aerr != nil {

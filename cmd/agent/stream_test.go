@@ -111,6 +111,94 @@ func TestTaskStreamRendererJSONLIsValidAndDeduplicated(t *testing.T) {
 	}
 }
 
+func TestTaskStreamRendererRecoversMissedDeltaWithCumulativeSnapshot(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	renderer := newTaskStreamRenderer(&stdout, &stderr, outputText)
+	renderer.HandleEvent(localclient.TaskEvent{
+		TaskID: "task-snapshot", Seq: 1, Type: "assistant.delta",
+		Payload: json.RawMessage(`{"delta":"hel"}`),
+	})
+	renderer.HandleEvent(localclient.TaskEvent{
+		TaskID: "task-snapshot", Seq: 2, Type: "assistant.snapshot",
+		Payload: json.RawMessage(`{"text":"hello world","partial":false}`),
+	})
+	if got := stdout.String(); got != "hello world" {
+		t.Fatalf("stdout = %q, want cumulative snapshot text once", got)
+	}
+	if got := renderer.FinalAnswer(persistence.TaskRecord{ID: "task-snapshot"}); got != "hello world" {
+		t.Fatalf("FinalAnswer() = %q, want snapshot text", got)
+	}
+}
+
+func TestTaskStreamRendererAdoptStatePreventsSnapshotReplay(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	first := newTaskStreamRenderer(&stdout, &stderr, outputText)
+	first.HandleEvent(localclient.TaskEvent{
+		TaskID: "task-resume", Seq: 1, Type: "assistant.delta",
+		Payload: json.RawMessage(`{"delta":"hello "}`),
+	})
+	second := newTaskStreamRenderer(&stdout, &stderr, outputText)
+	second.adoptState(first)
+	second.HandleEvent(localclient.TaskEvent{
+		TaskID: "task-resume", Seq: 1, Type: "assistant.delta",
+		Payload: json.RawMessage(`{"delta":"hello "}`),
+	})
+	second.HandleEvent(localclient.TaskEvent{
+		TaskID: "task-resume", Seq: 2, Type: "assistant.snapshot",
+		Payload: json.RawMessage(`{"text":"hello world","partial":false}`),
+	})
+	if got := stdout.String(); got != "hello world" {
+		t.Fatalf("stdout = %q, want no duplicated prefix after resume", got)
+	}
+	if got := second.FinalAnswer(persistence.TaskRecord{ID: "task-resume"}); got != "hello world" {
+		t.Fatalf("FinalAnswer() = %q", got)
+	}
+}
+
+func TestTaskStreamRendererSanitizesTextModeControlCharacters(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	renderer := newTaskStreamRenderer(&stdout, &stderr, outputText)
+	renderer.HandleEvent(localclient.TaskEvent{
+		TaskID: "task-ansi", Seq: 1, Type: "step_started",
+		Payload: json.RawMessage(`{"step_id":"\u001b[31mbuild"}`),
+	})
+	renderer.HandleEvent(localclient.TaskEvent{
+		TaskID: "task-ansi", Seq: 2, Type: "assistant.delta",
+		Payload: json.RawMessage(`{"delta":"safe\u001b[2Jtext"}`),
+	})
+	if strings.Contains(stdout.String()+stderr.String(), "\x1b") {
+		t.Fatalf("text mode emitted terminal control characters: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if got := stdout.String(); got != "safetext" {
+		t.Fatalf("stdout = %q, want sanitized assistant text", got)
+	}
+	if !strings.Contains(stderr.String(), "running step: build") {
+		t.Fatalf("stderr = %q, want sanitized progress line", stderr.String())
+	}
+}
+
+func TestTaskStreamRendererJSONFinalAnswerUsesCumulativeSnapshot(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	renderer := newTaskStreamRenderer(&stdout, &stderr, outputJSON)
+	renderer.HandleEvent(localclient.TaskEvent{
+		TaskID: "task-json-snapshot", Seq: 1, Type: "assistant.delta",
+		Payload: json.RawMessage(`{"delta":"hel"}`),
+	})
+	renderer.HandleEvent(localclient.TaskEvent{
+		TaskID: "task-json-snapshot", Seq: 2, Type: "assistant.snapshot",
+		Payload: json.RawMessage(`{"text":"hello world","partial":false}`),
+	})
+	if got := renderer.FinalAnswer(persistence.TaskRecord{ID: "task-json-snapshot"}); got != "hello world" {
+		t.Fatalf("FinalAnswer() = %q, want snapshot text", got)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		var item map[string]any
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			t.Fatalf("invalid JSONL line %q: %v", line, err)
+		}
+	}
+}
+
 func TestParseOutputModeRejectsUnknownMode(t *testing.T) {
 	if mode, err := parseOutputMode("json"); err != nil || mode != outputJSON {
 		t.Fatalf("parseOutputMode(json) = %q, %v", mode, err)

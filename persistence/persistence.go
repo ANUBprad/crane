@@ -183,7 +183,7 @@ func migrateTaskEventSequence(db *sql.DB) error {
 	`); err != nil {
 		return fmt.Errorf("backfill task_events.seq: %w", err)
 	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_task_events_task_seq ON task_events(task_id, seq)`); err != nil {
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_task_events_task_seq ON task_events(task_id, seq)`); err != nil {
 		return fmt.Errorf("create task_events seq index: %w", err)
 	}
 	return nil
@@ -736,14 +736,16 @@ func (s *Store) GetTaskEventsAfter(taskID string, after int64, limit int) ([]Tas
 	if after < 0 {
 		after = 0
 	}
-	if after > 0 {
-		var minSeq sql.NullInt64
-		if err := s.db.QueryRow(`SELECT MIN(seq) FROM task_events WHERE task_id = ?`, taskID).Scan(&minSeq); err != nil {
-			return nil, fmt.Errorf("check task event cursor: %w", err)
-		}
-		if minSeq.Valid && after < minSeq.Int64-1 {
-			return nil, ErrEventCursorExpired
-		}
+	var minSeq sql.NullInt64
+	var maxSeq int64
+	if err := s.db.QueryRow(`SELECT MIN(seq), COALESCE(MAX(seq), 0) FROM task_events WHERE task_id = ?`, taskID).Scan(&minSeq, &maxSeq); err != nil {
+		return nil, fmt.Errorf("check task event cursor: %w", err)
+	}
+	if minSeq.Valid && after < minSeq.Int64-1 {
+		return nil, ErrEventCursorExpired
+	}
+	if after > maxSeq {
+		return nil, ErrEventCursorExpired
 	}
 	rows, err := s.db.Query(`
 		SELECT id, seq, task_id, timestamp, type, COALESCE(payload, '{}')

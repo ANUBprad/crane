@@ -169,6 +169,7 @@ type Supervisor struct {
 	activeMu          sync.Mutex
 	active            map[string]*runningTask
 	taskContexts      map[string]taskContext
+	emitMu            sync.Mutex
 	events            *eventHub
 }
 
@@ -403,8 +404,10 @@ func (s *Supervisor) ApproveTask(id string, approved bool, scope string) (persis
 		return record, errors.New("task is not waiting for approval")
 	}
 	if !approved {
-		_ = s.store.CompleteTask(id, "failed", record.Result, "approval rejected by user")
 		s.emitEvent(id, "approval_rejected", map[string]any{"scope": scope})
+		if err := s.finalize(id, "failed", record.Result, "approval rejected by user", nil); err != nil {
+			return persistence.TaskRecord{}, err
+		}
 		return s.store.GetTaskRecord(id)
 	}
 
@@ -518,20 +521,27 @@ func ephemeralEventType(eventType string) bool {
 }
 
 func (s *Supervisor) emitEventWithPersist(taskID, eventType string, payload any, persist bool) {
-	var seq int64
-	if persist {
-		var err error
-		seq, err = s.store.AppendTaskEvent(taskID, eventType, payload)
-		if err != nil {
-			return
+	publish := func(seq int64) {
+		event := persistence.TaskEvent{
+			ID: seq, Seq: seq, EventVersion: persistence.EventSchemaVersion,
+			TaskID: taskID, Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			Type: eventType, Payload: mustJSON(payload),
 		}
+		s.events.publish(event)
 	}
-	event := persistence.TaskEvent{
-		ID: seq, Seq: seq, EventVersion: persistence.EventSchemaVersion,
-		TaskID: taskID, Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
-		Type: eventType, Payload: mustJSON(payload),
+	if !persist {
+		publish(0)
+		return
 	}
-	s.events.publish(event)
+	// Persist and publish under one lock so concurrent emitters cannot commit
+	// seq N+1 before publishing seq N. Consumers rely on monotonic delivery.
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	seq, err := s.store.AppendTaskEvent(taskID, eventType, payload)
+	if err != nil {
+		return
+	}
+	publish(seq)
 }
 
 func mustJSON(value any) json.RawMessage {
