@@ -670,7 +670,8 @@ func TestApprovalCheckpointSurvivesSupervisorRestartAndResumesExactGrant(t *test
 	if err := json.Unmarshal(resumed, &state); err != nil {
 		t.Fatal(err)
 	}
-	grants, _ := state["granted_approvals"].([]any)
+	resumedCheckpoint, _ := state["checkpoint"].(map[string]any)
+	grants, _ := resumedCheckpoint["granted_approvals"].([]any)
 	found := false
 	for _, grant := range grants {
 		if grant == scope {
@@ -678,7 +679,7 @@ func TestApprovalCheckpointSurvivesSupervisorRestartAndResumesExactGrant(t *test
 		}
 	}
 	if !found {
-		t.Fatalf("exact approval scope was not forwarded into resumed checkpoint: %#v", state)
+		t.Fatalf("exact approval scope was not forwarded into resumed checkpoint: %#v", resumedCheckpoint)
 	}
 	if _, err := restarted.CancelTask(taskID); err != nil {
 		t.Fatalf("cancel resumed helper task: %v", err)
