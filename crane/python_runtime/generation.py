@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
@@ -626,9 +627,18 @@ def run_validation_command(workspace: Path, command: ValidationCommand) -> Dict[
             return {**base, "status": "failed", "error": f"timeout after {timeout}s"}
         return {**base, "status": "succeeded" if exit_code == 0 else "failed"}
     except Exception as exc:  # noqa: BLE001
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+        for reader in readers:
+            reader.join(timeout=1.0)
         return {"name": command.name, "argv": argv, "status": "failed", "error": str(exc), "duration_ms": int((time.time() - start) * 1000)}
 
 def default_validation_commands(workspace: Path) -> List[ValidationCommand]:

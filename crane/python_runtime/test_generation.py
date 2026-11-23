@@ -180,7 +180,16 @@ class GenerationSafetyTests(unittest.TestCase):
             name="bounded_output", argv=["python", "-c", "print('x' * 50000)"], cwd=".", timeout_seconds=20,
         )
         result = gen.run_validation_command(self.ws, command)
-        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(
+            result["status"],
+            "succeeded",
+            msg={
+                "error": result.get("error"),
+                "exit_code": result.get("exit_code"),
+                "stdout": result.get("stdout", "")[:500],
+                "stderr": result.get("stderr", "")[:500],
+            },
+        )
         self.assertLessEqual(len(result["stdout"].encode("utf-8")), gen.MAX_COMMAND_OUTPUT)
         self.assertTrue(result["stdout_truncated"])
         self.assertFalse(gen.allowed_validation_command(["git", "push", "origin", "main"]))
