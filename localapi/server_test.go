@@ -738,7 +738,11 @@ func TestEventStreamReplaysPersistedEventsWithCursor(t *testing.T) {
 
 func TestEventStreamResumesFromLastEventIDHeader(t *testing.T) {
 	state := newTestState(t)
-	seq, err := state.store.AppendTaskEvent("api-running", "step_started", map[string]any{"step_id": "resume"})
+	firstSeq, err := state.store.AppendTaskEvent("api-running", "step_started", map[string]any{"step_id": "already_seen"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, err := state.store.AppendTaskEvent("api-running", "step_completed", map[string]any{"step_id": "resume"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -750,7 +754,7 @@ func TestEventStreamResumesFromLastEventIDHeader(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Authorization", "Bearer "+state.token)
-	req.Header.Set("Last-Event-ID", "0")
+	req.Header.Set("Last-Event-ID", strconv.FormatInt(firstSeq, 10))
 	response, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -765,7 +769,7 @@ func TestEventStreamResumesFromLastEventIDHeader(t *testing.T) {
 		t.Fatalf("unexpected snapshot event: %#v", snapshot)
 	}
 	event := readSSEEvent(t, reader)
-	if event.id != strconv.FormatInt(seq, 10) || event.name != "step_started" {
+	if event.id != strconv.FormatInt(seq, 10) || event.name != "step_completed" {
 		t.Fatalf("unexpected Last-Event-ID replay event: %#v", event)
 	}
 }

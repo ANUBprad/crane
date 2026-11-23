@@ -185,6 +185,7 @@ class GenerationSafetyTests(unittest.TestCase):
         self.assertTrue(result["stdout_truncated"])
         self.assertFalse(gen.allowed_validation_command(["git", "push", "origin", "main"]))
         self.assertTrue(gen.allowed_validation_command(["python.exe", "-m", "py_compile", "app.py"]))
+
     def test_duplicate_paths_rejected(self):
         with self.assertRaises(gen.GenerationError):
             gen.validate_file_operations(self.ws, [
