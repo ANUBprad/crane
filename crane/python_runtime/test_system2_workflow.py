@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import unittest
 from unittest import mock
 
@@ -101,29 +102,26 @@ class WorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.get("execution_status"), ExecutionStatus.FAILED.value)
         self.assertIn("MCP tools require", result.get("failure_reason") or "")
 
-    async def test_cancellation_is_reported(self) -> None:
+    async def test_cancellation_interrupts_blocking_model_call(self) -> None:
+        task_id = "t-cancel-blocking"
+        started = threading.Event()
+        release = threading.Event()
+
         def slow_invoke(*args, **kwargs):
-            import time as _time
-            _time.sleep(0.2)
+            started.set()
+            release.wait(2)
             return {"execution_mode": "deterministic_local", "provider": "local", "model_output": "ok"}
 
         with mock.patch.dict(os.environ, {"CRANE_MODEL_PROVIDER": "local"}, clear=False), \
              mock.patch.object(protocol, "write_stdout", lambda *_: None), \
              mock.patch.object(workflow_engine, "invoke_provider", side_effect=slow_invoke):
-            task = asyncio.create_task(workflow_engine.execute_task("hello", task_id="t-cancel"))
-            await asyncio.sleep(0.05)
-            workflow_engine.request_cancellation("t-cancel")
-            result = await task
-        self.assertIn(result["status"], {"cancelled", "failed", "succeeded"})
-        self.assertIn(
-            result.get("execution_status"),
-            {
-                ExecutionStatus.CANCELLED.value,
-                ExecutionStatus.FAILED.value,
-                ExecutionStatus.PARTIALLY_COMPLETED.value,
-                ExecutionStatus.FULLY_COMPLETED.value,
-            },
-        )
+            task = asyncio.create_task(workflow_engine.execute_task("hello", task_id=task_id))
+            self.assertTrue(await asyncio.to_thread(started.wait, 2))
+            workflow_engine.request_cancellation(task_id)
+            result = await asyncio.wait_for(task, 2)
+            release.set()
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["execution_status"], ExecutionStatus.CANCELLED.value)
 
 
 if __name__ == "__main__":

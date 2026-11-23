@@ -58,6 +58,32 @@ class ProtocolRuntime:
             "execution_status": outcome.get("execution_status") or result.get("execution_status"),
         })
 
+    @classmethod
+    def _send_cancellation_result(cls, task_id: str, reason: str) -> None:
+        """Acknowledge a supervisor cancellation without waiting for model work.
+
+        Model calls can block a worker thread long after the workflow has
+        observed the cancellation. Go must receive the confirmed terminal result
+        now so it can stop the child process that owns that worker.
+        """
+        protocol.write_stdout(protocol.task_event(
+            task_id, "cancellation_queued", {"reason": reason}
+        ))
+        cls._send_result({
+            "task_id": task_id,
+            "status": "cancelled",
+            "result": {
+                "execution_status": "cancelled",
+                "summary": "Task cancelled by supervisor request",
+                "model_output": "Task cancelled by supervisor request",
+            },
+            "result_summary": "Task cancelled by supervisor request",
+            "graph_steps": 0,
+            "wall_clock_ms": 0,
+            "current_step": "cancelled",
+            "execution_status": "cancelled",
+        })
+
     def run(self) -> int:
         protocol.write_stdout({
             "type": protocol.TYPE_RUNTIME_IDENTITY,
@@ -112,7 +138,12 @@ class ProtocolRuntime:
                         self._error("bad_request", str(exc))
                         continue
                     if current_id == command["task_id"]:
-                        if not request_cancellation(current_id):
+                        request_cancellation(current_id)
+                        if future is not None:
+                            self._send_cancellation_result(current_id, command["reason"])
+                            future = None
+                            current_id = None
+                        else:
                             protocol.write_stdout(protocol.task_event(
                                 current_id, "cancellation_queued", {"reason": command["reason"]}
                             ))

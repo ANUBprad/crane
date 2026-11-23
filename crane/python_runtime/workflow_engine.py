@@ -115,6 +115,35 @@ def request_cancellation(task_id: str) -> bool:
     return True
 
 
+def _cancellation_event(task_id: str) -> Optional[threading.Event]:
+    with _CANCELLATIONS_LOCK:
+        return _CANCELLATIONS.get(task_id)
+
+
+async def _await_with_cancellation(awaitable: Any, task_id: str) -> Any:
+    """Await model work while reacting to cancellation between blocking calls.
+
+    Model clients invoke synchronous HTTP APIs in worker threads; cancelling the
+    asyncio task cannot stop that thread, but it lets the workflow return a real
+    cancelled terminal result immediately. The supervisor then stops the child
+    process, which owns the worker thread.
+    """
+    event = _cancellation_event(task_id)
+    task = asyncio.ensure_future(awaitable)
+    try:
+        while not task.done():
+            if event is not None and event.is_set():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                raise WorkflowCancelled("task cancelled by supervisor")
+            await asyncio.sleep(0.05)
+        return task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 def _check_cancelled(task_id: str) -> None:
     with _CANCELLATIONS_LOCK:
         event = _CANCELLATIONS.get(task_id)
@@ -682,7 +711,7 @@ async def node_normalize(raw: Dict[str, Any]) -> Dict[str, Any]:
     return state_to_checkpoint(state)
 
 
-def _build_plan_with_model(state: WorkflowState, tools: List[Dict[str, Any]]) -> Optional[List[PlanStep]]:
+async def _build_plan_with_model(state: WorkflowState, tools: List[Dict[str, Any]]) -> Optional[List[PlanStep]]:
     if selected_provider() != "ollama":
         return None
     tool_desc = [{"name": t.get("name"), "description": t.get("description", ""), "policy_class": t.get("policy_class", "")} for t in tools[:40]]
@@ -694,7 +723,14 @@ def _build_plan_with_model(state: WorkflowState, tools: List[Dict[str, Any]]) ->
         f"Objective: {state.objective}\nAvailable tools: {json.dumps(tool_desc, ensure_ascii=False)}\n"
     )
     try:
-        out = invoke_provider(prompt, None, "You are a planning component. Output strict JSON only.", [], state.runtime_context)
+        out = await _await_with_cancellation(
+            asyncio.to_thread(
+                invoke_provider, prompt, None,
+                "You are a planning component. Output strict JSON only.", [],
+                state.runtime_context,
+            ),
+            state.task_id,
+        )
         state.model_calls += 1
         text = str((out or {}).get("model_output") or "")
         match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -723,6 +759,8 @@ def _build_plan_with_model(state: WorkflowState, tools: List[Dict[str, Any]]) ->
                 completion_criteria=str(raw.get("completion_criteria") or "").strip()[:500],
             ))
         return plan or None
+    except WorkflowCancelled:
+        raise
     except Exception:
         return None
 
@@ -763,7 +801,7 @@ async def node_plan(raw: Dict[str, Any]) -> Dict[str, Any]:
         plan = _default_generation_plan(state)
     else:
         use_model_planning = selected_provider() == "ollama" and not has_mcp
-        plan = _build_plan_with_model(state, tools) if use_model_planning else None
+        plan = await _build_plan_with_model(state, tools) if use_model_planning else None
         if plan is None:
             plan = _default_plan(state.objective, tools_by_name)
 
@@ -878,8 +916,12 @@ async def _invoke_model_for_step(state: WorkflowState, step: PlanStep, manager: 
     system_prompt = (state.runtime_context.get("system_prompt") or "")
 
     def _on_delta(text: str) -> None:
-        if text:
-            _event(state.task_id, "assistant.delta", {"delta": text})
+        if not text:
+            return
+        event = _cancellation_event(state.task_id)
+        if event is not None and event.is_set():
+            return
+        _event(state.task_id, "assistant.delta", {"delta": text})
 
     if selected_provider() == "ollama":
         prepare_provider()
@@ -888,35 +930,44 @@ async def _invoke_model_for_step(state: WorkflowState, step: PlanStep, manager: 
         if state.model_calls > MAX_MODEL_CALLS_PER_TASK:
             raise ProviderError("model_call_limit", f"Exceeded maximum model calls per task ({MAX_MODEL_CALLS_PER_TASK})")
         if tools:
-            out = await invoke_with_tools(
-                f"Objective: {state.objective}\nCurrent step: {step.description}\nExpected outcome: {step.expected_outcome}\nUse available tools as needed. Return a factual result based on actual tool outputs.",
-                tools,
-                system_prompt=system_prompt,
-                messages=conversation_messages,
+            out = await _await_with_cancellation(
+                invoke_with_tools(
+                    f"Objective: {state.objective}\nCurrent step: {step.description}\nExpected outcome: {step.expected_outcome}\nUse available tools as needed. Return a factual result based on actual tool outputs.",
+                    tools,
+                    system_prompt=system_prompt,
+                    messages=conversation_messages,
+                ),
+                state.task_id,
             )
             model_output = str((out or {}).get("model_output") or "")
             if model_output:
                 _on_delta(model_output)
             return out
-        out = await asyncio.to_thread(
+        out = await _await_with_cancellation(
+            asyncio.to_thread(
+                invoke_provider,
+                f"Objective: {state.objective}\nCurrent step: {step.description}\nExpected outcome: {step.expected_outcome}",
+                None,
+                system_prompt,
+                conversation_messages,
+                state.runtime_context,
+                _on_delta,
+            ),
+            state.task_id,
+        )
+        return out
+    # local/deterministic path
+    out = await _await_with_cancellation(
+        asyncio.to_thread(
             invoke_provider,
-            f"Objective: {state.objective}\nCurrent step: {step.description}\nExpected outcome: {step.expected_outcome}",
+            state.objective,
             None,
             system_prompt,
             conversation_messages,
             state.runtime_context,
             _on_delta,
-        )
-        return out
-    # local/deterministic path
-    out = await asyncio.to_thread(
-        invoke_provider,
-        state.objective,
-        None,
-        system_prompt,
-        conversation_messages,
-        state.runtime_context,
-        _on_delta,
+        ),
+        state.task_id,
     )
     return out
 
@@ -1048,8 +1099,17 @@ async def _model_json(state: WorkflowState, prompt: str, system: str) -> Optiona
         state.model_calls += 1
         if state.model_calls > MAX_MODEL_CALLS_PER_TASK:
             return None
-        out = await asyncio.to_thread(invoke_provider, prompt, None, system, state.persistent_state.get("conversation_messages") or [], state.runtime_context)
+        out = await _await_with_cancellation(
+            asyncio.to_thread(
+                invoke_provider, prompt, None, system,
+                state.persistent_state.get("conversation_messages") or [],
+                state.runtime_context,
+            ),
+            state.task_id,
+        )
         return _parse_model_json(str((out or {}).get("model_output") or ""))
+    except WorkflowCancelled:
+        raise
     except Exception:
         return None
 
