@@ -259,11 +259,19 @@ $payloadName = "crane-windows-x64-$Version.zip"
 $payloadPath = Join-Path $releaseDir $payloadName
 New-DeterministicZip -sourceDirectory $stage -destinationZip $payloadPath
 
+Write-Step 'Generating CycloneDX software bill of materials'
+$sbomPath = Join-Path $releaseDir 'sbom.cdx.json'
+& python (Join-Path $repoRoot 'scripts\generate-sbom.py') --repo-root $repoRoot --version $Version --commit $Commit --build-date $buildDate --python-version $PythonVersion --go-version $GoVersion --output $sbomPath
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $sbomPath)) {
+    throw 'CycloneDX SBOM generation failed.'
+}
+
 $artifacts = @(
     [ordered]@{ name = $payloadName; kind = 'payload'; sha256 = (Get-Sha256 $payloadPath); size = (Get-Item $payloadPath).Length },
     [ordered]@{ name = 'install.ps1'; kind = 'installer'; sha256 = (Get-Sha256 (Join-Path $releaseDir 'install.ps1')); size = (Get-Item (Join-Path $releaseDir 'install.ps1')).Length },
     [ordered]@{ name = 'uninstall.ps1'; kind = 'uninstaller'; sha256 = (Get-Sha256 (Join-Path $releaseDir 'uninstall.ps1')); size = (Get-Item (Join-Path $releaseDir 'uninstall.ps1')).Length },
     [ordered]@{ name = 'python-requirements.lock.txt'; kind = 'dependency_lock'; sha256 = (Get-Sha256 (Join-Path $releaseDir 'python-requirements.lock.txt')); size = (Get-Item (Join-Path $releaseDir 'python-requirements.lock.txt')).Length }
+    [ordered]@{ name = 'sbom.cdx.json'; kind = 'sbom'; sha256 = (Get-Sha256 $sbomPath); size = (Get-Item $sbomPath).Length }
 )
 $manifest = [ordered]@{
     schema_version = 1

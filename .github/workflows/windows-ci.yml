@@ -40,6 +40,9 @@ jobs:
       - name: Install locked Python dependencies
         run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.lock.txt
 
+      - name: Test SBOM generator
+        run: python scripts/generate-sbom.py --self-test
+
       - name: Check Go formatting
         shell: pwsh
         run: |
@@ -103,6 +106,17 @@ jobs:
           $testRoot = Join-Path $env:RUNNER_TEMP 'crane-ci-install'
           $releaseRoot = Join-Path (Join-Path $env:RUNNER_TEMP 'crane-release') $env:CRANE_CI_VERSION
           $installRoot = Join-Path $testRoot 'Programs\CRANE'
+
+          $sbomPath = Join-Path $releaseRoot 'sbom.cdx.json'
+          $sbom = Get-Content -LiteralPath $sbomPath -Raw | ConvertFrom-Json
+          if ($sbom.bomFormat -ne 'CycloneDX' -or $sbom.specVersion -ne '1.5' -or @($sbom.components).Count -eq 0) {
+            throw 'Release SBOM is missing, malformed, or has no dependency components.'
+          }
+          $manifest = Get-Content -LiteralPath (Join-Path $releaseRoot 'release-manifest.json') -Raw | ConvertFrom-Json
+          $sbomEntry = @($manifest.artifacts | Where-Object { $_.name -eq 'sbom.cdx.json' })
+          if ($sbomEntry.Count -ne 1 -or $sbomEntry[0].sha256 -ne (Get-FileHash -LiteralPath $sbomPath -Algorithm SHA256).Hash.ToLowerInvariant()) {
+            throw 'Release manifest does not authenticate the SBOM.'
+          }
           $env:LOCALAPPDATA = Join-Path $testRoot 'AppData\Local'
           $env:CRANE_SKIP_PATH_UPDATE = '1'
           New-Item -ItemType Directory -Path $env:LOCALAPPDATA -Force | Out-Null

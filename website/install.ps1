@@ -26,7 +26,8 @@ try {
         'SHA256SUMS.txt',
         'install.ps1',
         'uninstall.ps1',
-        'python-requirements.lock.txt'
+        'python-requirements.lock.txt',
+        'sbom.cdx.json'
     )
     $assets = @{}
     foreach ($asset in $release.assets) {

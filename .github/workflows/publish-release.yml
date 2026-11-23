@@ -120,3 +120,4 @@ jobs:
             build/release/${{ env.RELEASE_VERSION }}/install.ps1
             build/release/${{ env.RELEASE_VERSION }}/uninstall.ps1
             build/release/${{ env.RELEASE_VERSION }}/python-requirements.lock.txt
+            build/release/${{ env.RELEASE_VERSION }}/sbom.cdx.json

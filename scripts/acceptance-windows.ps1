@@ -187,6 +187,18 @@ try {
     $release012 = Join-Path $ReleaseRoot '0.1.2'
     Assert-Step (Test-Path -LiteralPath (Join-Path $release012 'release-manifest.json')) 'Release 0.1.2 manifest exists'
 
+    foreach ($versionRoot in @($release010, $release011, $release012)) {
+        $sbomPath = Join-Path $versionRoot 'sbom.cdx.json'
+        Assert-Step (Test-Path -LiteralPath $sbomPath) "Release $([IO.Path]::GetFileName($versionRoot)) includes a CycloneDX SBOM"
+        $sbom = Get-Content -LiteralPath $sbomPath -Raw | ConvertFrom-Json
+        Assert-Step ($sbom.bomFormat -eq 'CycloneDX' -and $sbom.specVersion -eq '1.5' -and @($sbom.components).Count -gt 0) 'SBOM contains a populated CycloneDX 1.5 component inventory'
+        $manifest = Get-Content -LiteralPath (Join-Path $versionRoot 'release-manifest.json') -Raw | ConvertFrom-Json
+        $entry = @($manifest.artifacts | Where-Object { $_.name -eq 'sbom.cdx.json' })
+        Assert-Step ($entry.Count -eq 1 -and $entry[0].sha256 -eq (Get-FileHash -LiteralPath $sbomPath -Algorithm SHA256).Hash.ToLowerInvariant()) 'Release manifest authenticates the SBOM checksum'
+        $sums = Get-Content -LiteralPath (Join-Path $versionRoot 'SHA256SUMS.txt') -Raw
+        Assert-Step ($sums -match [regex]::Escape($entry[0].sha256 + '  sbom.cdx.json')) 'SHA256SUMS includes the SBOM'
+    }
+
     $unsupportedRelease = Join-Path $testRoot 'unsupported-release'
     Copy-Item -LiteralPath $release010 -Destination $unsupportedRelease -Recurse -Force
     $manifestPath = Join-Path $unsupportedRelease 'release-manifest.json'

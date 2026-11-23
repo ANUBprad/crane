@@ -1,6 +1,8 @@
 package persistence
 
 import (
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -80,6 +82,128 @@ func TestTaskRecordExposesPendingApprovalWhenStatusIsFailed(t *testing.T) {
 	}
 	if record.PendingApprovalReason != "Approve exact changes" {
 		t.Fatalf("PendingApprovalReason = %q", record.PendingApprovalReason)
+	}
+}
+
+func TestLegacyV1DatabaseMigratesWithoutLosingTasksEventsApprovalsOrCheckpoints(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySchema := []string{
+		`CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE tasks (
+			id TEXT PRIMARY KEY, created_at TEXT, started_at TEXT, completed_at TEXT,
+			status TEXT NOT NULL, input TEXT, result TEXT, error TEXT, workflow_ref TEXT,
+			checkpoint TEXT, policy_state TEXT, artifact_ref TEXT, runtime TEXT,
+			schema_version TEXT NOT NULL DEFAULT '001'
+		)`,
+		`CREATE TABLE task_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+			timestamp TEXT NOT NULL, type TEXT NOT NULL, payload TEXT,
+			FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE checkpoints (
+			task_id TEXT NOT NULL, version INTEGER NOT NULL, timestamp TEXT NOT NULL,
+			snapshot TEXT, PRIMARY KEY (task_id, version),
+			FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE approvals (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, action TEXT NOT NULL,
+			granted BOOLEAN NOT NULL, granted_at TEXT, grantee TEXT,
+			FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+		)`,
+	}
+	for _, statement := range legacySchema {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("create v1 schema: %v", err)
+		}
+	}
+	if _, err := db.Exec(
+		"INSERT INTO schema_migrations (version, description, applied_at) VALUES (1, 'initial', '2025-01-01T00:00:00Z')",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		"INSERT INTO tasks (id, created_at, status, input, schema_version) VALUES (?, ?, ?, ?, ?)",
+		"legacy-upgrade-task", "2025-01-01T00:00:00Z", "waiting_approval", "resume this task", "001",
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []struct {
+		id   int
+		kind string
+	}{
+		{10, "task_admitted"},
+		{20, "waiting_approval"},
+	} {
+		if _, err := db.Exec(
+			"INSERT INTO task_events (id, task_id, timestamp, type, payload) VALUES (?, ?, ?, ?, ?)",
+			event.id, "legacy-upgrade-task", "2025-01-01T00:00:00Z", event.kind, `{"preserved":true}`,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkpoint := `{"execution_status":"waiting_for_approval","generation":{"pending_approval":{"scope":"generation:apply:legacy-upgrade-task:abc123","reason":"Approve preserved change"}}}`
+	if _, err := db.Exec(
+		"INSERT INTO checkpoints (task_id, version, timestamp, snapshot) VALUES (?, ?, ?, ?)",
+		"legacy-upgrade-task", 7, "2025-01-01T00:00:00Z", checkpoint,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		"INSERT INTO approvals (task_id, action, granted, granted_at, grantee) VALUES (?, ?, ?, ?, ?)",
+		"legacy-upgrade-task", "delete:record-1", true, "2025-01-01T00:00:00Z", "local-user",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("upgrade v1 database: %v", err)
+	}
+	defer store.Close()
+	version, err := store.MigrationVersion()
+	if err != nil || version != 4 {
+		t.Fatalf("MigrationVersion() = %d, %v; want 4", version, err)
+	}
+	record, err := store.GetTaskRecord("legacy-upgrade-task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "waiting_approval" || record.PendingApprovalScope != "generation:apply:legacy-upgrade-task:abc123" ||
+		record.PendingApprovalReason != "Approve preserved change" {
+		t.Fatalf("legacy task/approval checkpoint was not preserved: %#v", record)
+	}
+	events, err := store.GetTaskEventsAfter("legacy-upgrade-task", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Seq != 1 || events[1].Seq != 2 {
+		t.Fatalf("legacy event sequence migration = %#v, want sequences [1, 2]", events)
+	}
+	if events[0].Type != "task_admitted" || events[1].Type != "waiting_approval" {
+		t.Fatalf("legacy task events changed during migration: %#v", events)
+	}
+	var action, grantee string
+	var granted bool
+	if err := store.db.QueryRow(
+		"SELECT action, granted, grantee FROM approvals WHERE task_id = ?", "legacy-upgrade-task",
+	).Scan(&action, &granted, &grantee); err != nil {
+		t.Fatal(err)
+	}
+	if action != "delete:record-1" || !granted || grantee != "local-user" {
+		t.Fatalf("legacy approval row changed during migration: action=%q granted=%v grantee=%q", action, granted, grantee)
+	}
+	snapshot, ok := store.GetLatestTaskState("legacy-upgrade-task")
+	if !ok || !json.Valid(snapshot) || string(snapshot) != checkpoint {
+		t.Fatalf("legacy checkpoint was not preserved: %s", snapshot)
 	}
 }
 
