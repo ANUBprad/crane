@@ -30,9 +30,26 @@ Not validated / external blockers:
 - **Controlled official release host/domain:** no controlled official release host/domain is verified. Do not publish or claim an official install URL. Remote `http(s)` install sources are opt-in only and must be operator-controlled.
 - **Cross-environment reproducibility:** `scripts/test-release-reproducibility.ps1` can provide same-host/same-input evidence; cross-environment/toolchain reproducibility is not proven while relevant environment differences remain uncontrolled.
 
+## Public website and bootstrap installer
+
+The project website is deployed from `website/` using the GitHub Pages workflow:
+`https://anubprad.github.io/crane/`.
+
+After a stable GitHub Release exists, Windows users can bootstrap the installer from PowerShell:
+
+```powershell
+irm https://anubprad.github.io/crane/install.ps1 | iex
+```
+
+The bootstrap retrieves the latest stable release from the GitHub Releases API, downloads the manifest, checksum list, payload and lifecycle scripts into a temporary directory, checks the release/platform metadata, then calls the existing local-directory installer. The installer verifies SHA-256 values before activation. The bootstrap refuses missing assets, unexpected download hosts, mismatched platform/version metadata and unexpected signature metadata. Temporary download files are removed after the attempt.
+
+The publishing workflow is triggered by pushing a semantic-version tag such as `v0.1.0`. It builds the Windows x64 package on a Windows GitHub Actions runner and attaches the versioned package and metadata to the GitHub Release. Do not publish a tag until its source commit is intended for release.
+
+**Trust limitation:** artifacts remain unsigned until legitimate Authenticode signing credentials are configured. SHA-256 checks detect corruption/tampering relative to the downloaded manifest; they do not authenticate the publisher. The first public release also requires the GitHub Pages deployment to complete successfully and the public URL to be verified.
+
 ## Release source
 
-The release source is always explicit; no URL is invented.
+For controlled/manual packaging, the release source can still be supplied explicitly as a local directory or a controlled HTTPS base URL.
 
 ```powershell
 .\scripts\install.ps1 -Action Install -ReleaseSource .\build\release\0.1.0
