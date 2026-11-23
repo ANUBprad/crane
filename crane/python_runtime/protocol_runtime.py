@@ -43,6 +43,7 @@ class ProtocolRuntime:
 
     @staticmethod
     def _send_result(outcome: Dict[str, Any]) -> None:
+        result = outcome.get("result") if isinstance(outcome.get("result"), dict) else {}
         protocol.write_stdout({
             "type": protocol.TYPE_TASK_RESULT,
             "task_id": outcome["task_id"],
@@ -54,6 +55,7 @@ class ProtocolRuntime:
             "wall_clock_ms": outcome.get("wall_clock_ms", 0),
             "current_step": outcome.get("current_step", ""),
             "checkpoint": outcome.get("checkpoint"),
+            "execution_status": outcome.get("execution_status") or result.get("execution_status"),
         })
 
     def run(self) -> int:

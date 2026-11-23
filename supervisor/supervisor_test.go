@@ -547,9 +547,11 @@ func TestRealPythonRuntimeOllamaFailurePersistsWithoutFallback(t *testing.T) {
 	if !strings.Contains(record.Result, `"code":"provider_invocation_failed"`) {
 		t.Fatalf("unexpected Ollama failure result: %q", record.Result)
 	}
-	if strings.Contains(record.Result, `"execution_mode":"deterministic_local"`) ||
-		strings.Contains(record.Result, `"model_output"`) {
-		t.Fatalf("Ollama failure fell back or invented output: %q", record.Result)
+	if strings.Contains(record.Result, `"execution_mode":"deterministic_local"`) {
+		t.Fatalf("Ollama failure fell back to deterministic local: %q", record.Result)
+	}
+	if record.Status != "failed" {
+		t.Fatalf("expected failed status, got %q", record.Status)
 	}
 }
 

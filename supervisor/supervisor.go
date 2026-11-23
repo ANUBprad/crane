@@ -760,8 +760,22 @@ func safeToResume(checkpoint []byte) bool {
 	if hasJSONValue(state.LastToolSideEffect) || hasJSONValue(state.SelectedTool) {
 		return false
 	}
-	switch state.CurrentStep {
-	case "", "initialization", "normalizing", "planning", "queued", "starting", "running", "completed", "succeeded":
+	switch {
+	case state.CurrentStep == "",
+		state.CurrentStep == "initialization",
+		state.CurrentStep == "normalizing",
+		state.CurrentStep == "planning",
+		state.CurrentStep == "understanding_objective",
+		state.CurrentStep == "selecting_next_step",
+		state.CurrentStep == "evaluating",
+		state.CurrentStep == "recovering",
+		state.CurrentStep == "verifying_completion",
+		state.CurrentStep == "verified",
+		state.CurrentStep == "queued",
+		state.CurrentStep == "starting",
+		state.CurrentStep == "running",
+		state.CurrentStep == "completed",
+		state.CurrentStep == "succeeded":
 		return true
 	default:
 		return false

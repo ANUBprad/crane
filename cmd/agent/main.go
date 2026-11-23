@@ -599,6 +599,17 @@ func runTaskStatus(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "ID: %s\nStatus: %s\n", record.ID, record.Status)
+	if record.Result != "" {
+		var result map[string]any
+		if err := json.Unmarshal([]byte(record.Result), &result); err == nil {
+			if es, _ := result["execution_status"].(string); es != "" {
+				fmt.Fprintf(stdout, "ExecutionStatus: %s\n", es)
+			}
+			if summary, _ := result["summary"].(string); summary != "" {
+				fmt.Fprintf(stdout, "Summary: %s\n", summary)
+			}
+		}
+	}
 	if record.Error != "" {
 		fmt.Fprintf(stdout, "Error: %s\n", record.Error)
 	}

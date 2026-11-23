@@ -240,15 +240,16 @@ type TaskEvent struct {
 // task successful before receiving this message with a succeeded status.
 type TaskResult struct {
 	Message
-	TaskID        string          `json:"task_id"`
-	Status        string          `json:"status"`
-	Result        json.RawMessage `json:"result,omitempty"`
-	ResultSummary string          `json:"result_summary,omitempty"`
-	FailureReason string          `json:"failure_reason,omitempty"`
-	GraphSteps    int             `json:"graph_steps"`
-	WallClockMs   int64           `json:"wall_clock_ms"`
-	CurrentStep   string          `json:"current_step,omitempty"`
-	Checkpoint    json.RawMessage `json:"checkpoint,omitempty"`
+	TaskID          string          `json:"task_id"`
+	Status          string          `json:"status"`
+	Result          json.RawMessage `json:"result,omitempty"`
+	ResultSummary   string          `json:"result_summary,omitempty"`
+	FailureReason   string          `json:"failure_reason,omitempty"`
+	GraphSteps      int             `json:"graph_steps"`
+	WallClockMs     int64           `json:"wall_clock_ms"`
+	CurrentStep     string          `json:"current_step,omitempty"`
+	ExecutionStatus string          `json:"execution_status,omitempty"`
+	Checkpoint      json.RawMessage `json:"checkpoint,omitempty"`
 }
 
 // TaskError is an explicit Python-side execution failure.
