@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -213,5 +214,75 @@ func TestApprovalRejectionEmitsTerminalEvent(t *testing.T) {
 	}
 	if !seenRejection {
 		t.Fatal("approval_rejected event was not emitted")
+	}
+}
+
+func TestApprovalRejectionClearsPendingCheckpoint(t *testing.T) {
+	store, err := persistence.NewStore(filepath.Join(t.TempDir(), "approval-checkpoint.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const id = "approval-clear-task"
+	if _, err := store.CreateTask(id, "waiting_approval", "test"); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := []byte(`{
+		"state":"failed",
+		"execution_status":"waiting_for_approval",
+		"generation":{"enabled":true,"status":"planned","pending_approval":{"scope":"generation:apply:approval-clear-task:abc123","reason":"Apply generated files"}},
+		"pending_approval_scope":"legacy:approval-clear-task:abc123",
+		"pending_approval_reason":"legacy reason",
+		"plan":[{"step_id":"generate_files","status":"waiting_approval"}],
+		"resumable":true
+	}`)
+	if err := store.SaveTaskState(id, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	s := NewWithStore(store)
+	s.started.Store(true)
+
+	record, err := s.ApproveTask(id, false, "generation:apply:approval-clear-task:abc123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "failed" {
+		t.Fatalf("status = %q, want failed", record.Status)
+	}
+	if record.PendingApprovalScope != "" || record.PendingApprovalReason != "" {
+		t.Fatalf("record still exposes approval scope %q and reason %q", record.PendingApprovalScope, record.PendingApprovalReason)
+	}
+
+	after, ok := store.GetLatestTaskState(id)
+	if !ok {
+		t.Fatal("terminal checkpoint was not persisted")
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(after, &decoded); err != nil {
+		t.Fatalf("terminal checkpoint is invalid JSON: %v", err)
+	}
+	if got, _ := decoded["execution_status"].(string); got != "failed" {
+		t.Fatalf("checkpoint execution_status = %q, want failed", got)
+	}
+	if got, _ := decoded["state"].(string); got != "failed" {
+		t.Fatalf("checkpoint state = %q, want failed", got)
+	}
+	generation, _ := decoded["generation"].(map[string]any)
+	if _, exists := generation["pending_approval"]; exists {
+		t.Fatalf("terminal checkpoint retained generation.pending_approval: %s", after)
+	}
+	if _, exists := decoded["pending_approval_scope"]; exists {
+		t.Fatalf("terminal checkpoint retained pending_approval_scope: %s", after)
+	}
+	steps, _ := decoded["plan"].([]any)
+	if len(steps) != 1 {
+		t.Fatalf("terminal checkpoint plan length = %d, want 1", len(steps))
+	}
+	step, _ := steps[0].(map[string]any)
+	if got, _ := step["status"].(string); got != "failed" {
+		t.Fatalf("waiting plan step status = %q, want failed", got)
+	}
+	if _, err := s.ApproveTask(id, true, "generation:apply:approval-clear-task:abc123"); err == nil {
+		t.Fatal("approval after rejection unexpectedly succeeded")
 	}
 }

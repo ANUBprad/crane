@@ -28,12 +28,13 @@ const (
 	maxConcurrentTasks  = 2
 	// A locally installed CPU-only chat model can take several minutes to load
 	// and answer its first request. Keep the bound, but allow real inference.
-	taskExecutionTimeout  = 180 * time.Second
-	cancelAckTimeout      = 5 * time.Second
-	processCleanupTimeout = 3 * time.Second
-	maxTaskInputBytes     = 64 << 10
-	maxEventSubscribers   = 32
-	eventBufferSize       = 128
+	taskExecutionTimeout    = 180 * time.Second
+	cancelAckTimeout        = 5 * time.Second
+	processCleanupTimeout   = 3 * time.Second
+	maxTaskInputBytes       = 64 << 10
+	maxEventSubscribers     = 32
+	eventBufferSize         = 128
+	approvalRejectionReason = "approval rejected by user"
 )
 
 var (
@@ -414,7 +415,13 @@ func (s *Supervisor) ApproveTask(id string, approved bool, scope string) (persis
 	}
 	if !approved {
 		s.emitEvent(id, "approval_rejected", map[string]any{"scope": scope})
-		if err := s.finalize(id, "failed", record.Result, "approval rejected by user", nil); err != nil {
+		// The workflow checkpoint is the source of pending approval state. A
+		// rejection must persist a terminal checkpoint too; otherwise the latest
+		// checkpoint keeps advertising a scope that can never be granted.
+		if err := s.store.SaveTaskState(id, rejectedApprovalCheckpoint(ckpt)); err != nil {
+			return persistence.TaskRecord{}, err
+		}
+		if err := s.finalize(id, "failed", record.Result, approvalRejectionReason, nil); err != nil {
 			return persistence.TaskRecord{}, err
 		}
 		return s.store.GetTaskRecord(id)
@@ -469,6 +476,57 @@ func (s *Supervisor) ApproveTask(id string, approved bool, scope string) (persis
 	s.emitEvent(id, "approval_granted", map[string]any{"scope": scope})
 	s.enqueue(id, task["input"], updatedCheckpoint, true)
 	return s.store.GetTaskRecord(id)
+}
+
+// rejectedApprovalCheckpoint rewrites a waiting-for-approval checkpoint into a
+// terminal one. The workflow checkpoint is the durable source of approval
+// state, so a rejection must not leave a stale scope available to a later
+// approval request or task-list response.
+func rejectedApprovalCheckpoint(checkpoint map[string]any) []byte {
+	terminal := make(map[string]any, len(checkpoint)+6)
+	for key, value := range checkpoint {
+		terminal[key] = value
+	}
+	if generation, ok := terminal["generation"].(map[string]any); ok {
+		cleared := make(map[string]any, len(generation))
+		for key, value := range generation {
+			if key != "pending_approval" {
+				cleared[key] = value
+			}
+		}
+		terminal["generation"] = cleared
+	}
+	delete(terminal, "pending_approval_scope")
+	delete(terminal, "pending_approval_reason")
+	if steps, ok := terminal["plan"].([]any); ok {
+		updated := make([]any, len(steps))
+		for index, raw := range steps {
+			step, ok := raw.(map[string]any)
+			if !ok {
+				updated[index] = raw
+				continue
+			}
+			clone := make(map[string]any, len(step))
+			for key, value := range step {
+				clone[key] = value
+			}
+			if status, _ := clone["status"].(string); status == "waiting_approval" || status == "waiting_input" {
+				clone["status"] = "failed"
+			}
+			updated[index] = clone
+		}
+		terminal["plan"] = updated
+	}
+	terminal["state"] = "failed"
+	terminal["execution_status"] = "failed"
+	terminal["failure_reason"] = approvalRejectionReason
+	terminal["result_summary"] = "Approval rejected by user"
+	terminal["resumable"] = false
+	encoded, err := json.Marshal(terminal)
+	if err != nil {
+		return []byte(`{"state":"failed","execution_status":"failed","failure_reason":"approval rejected by user"}`)
+	}
+	return encoded
 }
 
 // SubscribeTaskEvents replays persisted events after a cursor and delivers
