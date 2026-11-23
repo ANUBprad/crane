@@ -17,6 +17,7 @@ import (
 
 	"crane/localauth"
 	"crane/persistence"
+	"crane/python_protocol"
 )
 
 const (
@@ -35,11 +36,22 @@ type TaskStore interface {
 	GetTaskRecord(id string) (persistence.TaskRecord, error)
 }
 
+// ConversationStore is the optional persistence surface for chat conversations.
+type ConversationStore interface {
+	CreateConversation(id, title string) (persistence.ConversationRecord, error)
+	GetConversation(id string) (persistence.ConversationRecord, error)
+	ListConversations(limit int) ([]persistence.ConversationRecord, error)
+	AppendConversationMessage(conversationID, role, content, metadata string) (persistence.ConversationMessage, error)
+	GetConversationMessages(conversationID string, limit int) ([]persistence.ConversationMessage, error)
+	GetRecentConversationMessages(conversationID string, limit int) ([]persistence.ConversationMessage, error)
+}
+
 // TaskController is the supervisor-owned task surface exposed by the API.
 // Admission, cancellation and event streaming are deliberately separated from
 // HTTP transport so the Go supervisor owns all task lifecycle decisions.
 type TaskController interface {
 	AdmitTask(id, input string) (persistence.TaskRecord, error)
+	AdmitTaskWithContext(id, input string, conversationID string, conversationMessages []python_protocol.ConversationMessage) (persistence.TaskRecord, error)
 	CancelTask(id string) (persistence.TaskRecord, error)
 	SubscribeTaskEvents(id string, after int64) (<-chan persistence.TaskEvent, func(), error)
 }
@@ -59,16 +71,17 @@ type HealthResponse struct {
 }
 
 type Server struct {
-	auth       *localauth.Manager
-	store      TaskStore
-	runtime    func() RuntimeStatus
-	supervisor func() bool
-	controller TaskController
-	mcp        MCPController
-	httpSrv    *http.Server
-	listener   net.Listener
-	serveErr   chan error
-	serveDone  chan error
+	auth          *localauth.Manager
+	store         TaskStore
+	conversations ConversationStore
+	runtime       func() RuntimeStatus
+	supervisor    func() bool
+	controller    TaskController
+	mcp           MCPController
+	httpSrv       *http.Server
+	listener      net.Listener
+	serveErr      chan error
+	serveDone     chan error
 }
 
 // DefaultPort is the fixed loopback port used by the supervisor and desktop
@@ -124,7 +137,7 @@ func NewServer(
 	if supervisor == nil {
 		supervisor = func() bool { return false }
 	}
-	return &Server{
+	s := &Server{
 		auth:       auth,
 		store:      store,
 		runtime:    runtime,
@@ -132,7 +145,11 @@ func NewServer(
 		controller: controller,
 		serveErr:   make(chan error, 1),
 		serveDone:  make(chan error, 1),
-	}, nil
+	}
+	if conv, ok := store.(ConversationStore); ok {
+		s.conversations = conv
+	}
+	return s, nil
 }
 
 // Start binds to 127.0.0.1 on port and begins serving in the background.
@@ -353,6 +370,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/v1/mcp/approvals/"):
 		s.handleMCPApprovalDecision(w, r, strings.TrimPrefix(path, "/v1/mcp/approvals/"))
 
+	case path == "/v1/conversations":
+		s.handleConversations(w, r)
+
+	case strings.HasPrefix(path, "/v1/conversations/"):
+		s.handleConversationPath(w, r, strings.TrimPrefix(path, "/v1/conversations/"))
+
 	default:
 		writeError(w, http.StatusNotFound, "not_found")
 	}
@@ -376,8 +399,10 @@ func methodNotAllowed(w http.ResponseWriter, methods ...string) {
 }
 
 type taskSubmissionRequest struct {
-	ID    string `json:"id"`
-	Input string `json:"input"`
+	ID                   string                                `json:"id"`
+	Input                string                                `json:"input"`
+	ConversationID       string                                `json:"conversation_id,omitempty"`
+	ConversationMessages []python_protocol.ConversationMessage `json:"conversation_messages,omitempty"`
 }
 
 func (s *Server) handleTaskCreate(w http.ResponseWriter, r *http.Request) {
@@ -405,7 +430,26 @@ func (s *Server) handleTaskCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request")
 		return
 	}
-	record, err := s.controller.AdmitTask(request.ID, request.Input)
+	if request.ConversationID != "" && !persistence.ValidConversationID(request.ConversationID) {
+		writeError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	if len(request.ConversationMessages) > 200 {
+		writeError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	for _, m := range request.ConversationMessages {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		if role != "user" && role != "assistant" && role != "system" {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		if len(m.Content) > 16<<10 {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+	}
+	record, err := s.controller.AdmitTaskWithContext(request.ID, request.Input, request.ConversationID, request.ConversationMessages)
 	if errors.Is(err, persistence.ErrDuplicateTask) {
 		writeError(w, http.StatusConflict, "task_already_exists")
 		return
@@ -575,6 +619,210 @@ func (s *Server) handleTask(w http.ResponseWriter, id string) {
 	writeData(w, http.StatusOK, struct {
 		Task persistence.TaskRecord `json:"task"`
 	}{Task: record})
+}
+
+func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
+	if s.conversations == nil {
+		writeError(w, http.StatusServiceUnavailable, "conversations_unavailable")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		if r.URL.RawQuery != "" && r.URL.Query().Get("limit") == "" {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		if r.ContentLength > 0 || len(r.TransferEncoding) > 0 {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		limit := 50
+		if v := r.URL.Query().Get("limit"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 || n > 200 {
+				writeError(w, http.StatusBadRequest, "bad_request")
+				return
+			}
+			limit = n
+		}
+		records, err := s.conversations.ListConversations(limit)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "CRANE local API: conversation listing failed")
+			writeError(w, http.StatusServiceUnavailable, "persistence_unavailable")
+			return
+		}
+		if records == nil {
+			records = []persistence.ConversationRecord{}
+		}
+		writeData(w, http.StatusOK, struct {
+			Conversations []persistence.ConversationRecord `json:"conversations"`
+			Count         int                              `json:"count"`
+		}{Conversations: records, Count: len(records)})
+	case http.MethodPost:
+		if r.URL.RawQuery != "" {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		var req struct {
+			ID    string `json:"id"`
+			Title string `json:"title"`
+		}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		if !persistence.ValidConversationID(req.ID) {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		record, err := s.conversations.CreateConversation(req.ID, req.Title)
+		if err != nil {
+			if strings.Contains(err.Error(), "already exists") {
+				writeError(w, http.StatusConflict, "conversation_already_exists")
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "persistence_unavailable")
+			return
+		}
+		writeData(w, http.StatusCreated, struct {
+			Conversation persistence.ConversationRecord `json:"conversation"`
+		}{Conversation: record})
+	default:
+		methodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
+}
+
+func (s *Server) handleConversationPath(w http.ResponseWriter, r *http.Request, rest string) {
+	if s.conversations == nil {
+		writeError(w, http.StatusServiceUnavailable, "conversations_unavailable")
+		return
+	}
+	if rest == "" || strings.Contains(rest, "//") {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	if strings.HasSuffix(rest, "/messages") {
+		id := strings.TrimSuffix(rest, "/messages")
+		if !persistence.ValidConversationID(id) || strings.Contains(id, "/") {
+			writeError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		s.handleConversationMessages(w, r, id)
+		return
+	}
+	if strings.Contains(rest, "/") {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	if !persistence.ValidConversationID(rest) {
+		writeError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if rejectQueryAndBody(w, r) {
+		return
+	}
+	record, err := s.conversations.GetConversation(rest)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, "not_found")
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "persistence_unavailable")
+		return
+	}
+	writeData(w, http.StatusOK, struct {
+		Conversation persistence.ConversationRecord `json:"conversation"`
+	}{Conversation: record})
+}
+
+func (s *Server) handleConversationMessages(w http.ResponseWriter, r *http.Request, id string) {
+	switch r.Method {
+	case http.MethodGet:
+		if r.ContentLength > 0 || len(r.TransferEncoding) > 0 {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		limit := 200
+		if v := r.URL.Query().Get("limit"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 || n > 500 {
+				writeError(w, http.StatusBadRequest, "bad_request")
+				return
+			}
+			limit = n
+		}
+		// ensure conversation exists
+		if _, err := s.conversations.GetConversation(id); err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				writeError(w, http.StatusNotFound, "not_found")
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "persistence_unavailable")
+			return
+		}
+		messages, err := s.conversations.GetConversationMessages(id, limit)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "persistence_unavailable")
+			return
+		}
+		if messages == nil {
+			messages = []persistence.ConversationMessage{}
+		}
+		writeData(w, http.StatusOK, struct {
+			Messages []persistence.ConversationMessage `json:"messages"`
+			Count    int                               `json:"count"`
+		}{Messages: messages, Count: len(messages)})
+	case http.MethodPost:
+		if r.URL.RawQuery != "" {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		var req struct {
+			Role     string `json:"role"`
+			Content  string `json:"content"`
+			Metadata string `json:"metadata"`
+		}
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			writeError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		msg, err := s.conversations.AppendConversationMessage(id, req.Role, req.Content, req.Metadata)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				writeError(w, http.StatusNotFound, "not_found")
+				return
+			}
+			if strings.Contains(err.Error(), "invalid") || strings.Contains(err.Error(), "unsupported") || strings.Contains(err.Error(), "empty") {
+				writeError(w, http.StatusBadRequest, "bad_request")
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "persistence_unavailable")
+			return
+		}
+		writeData(w, http.StatusCreated, struct {
+			Message persistence.ConversationMessage `json:"message"`
+		}{Message: msg})
+	default:
+		methodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
 }
 
 func writeData(w http.ResponseWriter, status int, data any) {

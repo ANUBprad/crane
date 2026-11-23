@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"crane/internal/ghauth"
 	"crane/internal/localclient"
 	"crane/internal/runtimeenv"
 	"crane/localapi"
@@ -61,6 +63,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runTask(args[1:], stdout, stderr)
 	case "run":
 		return runTaskPrompt(args[1:], stdout, stderr)
+	case "chat":
+		return runChat(args[1:], stdout, stderr)
+	case "auth":
+		return runAuth(args[1:], stdout, stderr)
 	case "status":
 		return runTaskStatus(args[1:], stdout, stderr)
 	case "result":
@@ -84,12 +90,20 @@ func printUsage(stdout io.Writer) {
 	fmt.Fprintln(stdout, "Usage:")
 	fmt.Fprintln(stdout, "  agent                      Start the supervisor and local API")
 	fmt.Fprintln(stdout, "  agent run \"task\"            Submit a task and print its ID")
+	fmt.Fprintln(stdout, "  agent chat [flags]         Start or resume a persistent conversation")
 	fmt.Fprintln(stdout, "  agent status <task-id>     Report persisted task status")
 	fmt.Fprintln(stdout, "  agent result <task-id>     Print a completed task result")
 	fmt.Fprintln(stdout, "  agent cancel <task-id>     Request task cancellation")
+	fmt.Fprintln(stdout, "  agent auth <login|status|logout>  Manage GitHub authentication")
 	fmt.Fprintln(stdout, "  agent doctor               Report runtime and installation health")
 	fmt.Fprintln(stdout, "  agent update [flags]       Verify and install a newer release")
 	fmt.Fprintln(stdout, "  agent uninstall [flags]    Remove CRANE binaries and PATH entry")
+	fmt.Fprintln(stdout, "")
+	fmt.Fprintln(stdout, "Chat flags:")
+	fmt.Fprintln(stdout, "  --resume <id>              Resume an existing conversation")
+	fmt.Fprintln(stdout, "  --list                     List recent conversations")
+	fmt.Fprintln(stdout, "  --history <id>             Show conversation history")
+	fmt.Fprintln(stdout, "  --limit <n>                Limit list/history entries")
 }
 
 func runServe(args []string, stdout, stderr io.Writer) error {
@@ -319,6 +333,262 @@ func waitForSupervisor(ctx context.Context, client *localclient.Client) error {
 	}
 }
 
+func runChat(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("chat", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	resumeID := flags.String("resume", "", "resume an existing conversation ID")
+	list := flags.Bool("list", false, "list recent conversations")
+	historyID := flags.String("history", "", "show history for a conversation ID")
+	limit := flags.Int("limit", 20, "maximum records/messages to show")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if *limit <= 0 || *limit > 200 {
+		return errors.New("chat --limit must be between 1 and 200")
+	}
+
+	if err := runtimeenv.EnsureDataDirectories(); err != nil {
+		return err
+	}
+	client, err := localclient.New()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := ensureSupervisorReady(ctx, client); err != nil {
+		return err
+	}
+
+	if *list {
+		return chatList(ctx, client, *limit, stdout)
+	}
+	if *historyID != "" {
+		if !persistence.ValidConversationID(*historyID) {
+			return fmt.Errorf("invalid conversation ID %q", *historyID)
+		}
+		return chatHistory(ctx, client, *historyID, *limit, stdout)
+	}
+
+	conversationID := strings.TrimSpace(*resumeID)
+	if conversationID != "" {
+		if !persistence.ValidConversationID(conversationID) {
+			return fmt.Errorf("invalid conversation ID %q", conversationID)
+		}
+		if _, err := client.GetConversation(ctx, conversationID); err != nil {
+			return fmt.Errorf("conversation %q not found or unavailable: %w", conversationID, err)
+		}
+	} else {
+		conversationID, err = newConversationID()
+		if err != nil {
+			return err
+		}
+		if _, err := client.CreateConversation(ctx, conversationID, ""); err != nil {
+			return fmt.Errorf("create conversation: %w", err)
+		}
+	}
+
+	// One-shot mode: remaining args are treated as a single prompt.
+	prompt := strings.TrimSpace(strings.Join(flags.Args(), " "))
+	if prompt != "" {
+		return chatTurn(context.Background(), client, conversationID, prompt, stdout, stderr)
+	}
+
+	// Interactive mode.
+	if !isTerminal(os.Stdin) {
+		// Non-interactive stdin: read all input as one prompt.
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		prompt = strings.TrimSpace(string(data))
+		if prompt == "" {
+			return errors.New("chat requires a prompt, --resume, --list, or --history")
+		}
+		return chatTurn(context.Background(), client, conversationID, prompt, stdout, stderr)
+	}
+
+	fmt.Fprintf(stdout, "CRANE chat (%s)\n", conversationID)
+	fmt.Fprintln(stdout, "Type /exit to quit, /history to show messages, /id to print conversation ID.")
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	for {
+		fmt.Fprint(stdout, "crane> ")
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return err
+			}
+			fmt.Fprintln(stdout)
+			return nil
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		switch line {
+		case "/exit", "/quit":
+			return nil
+		case "/id":
+			fmt.Fprintln(stdout, conversationID)
+			continue
+		case "/history":
+			if err := chatHistory(context.Background(), client, conversationID, *limit, stdout); err != nil {
+				fmt.Fprintf(stderr, "history error: %v\n", err)
+			}
+			continue
+		}
+		if err := chatTurn(context.Background(), client, conversationID, line, stdout, stderr); err != nil {
+			fmt.Fprintf(stderr, "CRANE: %v\n", err)
+		}
+	}
+}
+
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) != 0
+}
+
+func newConversationID() (string, error) {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("conv-%s-%s", time.Now().UTC().Format("20060102T150405.000000000"), hex.EncodeToString(buf)), nil
+}
+
+func ensureSupervisorReady(ctx context.Context, client *localclient.Client) error {
+	if _, err := client.Health(ctx); err == nil {
+		return nil
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if err := startDetachedServe(executable); err != nil {
+		return err
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return waitForSupervisor(waitCtx, client)
+}
+
+func chatList(ctx context.Context, client *localclient.Client, limit int, stdout io.Writer) error {
+	conversations, err := client.ListConversations(ctx, limit)
+	if err != nil {
+		return err
+	}
+	if len(conversations) == 0 {
+		fmt.Fprintln(stdout, "No conversations.")
+		return nil
+	}
+	for _, c := range conversations {
+		title := c.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		fmt.Fprintf(stdout, "%s\t%s\tmessages=%d\tupdated=%s\n", c.ID, title, c.MessageCount, c.UpdatedAt)
+	}
+	return nil
+}
+
+func chatHistory(ctx context.Context, client *localclient.Client, conversationID string, limit int, stdout io.Writer) error {
+	messages, err := client.GetConversationMessages(ctx, conversationID, limit)
+	if err != nil {
+		return err
+	}
+	if len(messages) == 0 {
+		fmt.Fprintln(stdout, "No messages.")
+		return nil
+	}
+	for _, m := range messages {
+		fmt.Fprintf(stdout, "[%s] %s: %s\n", m.CreatedAt, m.Role, m.Content)
+	}
+	return nil
+}
+
+func chatTurn(ctx context.Context, client *localclient.Client, conversationID, prompt string, stdout, stderr io.Writer) error {
+	// Persist user message.
+	if _, err := client.AppendConversationMessage(ctx, conversationID, "user", prompt, ""); err != nil {
+		return fmt.Errorf("persist user message: %w", err)
+	}
+	// Load recent context for the model.
+	recent, err := client.GetConversationMessages(ctx, conversationID, 40)
+	if err != nil {
+		return fmt.Errorf("load conversation context: %w", err)
+	}
+	contextMessages := make([]localclient.ConversationMessage, 0, len(recent))
+	for _, m := range recent {
+		contextMessages = append(contextMessages, localclient.ConversationMessage{Role: m.Role, Content: m.Content})
+	}
+
+	taskID, err := newTaskID()
+	if err != nil {
+		return err
+	}
+	submitCtx, submitCancel := context.WithTimeout(ctx, 30*time.Second)
+	_, err = client.CreateTaskWithContext(submitCtx, taskID, prompt, conversationID, contextMessages)
+	submitCancel()
+	if err != nil {
+		return fmt.Errorf("submit chat task: %w", err)
+	}
+
+	record, err := waitForTaskCompletion(ctx, client, taskID, 5*time.Minute)
+	if err != nil {
+		return err
+	}
+	if record.Status == "failed" {
+		msg := record.Error
+		if msg == "" {
+			msg = "task failed"
+		}
+		_, _ = client.AppendConversationMessage(ctx, conversationID, "assistant", "Error: "+msg, `{"task_id":"`+taskID+`","status":"failed"}`)
+		return fmt.Errorf("%s", msg)
+	}
+	if record.Status == "cancelled" {
+		_, _ = client.AppendConversationMessage(ctx, conversationID, "assistant", "Task cancelled.", `{"task_id":"`+taskID+`","status":"cancelled"}`)
+		return errors.New("task cancelled")
+	}
+	answer := strings.TrimSpace(record.Result)
+	if answer == "" {
+		answer = "(no result)"
+	}
+	if _, err := client.AppendConversationMessage(ctx, conversationID, "assistant", answer, `{"task_id":"`+taskID+`","status":"succeeded"}`); err != nil {
+		fmt.Fprintf(stderr, "warning: failed to persist assistant message: %v\n", err)
+	}
+	fmt.Fprintln(stdout, answer)
+	return nil
+}
+
+func waitForTaskCompletion(ctx context.Context, client *localclient.Client, taskID string, timeout time.Duration) (persistence.TaskRecord, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		record, err := client.GetTask(waitCtx, taskID)
+		if err == nil {
+			switch record.Status {
+			case "succeeded", "failed", "cancelled":
+				return record, nil
+			}
+		}
+		select {
+		case <-waitCtx.Done():
+			if err != nil {
+				return persistence.TaskRecord{}, err
+			}
+			return persistence.TaskRecord{}, fmt.Errorf("timed out waiting for task %s", taskID)
+		case <-ticker.C:
+		}
+	}
+}
+
 func runTaskStatus(args []string, stdout, stderr io.Writer) error {
 	id, err := singleTaskID("status", args)
 	if err != nil {
@@ -460,6 +730,143 @@ type ollamaDoctor struct {
 type doctorIssue struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+func runAuth(args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("auth requires a subcommand: login, status, logout")
+	}
+	switch args[0] {
+	case "login":
+		return runAuthLogin(args[1:], stdout, stderr)
+	case "status":
+		return runAuthStatus(args[1:], stdout, stderr)
+	case "logout":
+		return runAuthLogout(args[1:], stdout, stderr)
+	default:
+		return fmt.Errorf("unknown auth subcommand %q", args[0])
+	}
+}
+
+func githubAuthConfig(clientID string) ghauth.Config {
+	cfg := ghauth.Config{
+		ClientID: strings.TrimSpace(clientID),
+		DataDir:  filepath.Join(runtimeenv.DataRoot(), "auth"),
+	}
+	if cfg.ClientID == "" {
+		cfg.ClientID = ghauth.ClientIDFromEnv()
+	}
+	return cfg
+}
+
+func runAuthLogin(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("auth login", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	clientID := flags.String("client-id", "", "GitHub OAuth client ID (or set CRANE_GITHUB_CLIENT_ID)")
+	scope := flags.String("scope", "read:user", "OAuth scope")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("auth login accepts no positional arguments")
+	}
+	if err := runtimeenv.EnsureDataDirectories(); err != nil {
+		return err
+	}
+	cfg := githubAuthConfig(*clientID)
+	cfg.Scope = strings.TrimSpace(*scope)
+	if cfg.Scope == "" {
+		cfg.Scope = "read:user"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	dc, err := ghauth.StartDeviceFlow(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "GitHub authentication required.")
+	fmt.Fprintf(stdout, "Visit: %s\n", dc.VerificationURI)
+	fmt.Fprintf(stdout, "Code: %s\n", dc.UserCode)
+	fmt.Fprintln(stdout, "Waiting for authorization...")
+
+	token, err := ghauth.PollForToken(ctx, cfg, dc)
+	if err != nil {
+		return err
+	}
+	if err := ghauth.SaveToken(cfg, token); err != nil {
+		return fmt.Errorf("save GitHub token: %w", err)
+	}
+	fmt.Fprintln(stdout, "GitHub authentication complete. Token stored securely.")
+	return nil
+}
+
+func runAuthStatus(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("auth status", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	validate := flags.Bool("validate", false, "validate stored token with GitHub API")
+	clientID := flags.String("client-id", "", "GitHub OAuth client ID (optional)")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("auth status accepts no positional arguments")
+	}
+	cfg := githubAuthConfig(*clientID)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	st, err := ghauth.GetStatus(ctx, cfg, *validate)
+	if err != nil {
+		return err
+	}
+	if !st.Authenticated {
+		fmt.Fprintln(stdout, "GitHub: not authenticated")
+		return nil
+	}
+	fmt.Fprintln(stdout, "GitHub: authenticated")
+	if st.Login != "" {
+		fmt.Fprintf(stdout, "Login: %s\n", st.Login)
+	}
+	if st.Scope != "" {
+		fmt.Fprintf(stdout, "Scope: %s\n", st.Scope)
+	}
+	if st.ObtainedAt != "" {
+		fmt.Fprintf(stdout, "Obtained: %s\n", st.ObtainedAt)
+	}
+	if *validate {
+		if st.Validated {
+			fmt.Fprintln(stdout, "Validation: ok")
+		} else if st.ValidationErr != "" {
+			fmt.Fprintf(stdout, "Validation: %s\n", st.ValidationErr)
+		}
+	}
+	return nil
+}
+
+func runAuthLogout(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("auth logout", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	clientID := flags.String("client-id", "", "GitHub OAuth client ID (optional)")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("auth logout accepts no positional arguments")
+	}
+	cfg := githubAuthConfig(*clientID)
+	if err := ghauth.DeleteToken(cfg); err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "GitHub token removed.")
+	return nil
 }
 
 func runDoctor(args []string, stdout, stderr io.Writer) error {

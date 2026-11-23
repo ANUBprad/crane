@@ -54,10 +54,28 @@ func (c *Client) Health(ctx context.Context) (localapi.HealthResponse, error) {
 
 // CreateTask submits one task to the running supervisor.
 func (c *Client) CreateTask(ctx context.Context, id, input string) (persistence.TaskRecord, error) {
+	return c.CreateTaskWithContext(ctx, id, input, "", nil)
+}
+
+// ConversationMessage mirrors the API conversation message payload.
+type ConversationMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// CreateTaskWithContext submits one task with optional conversation context.
+func (c *Client) CreateTaskWithContext(ctx context.Context, id, input, conversationID string, messages []ConversationMessage) (persistence.TaskRecord, error) {
 	var response struct {
 		Task persistence.TaskRecord `json:"task"`
 	}
-	body, err := json.Marshal(map[string]string{"id": id, "input": input})
+	payload := map[string]any{"id": id, "input": input}
+	if conversationID != "" {
+		payload["conversation_id"] = conversationID
+	}
+	if len(messages) > 0 {
+		payload["conversation_messages"] = messages
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return response.Task, err
 	}
@@ -199,4 +217,100 @@ func apiErrorCode(data []byte) string {
 		return ""
 	}
 	return strings.TrimSpace(body.Error.Code)
+}
+
+func (c *Client) CreateConversation(ctx context.Context, id, title string) (persistence.ConversationRecord, error) {
+	var response struct {
+		Conversation persistence.ConversationRecord `json:"conversation"`
+	}
+	body, err := json.Marshal(map[string]string{"id": id, "title": title})
+	if err != nil {
+		return response.Conversation, err
+	}
+	data, err := c.do(ctx, http.MethodPost, "/v1/conversations", body)
+	if err != nil {
+		return response.Conversation, err
+	}
+	if err := unmarshalEnvelope(data, &response); err != nil {
+		return response.Conversation, err
+	}
+	return response.Conversation, nil
+}
+
+func (c *Client) GetConversation(ctx context.Context, id string) (persistence.ConversationRecord, error) {
+	var response struct {
+		Conversation persistence.ConversationRecord `json:"conversation"`
+	}
+	if !persistence.ValidConversationID(id) {
+		return response.Conversation, fmt.Errorf("conversation not found: %s", id)
+	}
+	data, err := c.do(ctx, http.MethodGet, "/v1/conversations/"+id, nil)
+	if err != nil {
+		return response.Conversation, err
+	}
+	if err := unmarshalEnvelope(data, &response); err != nil {
+		return response.Conversation, err
+	}
+	return response.Conversation, nil
+}
+
+func (c *Client) ListConversations(ctx context.Context, limit int) ([]persistence.ConversationRecord, error) {
+	var response struct {
+		Conversations []persistence.ConversationRecord `json:"conversations"`
+	}
+	path := "/v1/conversations"
+	if limit > 0 {
+		path = fmt.Sprintf("/v1/conversations?limit=%d", limit)
+	}
+	data, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := unmarshalEnvelope(data, &response); err != nil {
+		return nil, err
+	}
+	return response.Conversations, nil
+}
+
+func (c *Client) GetConversationMessages(ctx context.Context, id string, limit int) ([]persistence.ConversationMessage, error) {
+	var response struct {
+		Messages []persistence.ConversationMessage `json:"messages"`
+	}
+	if !persistence.ValidConversationID(id) {
+		return nil, fmt.Errorf("conversation not found: %s", id)
+	}
+	path := "/v1/conversations/" + id + "/messages"
+	if limit > 0 {
+		path = fmt.Sprintf("%s?limit=%d", path, limit)
+	}
+	data, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := unmarshalEnvelope(data, &response); err != nil {
+		return nil, err
+	}
+	return response.Messages, nil
+}
+
+func (c *Client) AppendConversationMessage(ctx context.Context, id, role, content, metadata string) (persistence.ConversationMessage, error) {
+	var response struct {
+		Message persistence.ConversationMessage `json:"message"`
+	}
+	payload := map[string]string{"role": role, "content": content}
+	if metadata != "" {
+		payload["metadata"] = metadata
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return response.Message, err
+	}
+	data, err := c.do(ctx, http.MethodPost, "/v1/conversations/"+id+"/messages", body)
+	if err != nil {
+		return response.Message, err
+	}
+	if err := unmarshalEnvelope(data, &response); err != nil {
+		return response.Message, err
+	}
+	return response.Message, nil
 }

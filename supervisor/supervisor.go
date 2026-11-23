@@ -43,6 +43,11 @@ var (
 	ErrTaskNotActive = errors.New("task has no active runtime")
 )
 
+type conversationContext struct {
+	ConversationID string
+	Messages       []python_protocol.ConversationMessage
+}
+
 type runningTask struct {
 	id     string
 	cancel context.CancelFunc
@@ -141,6 +146,7 @@ type Supervisor struct {
 	limits            chan struct{}
 	activeMu          sync.Mutex
 	active            map[string]*runningTask
+	conversations     map[string]conversationContext
 	events            *eventHub
 }
 
@@ -164,6 +170,7 @@ func NewWithStore(store *persistence.Store) *Supervisor {
 		shutdownTimeout: 10 * time.Second,
 		limits:          make(chan struct{}, maxConcurrentTasks),
 		active:          make(map[string]*runningTask),
+		conversations:   make(map[string]conversationContext),
 		events:          newEventHub(store),
 	}
 }
@@ -261,6 +268,11 @@ func (s *Supervisor) HealthCheck() error {
 
 // AdmitTask durably accepts one task and then schedules bounded execution.
 func (s *Supervisor) AdmitTask(id, input string) (persistence.TaskRecord, error) {
+	return s.AdmitTaskWithContext(id, input, "", nil)
+}
+
+// AdmitTaskWithContext durably accepts one task with optional conversation context.
+func (s *Supervisor) AdmitTaskWithContext(id, input string, conversationID string, conversationMessages []python_protocol.ConversationMessage) (persistence.TaskRecord, error) {
 	if !s.IsRunning() {
 		return persistence.TaskRecord{}, errors.New("supervisor is not running")
 	}
@@ -270,8 +282,19 @@ func (s *Supervisor) AdmitTask(id, input string) (persistence.TaskRecord, error)
 	if strings.TrimSpace(input) == "" || len(input) > maxTaskInputBytes {
 		return persistence.TaskRecord{}, ErrTaskNotAdmittable
 	}
+	if conversationID != "" && !persistence.ValidConversationID(conversationID) {
+		return persistence.TaskRecord{}, ErrTaskNotAdmittable
+	}
+	if len(conversationMessages) > 200 {
+		return persistence.TaskRecord{}, ErrTaskNotAdmittable
+	}
 	if _, err := s.store.CreateTask(id, "queued", input); err != nil {
 		return persistence.TaskRecord{}, err
+	}
+	if conversationID != "" || len(conversationMessages) > 0 {
+		s.activeMu.Lock()
+		s.conversations[id] = conversationContext{ConversationID: conversationID, Messages: append([]python_protocol.ConversationMessage(nil), conversationMessages...)}
+		s.activeMu.Unlock()
 	}
 	s.emitEvent(id, "task_admitted", map[string]any{"status": "queued"})
 	s.enqueue(id, input, nil, false)
@@ -435,15 +458,20 @@ func (s *Supervisor) executeTask(id, input string, checkpoint []byte, resume boo
 		_ = task.finish(s, "failed", "", "unable to load MCP execution context", nil)
 		return
 	}
+	s.activeMu.Lock()
+	convCtx := s.conversations[id]
+	s.activeMu.Unlock()
 	submission := python_protocol.TaskSubmission{
-		Message:          python_protocol.Message{Version: python_protocol.ProtocolVersion, Type: python_protocol.TypeTaskSubmission},
-		TaskID:           id,
-		Input:            input,
-		Resume:           resume,
-		Checkpoint:       checkpoint,
-		TimeoutMs:        taskExecutionTimeout.Milliseconds(),
-		MCPServers:       servers,
-		GrantedApprovals: grants,
+		Message:              python_protocol.Message{Version: python_protocol.ProtocolVersion, Type: python_protocol.TypeTaskSubmission},
+		TaskID:               id,
+		Input:                input,
+		Resume:               resume,
+		Checkpoint:           checkpoint,
+		TimeoutMs:            taskExecutionTimeout.Milliseconds(),
+		MCPServers:           servers,
+		GrantedApprovals:     grants,
+		ConversationID:       convCtx.ConversationID,
+		ConversationMessages: convCtx.Messages,
 	}
 	if err := task.send(submission); err != nil {
 		cancel()

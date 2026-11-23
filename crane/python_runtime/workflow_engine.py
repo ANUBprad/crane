@@ -22,6 +22,7 @@ from crane.mcp_runtime import (
     shutdown_all,
 )
 from crane.python_runtime import protocol
+from crane.python_runtime.context import build_runtime_context
 from crane.python_runtime.provider import (
     ProviderError,
     invoke as invoke_provider,
@@ -196,15 +197,48 @@ def _make_node_execute(manager: Optional[MCPManager]) -> Callable[[Dict[str, Any
 
             prepare_provider()
             warm_provider()
+            runtime_tool_list: List[Dict[str, Any]] = []
+            if manager is not None:
+                for t in manager.tools():
+                    try:
+                        runtime_tool_list.append(t.to_dict())
+                    except Exception:
+                        runtime_tool_list.append({"name": getattr(t, "name", "unknown")})
+            conversation_id = state.persistent_state.get("conversation_id")
+            conversation_messages = state.persistent_state.get("conversation_messages") or []
+            runtime_context = build_runtime_context(
+                user_input=state.user_input,
+                mcp_tools=runtime_tool_list,
+                conversation_id=conversation_id,
+                conversation_messages=conversation_messages,
+            )
+            state.persistent_state["runtime_context"] = {
+                "provider": runtime_context.get("provider"),
+                "tool_count": len(runtime_tool_list),
+                "conversation_id": conversation_id,
+            }
+            system_prompt = runtime_context.get("system_prompt", "")
             if tools:
                 if selected_provider() != "ollama":
                     raise ProviderError(
                         "mcp_tool_provider_required",
                         "MCP tools require CRANE_MODEL_PROVIDER=ollama with a tool-capable local model",
                     )
-                output = await invoke_with_tools(state.user_input, tools)
+                output = await invoke_with_tools(
+                    state.user_input,
+                    tools,
+                    system_prompt=system_prompt,
+                    messages=conversation_messages,
+                )
             else:
-                output = await asyncio.to_thread(invoke_provider, state.user_input)
+                output = await asyncio.to_thread(
+                    invoke_provider,
+                    state.user_input,
+                    None,
+                    system_prompt,
+                    conversation_messages,
+                    runtime_context,
+                )
             state.result = output
             state.result_summary = f"Completed with {output.get('execution_mode', 'configured')} execution"
             state.state = TaskState.SUCCEEDED
@@ -325,6 +359,8 @@ async def execute_task(
     cancellation: Optional[threading.Event] = None,
     mcp_servers: Optional[List[Dict[str, Any]]] = None,
     granted_approvals: Optional[List[str]] = None,
+    conversation_id: Optional[str] = None,
+    conversation_messages: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Execute one bounded task through LangGraph and return its final state."""
     resolved_id = task_id or str(uuid.uuid4())
@@ -350,6 +386,10 @@ async def execute_task(
                 python_runtime_pid=python_runtime_pid,
                 state=TaskState.QUEUED,
             )
+        if conversation_id:
+            state.persistent_state["conversation_id"] = conversation_id
+        if conversation_messages is not None:
+            state.persistent_state["conversation_messages"] = list(conversation_messages)[-40:]
         graph = compile_workflow(manager)
         raw_result = await graph.ainvoke(
             state_to_checkpoint(state),

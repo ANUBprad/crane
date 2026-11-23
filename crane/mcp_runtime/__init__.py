@@ -65,6 +65,9 @@ _STDIO_ENV_BASE_ALLOWLIST = {
     "PROGRAMDATA",
     "PROGRAMFILES",
     "PROGRAMFILES(X86)",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONUTF8",
     "SYSTEMDRIVE",
     "SYSTEMROOT",
     "TEMP",
@@ -395,14 +398,17 @@ class _ManagedServer:
 def classify_tool(tool: MCPTool) -> str:
     """Classify from static tool metadata only; descriptions never grant access."""
     annotations = tool.annotations
-    if annotations is not None and annotations.readOnlyHint is True:
-        return POLICY_ALLOWED
     name = tool.name.lower()
-    if annotations is not None and annotations.destructiveHint is True:
+    if annotations is not None and getattr(annotations, "destructiveHint", False) is True:
+        return POLICY_APPROVAL_REQUIRED
+    if annotations is not None and getattr(annotations, "openWorldHint", False) is True:
         return POLICY_APPROVAL_REQUIRED
     if any(word in name for word in _CONSEQUENTIAL_WORDS):
         return POLICY_APPROVAL_REQUIRED
-    if name.startswith(_READ_ONLY_VERBS) and not any(word in name for word in ("write", "delete", "send", "update")):
+    if annotations is not None and annotations.readOnlyHint is True:
+        if not any(word in name for word in ("write", "delete", "send", "update", "exec", "run", "command", "shell")):
+            return POLICY_ALLOWED
+    if name.startswith(_READ_ONLY_VERBS) and not any(word in name for word in ("write", "delete", "send", "update", "exec", "run", "command", "shell")):
         return POLICY_ALLOWED
     return POLICY_APPROVAL_REQUIRED
 

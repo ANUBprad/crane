@@ -136,6 +136,29 @@ CREATE INDEX IF NOT EXISTS idx_mcp_approvals_status ON mcp_approval_requests(sta
 CREATE INDEX IF NOT EXISTS idx_mcp_approvals_task ON mcp_approval_requests(task_id, status);
 `
 
+// conversationSchema is applied as migration 3 for persistent chat sessions.
+const conversationSchema = `
+CREATE TABLE IF NOT EXISTS conversations (
+	id TEXT PRIMARY KEY,
+	title TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	last_message_at TEXT NOT NULL DEFAULT '',
+	message_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS conversation_messages (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	conversation_id TEXT NOT NULL,
+	role TEXT NOT NULL,
+	content TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	metadata TEXT NOT NULL DEFAULT '{}',
+	FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv_id ON conversation_messages(conversation_id, id ASC);
+CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
+`
+
 // ValidTaskID restricts task IDs to a safe, portable character set shared by
 // the CLI, persistence boundary and local API paths.
 func ValidTaskID(id string) bool {
@@ -294,6 +317,18 @@ func NewStore(path string) (*Store, error) {
 			time.Now().UTC().Format(time.RFC3339Nano),
 		); err != nil {
 			return fail(fmt.Errorf("record MCP schema migration: %w", err))
+		}
+		version = 2
+	}
+	if version < 3 {
+		if _, err := db.Exec(conversationSchema); err != nil {
+			return fail(fmt.Errorf("apply conversation schema migration: %w", err))
+		}
+		if _, err := db.Exec(
+			"INSERT OR REPLACE INTO schema_migrations (version, description, applied_at) VALUES (3, 'conversations and messages', ?)",
+			time.Now().UTC().Format(time.RFC3339Nano),
+		); err != nil {
+			return fail(fmt.Errorf("record conversation schema migration: %w", err))
 		}
 	}
 	if err := db.Ping(); err != nil {

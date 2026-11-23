@@ -136,7 +136,7 @@ class MCPWorkflowTest(unittest.TestCase):
             if decoded["type"] == protocol.TYPE_TOOL_RESULT:
                 tool_results.append(decoded)
 
-        async def fake_tool_model(user_input: str, tools: list, env=None) -> Dict[str, Any]:
+        async def fake_tool_model(user_input: str, tools: list, env=None, system_prompt: str = "", messages=None) -> Dict[str, Any]:
             tool = next(item for item in tools if item.name.endswith(tool_name))
             try:
                 output = await tool.ainvoke(arguments)
@@ -151,7 +151,7 @@ class MCPWorkflowTest(unittest.TestCase):
                 "notice": None,
             }
 
-        async def forbidden_fallback(user_input: str, env=None) -> Dict[str, Any]:
+        async def forbidden_fallback(user_input: str, env=None, system_prompt: str = "", messages=None, context=None) -> Dict[str, Any]:
             self.fail("non-tool provider path executed with MCP tools configured")
 
         with mock.patch.dict(os.environ, OLLAMA_ENV), \

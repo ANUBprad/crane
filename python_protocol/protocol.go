@@ -201,16 +201,24 @@ type TaskState struct {
 	Checkpoint       json.RawMessage `json:"checkpoint,omitempty"`
 }
 
+// ConversationMessage carries one persisted chat turn for model context.
+type ConversationMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 // TaskSubmission asks the Python runtime to execute one admitted task.
 type TaskSubmission struct {
 	Message
-	TaskID           string                   `json:"task_id"`
-	Input            string                   `json:"input"`
-	Resume           bool                     `json:"resume,omitempty"`
-	Checkpoint       json.RawMessage          `json:"checkpoint,omitempty"`
-	TimeoutMs        int64                    `json:"timeout_ms,omitempty"`
-	MCPServers       []MCPServerConfigMessage `json:"mcp_servers,omitempty"`
-	GrantedApprovals []string                 `json:"granted_approvals,omitempty"`
+	TaskID               string                   `json:"task_id"`
+	Input                string                   `json:"input"`
+	Resume               bool                     `json:"resume,omitempty"`
+	Checkpoint           json.RawMessage          `json:"checkpoint,omitempty"`
+	TimeoutMs            int64                    `json:"timeout_ms,omitempty"`
+	MCPServers           []MCPServerConfigMessage `json:"mcp_servers,omitempty"`
+	GrantedApprovals     []string                 `json:"granted_approvals,omitempty"`
+	ConversationID       string                   `json:"conversation_id,omitempty"`
+	ConversationMessages []ConversationMessage    `json:"conversation_messages,omitempty"`
 }
 
 // TaskCancellation propagates a Go-owned cancellation decision to Python.
@@ -765,6 +773,22 @@ func DecodeTaskSubmission(data []byte) (*TaskSubmission, error) {
 	for _, fingerprint := range msg.GrantedApprovals {
 		if !validFingerprint(fingerprint) {
 			return nil, errors.New("task_submission has an invalid approval fingerprint")
+		}
+	}
+	if msg.ConversationID != "" && !ValidTaskID(msg.ConversationID) {
+		return nil, errors.New("task_submission has an invalid conversation identifier")
+	}
+	if len(msg.ConversationMessages) > 200 {
+		return nil, errors.New("task_submission conversation history exceeds bounds")
+	}
+	for _, m := range msg.ConversationMessages {
+		switch strings.ToLower(strings.TrimSpace(m.Role)) {
+		case "user", "assistant", "system":
+		default:
+			return nil, errors.New("task_submission has an invalid conversation message role")
+		}
+		if len(m.Content) > 16<<10 {
+			return nil, errors.New("task_submission conversation message exceeds size limit")
 		}
 	}
 	return &msg, nil

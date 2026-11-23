@@ -14,8 +14,8 @@ func TestMCPSchemaMigrationAndRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MigrationVersion() error = %v", err)
 	}
-	if version != 2 {
-		t.Fatalf("MigrationVersion() = %d, want 2", version)
+	if version != 3 {
+		t.Fatalf("MigrationVersion() = %d, want 3", version)
 	}
 
 	server := MCPServerRecord{

@@ -260,20 +260,78 @@ def normalize_input(user_input: str) -> str:
     return normalized
 
 
-def deterministic_result(user_input: str, details: Dict[str, Any]) -> Dict[str, Any]:
+def _context_answer(user_input: str, context: Dict[str, Any]) -> Optional[str]:
+    """Answer identity/capability questions from real runtime context only."""
+    text = normalize_input(user_input).lower()
+    if not text:
+        return None
+    identity = context.get("identity") or {}
+    caps = context.get("capabilities") or {}
+    tools = context.get("tools") or []
+    limits = context.get("limitations") or []
+    provider = context.get("provider") or {}
+    asks_identity = any(k in text for k in ["what is crane", "who are you", "what are you", "describe crane"])
+    asks_can_do = any(k in text for k in ["what can you do", "capabilities", "what do you do", "help"])
+    asks_provider = any(k in text for k in ["which model", "what model", "provider", "ollama", "llm"])
+    asks_tools = "tool" in text and any(k in text for k in ["available", "what", "which", "list", "have"])
+    asks_limits = any(k in text for k in ["limitation", "can't", "cannot", "what are your limits"])
+    if not (asks_identity or asks_can_do or asks_provider or asks_tools or asks_limits):
+        return None
+    lines: List[str] = []
+    if asks_identity or asks_can_do:
+        lines.append(str(identity.get("summary") or "CRANE is a local-first, offline-first MCP execution and orchestration runtime."))
+        if identity.get("architecture"):
+            lines.append(f"Architecture: {identity['architecture']}")
+    if asks_provider or asks_identity or asks_can_do:
+        prov_name = provider.get("name", "unknown")
+        model = provider.get("model")
+        lines.append(f"Configured model provider: {prov_name}" + (f" (model: {model})" if model else ""))
+        if provider.get("configuration_error"):
+            lines.append(f"Provider configuration issue: {provider['configuration_error']}")
+    if asks_tools or asks_can_do:
+        if tools:
+            lines.append("Available tools:")
+            for t in tools[:30]:
+                name = t.get("name") if isinstance(t, dict) else str(t)
+                desc = t.get("description") if isinstance(t, dict) else ""
+                lines.append(f"- {name}" + (f": {desc}" if desc else ""))
+        else:
+            lines.append("Available tools: none currently discovered/registered.")
+    if asks_limits or asks_can_do:
+        if limits:
+            lines.append("Limitations:")
+            for lim in limits[:20]:
+                lines.append(f"- {lim}")
+    if asks_can_do:
+        available = caps.get("available") or []
+        configured_unavailable = caps.get("configured_but_unavailable") or []
+        not_implemented = caps.get("not_implemented") or []
+        if available:
+            lines.append("Available capabilities: " + "; ".join(str(x) for x in available[:15]))
+        if configured_unavailable:
+            lines.append("Configured but currently unavailable: " + "; ".join(str(x) for x in configured_unavailable[:15]))
+        if not_implemented:
+            lines.append("Not implemented: " + "; ".join(str(x) for x in not_implemented[:15]))
+    return "\n".join(lines).strip() if lines else None
+
+
+def deterministic_result(user_input: str, details: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Produce a real execution result without inventing model output.
 
-    This mode performs input normalization and reports workflow execution
-    facts. It deliberately does not claim to answer or reason about the task.
+    When runtime context is available, answer identity/capability questions
+    factually from that context. Otherwise report deterministic workflow facts.
     """
     normalized = normalize_input(user_input)
+    ctx = context or {}
+    answer = _context_answer(user_input, ctx) if ctx else None
     return {
         "execution_mode": "deterministic_local",
         "provider": details["name"],
         "normalized_input": normalized,
         "input_bytes": len(user_input.encode("utf-8")),
-        "model_output": None,
-        "notice": "No model provider is configured; this result contains deterministic workflow output only.",
+        "model_output": answer,
+        "context_used": bool(ctx),
+        "notice": None if answer else "No model provider is configured; this result contains deterministic workflow output only.",
     }
 
 
@@ -377,18 +435,50 @@ def _create_chat_model(config: OllamaConfig) -> Any:
         ) from exc
 
 
-def _invoke_ollama(user_input: str, env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+def _build_messages(user_input: str, system_prompt: str = "", messages: Optional[List[Dict[str, str]]] = None) -> List[Any]:
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+    built: List[Any] = []
+    if system_prompt and system_prompt.strip():
+        built.append(SystemMessage(content=system_prompt.strip()))
+    for item in messages or []:
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "")
+        if not content.strip():
+            continue
+        if role == "user":
+            built.append(HumanMessage(content=content))
+        elif role == "assistant":
+            built.append(AIMessage(content=content))
+        elif role == "system":
+            built.append(SystemMessage(content=content))
+    # Ensure the current user input is present as the latest user turn.
+    normalized = normalize_input(user_input)
+    if not built or not isinstance(built[-1], HumanMessage) or built[-1].content != normalized:
+        built.append(HumanMessage(content=normalized))
+    return built
+
+
+def _invoke_ollama(
+    user_input: str,
+    env: Optional[Mapping[str, str]] = None,
+    system_prompt: str = "",
+    messages: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
     config = load_ollama_config(env)
     preflight_ollama(config)
     chat_model = _create_chat_model(config)
+    prompt_messages = _build_messages(user_input, system_prompt=system_prompt, messages=messages)
     try:
-        response = chat_model.invoke(normalize_input(user_input))
+        response = chat_model.invoke(prompt_messages)
     except Exception as exc:  # noqa: BLE001 - provider errors must be actionable, not leaked verbatim
         raise ProviderError(
             "provider_invocation_failed",
             f"The configured Ollama model {config.model!r} did not complete the request. Confirm the model supports chat, is loaded locally, and CRANE_OLLAMA_INVOKE_TIMEOUT_SECONDS allows enough time.",
         ) from exc
     content = getattr(response, "content", response)
+    if isinstance(content, list):
+        content = _tool_output_text(content)
     if not isinstance(content, str) or not content.strip():
         raise ProviderError("provider_empty_response", "The configured model returned an empty response.")
     return {
@@ -425,6 +515,8 @@ async def _invoke_ollama_with_tools(
     user_input: str,
     tools: List[Any],
     env: Optional[Mapping[str, str]] = None,
+    system_prompt: str = "",
+    messages: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Run a bounded Ollama tool loop using real LangChain MCP tools."""
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -442,14 +534,15 @@ async def _invoke_ollama_with_tools(
             "The configured Ollama model could not bind the discovered MCP tools.",
         ) from exc
 
-    messages: List[Any] = [
-        SystemMessage(content=(
-            "You are CRANE, a headless execution agent. Use the provided MCP tools "
-            "when a task requires a tool action. When a tool is used, base the final "
-            "answer on its actual returned content and do not claim unperformed effects."
-        )),
-        HumanMessage(content=normalize_input(user_input)),
-    ]
+    default_system = (
+        "You are CRANE, a headless execution agent. Use the provided MCP tools "
+        "when a task requires a tool action. When a tool is used, base the final "
+        "answer on its actual returned content and do not claim unperformed effects."
+    )
+    prompt = system_prompt.strip() or default_system
+    convo: List[Any] = _build_messages(user_input, system_prompt=prompt, messages=messages)
+    # _build_messages returns a full message list; use it directly.
+    messages = convo
     observed: List[Dict[str, Any]] = []
     for _ in range(MAX_TOOL_ROUNDS):
         try:
@@ -500,13 +593,19 @@ async def _invoke_ollama_with_tools(
     )
 
 
-def invoke(user_input: str, env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+def invoke(
+    user_input: str,
+    env: Optional[Mapping[str, str]] = None,
+    system_prompt: str = "",
+    messages: Optional[List[Dict[str, str]]] = None,
+    context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Execute the configured provider path. No fallback is permitted."""
     provider = selected_provider(env)
     if provider == "local":
-        return deterministic_result(user_input, provider_details(env))
+        return deterministic_result(user_input, provider_details(env), context=context)
     if provider == "ollama":
-        return _invoke_ollama(user_input, env)
+        return _invoke_ollama(user_input, env, system_prompt=system_prompt, messages=messages)
     raise ProviderError(
         "provider_not_supported",
         f"Model provider {provider!r} is not supported. Configure CRANE_MODEL_PROVIDER=local or =ollama.",

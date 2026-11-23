@@ -148,6 +148,24 @@ def parse_task_submission(message: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(fingerprint, str) or not _FINGERPRINT_PATTERN.fullmatch(fingerprint):
             raise ProtocolError("approval fingerprint is invalid")
 
+    conversation_id = message.get("conversation_id")
+    if conversation_id is not None and not _valid_task_id(conversation_id):
+        raise ProtocolError("invalid conversation identifier")
+    conversation_messages = message.get("conversation_messages") or []
+    if not isinstance(conversation_messages, list) or len(conversation_messages) > 200:
+        raise ProtocolError("conversation_messages must be a bounded array")
+    normalized_messages = []
+    for item in conversation_messages:
+        if not isinstance(item, dict):
+            raise ProtocolError("conversation message must be an object")
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "")
+        if role not in {"user", "assistant", "system"}:
+            raise ProtocolError("conversation message role is invalid")
+        if len(content.encode("utf-8")) > 16 * 1024:
+            content = content.encode("utf-8")[: 16 * 1024].decode("utf-8", errors="ignore")
+        normalized_messages.append({"role": role, "content": content})
+
     return {
         "task_id": task_id,
         "input": user_input,
@@ -155,6 +173,8 @@ def parse_task_submission(message: Dict[str, Any]) -> Dict[str, Any]:
         "checkpoint": checkpoint,
         "mcp_servers": servers,
         "granted_approvals": approvals,
+        "conversation_id": conversation_id,
+        "conversation_messages": normalized_messages,
     }
 
 

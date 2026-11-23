@@ -19,6 +19,7 @@ import (
 
 	"crane/localauth"
 	"crane/persistence"
+	"crane/python_protocol"
 )
 
 type testState struct {
@@ -48,6 +49,10 @@ func newMockController(store *persistence.Store) *mockController {
 }
 
 func (m *mockController) AdmitTask(id, input string) (persistence.TaskRecord, error) {
+	return m.AdmitTaskWithContext(id, input, "", nil)
+}
+
+func (m *mockController) AdmitTaskWithContext(id, input string, conversationID string, conversationMessages []python_protocol.ConversationMessage) (persistence.TaskRecord, error) {
 	if _, err := m.store.CreateTask(id, "queued", input); err != nil {
 		return persistence.TaskRecord{}, err
 	}

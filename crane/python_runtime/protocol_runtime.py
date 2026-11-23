@@ -138,6 +138,8 @@ class ProtocolRuntime:
                         resume_checkpoint=command["checkpoint"] if command["resume"] else None,
                         mcp_servers=command["mcp_servers"],
                         granted_approvals=command["granted_approvals"],
+                        conversation_id=command.get("conversation_id"),
+                        conversation_messages=command.get("conversation_messages"),
                     ),
                 )
             if future is not None:
