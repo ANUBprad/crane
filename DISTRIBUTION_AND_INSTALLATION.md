@@ -8,7 +8,7 @@ This is a per-user PowerShell bootstrapper, not an MSI or graphical installer.
 
 ## Current status
 
-**As of HEAD `256de3c3354e49c5878dd4c058397b1867d7a9ca` (Windows CI run [45040349046](https://github.com/ANUBprad/crane/actions/runs/45040349046), success).**
+**As of HEAD `af0b4a18f6da37a1a293315a273b71f681400ec4` (Windows CI run [45238765482](https://github.com/ANUBprad/crane/actions/runs/45238765482), success, completed `2026-11-23T18:36:42Z`).**
 
 Implemented:
 
@@ -21,7 +21,8 @@ Implemented:
 Validated by current repository evidence:
 
 - GitHub-hosted `windows-2025` CI builds, formats/vets, runs Go/Python tests, packages a release, and smoke-tests packaged install/`agent --version`/`agent doctor`/basic task submission.
-- The release scripts and workflow exist in-tree and define the intended integrity checks; update this document when additional clean-runner or physical-machine evidence is produced.
+- The current run built versioned `0.1.0`–`0.1.2` releases, verified all six `0.1.2-repro` outputs byte-for-byte identical (ZIP SHA-256 `a84f26e0b6c9f615f865d40e9378aa7a44b8f5b2ec20b7d943f17778d375f3b8`), and ran the full isolated acceptance harness with `ACCEPTANCE RESULT: ALL ISOLATED CHECKS PASSED` (install, version/doctor, task/result, update, rollback, uninstall/data preservation, PATH, and integrity/failure cases).
+- Artifact [`crane-windows-ci-47`](https://github.com/ANUBprad/crane/actions/runs/45238765482/artifacts/14851690816) is 150,044,577 bytes; uploaded ZIP SHA-256 `b0015df306e3e7be87671e920e76e39b8703a60eeb2df808bfb5e2a7822c361e`.
 
 Not validated / external blockers:
 

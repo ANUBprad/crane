@@ -2,9 +2,10 @@
 
 This checklist tracks Windows release-readiness evidence. It distinguishes clean GitHub-hosted runner evidence from clean physical Windows 10/11 x64 acceptance. Do not treat a development machine, source checkout, or historical local evidence as clean-machine acceptance.
 
-## Current status (HEAD `256de3c3354e49c5878dd4c058397b1867d7a9ca`)
+## Current status (HEAD `af0b4a18f6da37a1a293315a273b71f681400ec4`)
 
-- GitHub-hosted `windows-2025` CI: **PASS** for build, formatting/vet, Go/Python tests, release packaging, and packaged install/`agent --version`/`agent doctor`/basic task smoke. Run: [45040349046](https://github.com/ANUBprad/crane/actions/runs/45040349046).
+- GitHub-hosted `windows-2025` CI: **PASS** for build, formatting/vet, Go/Python tests, release packaging, packaged install/`agent --version`/`agent doctor`/basic task smoke, same-host reproducibility, and the full isolated Windows acceptance harness. Run: [45238765482](https://github.com/ANUBprad/crane/actions/runs/45238765482), completed `2026-11-23T18:36:42Z`. Artifact: [`crane-windows-ci-47`](https://github.com/ANUBprad/crane/actions/runs/45238765482/artifacts/14851690816), 150,044,577 bytes, uploaded ZIP SHA-256 `b0015df306e3e7be87671e920e76e39b8703a60eeb2df808bfb5e2a7822c361e`.
+- Same-host reproducibility evidence from that run: all six `0.1.2-repro` outputs were byte-for-byte identical, including ZIP SHA-256 `a84f26e0b6c9f615f865d40e9378aa7a44b8f5b2ec20b7d943f17778d375f3b8` and manifest SHA-256 `01438d74286c131a19cf91c332d8fb98b5df61016cbda2e2ac3abda0c8350585`. The acceptance harness reported `ACCEPTANCE RESULT: ALL ISOLATED CHECKS PASSED`.
 - `scripts/acceptance-windows.ps1`: implemented; covers install, version/doctor smoke, basic task/result, upgrade, rollback, uninstall/data preservation, PATH, and integrity/failure cases. It requires prebuilt `0.1.0`-`0.1.2` release directories, uses isolated `LOCALAPPDATA`, and temporarily modifies/restores the real user PATH for the final PATH check. Run sequentially on a machine where that PATH mutation is acceptable.
 - `scripts/test-release-reproducibility.ps1`: implemented; compares two independent builds with identical declared inputs for byte-for-byte ZIP/manifest/SHA256SUMS equality. Same-host evidence only unless cross-environment inputs are controlled.
 - Clean physical Windows 10/11 x64 acceptance: **not performed**.
@@ -16,9 +17,9 @@ This checklist tracks Windows release-readiness evidence. It distinguishes clean
 - [x] Windows runner builds Go binary and packages a release artifact (`windows-ci.yml`).
 - [x] Go formatting, `go vet`, `go test ./...`, Python compile/tests run on `windows-2025`.
 - [x] Packaged install smoke: `agent --version`, `agent doctor`, basic task submission on runner.
-- [ ] Full `scripts/acceptance-windows.ps1` run on clean GitHub-hosted runner with recorded artifact versions/hashes/commit.
-- [ ] `scripts/test-release-reproducibility.ps1` run with recorded inputs/hashes on runner or controlled environment.
-- [ ] Hosted-runner evidence recorded with workflow URL, HEAD SHA, artifact names, and hashes.
+- [x] Full `scripts/acceptance-windows.ps1` run on clean GitHub-hosted runner with recorded artifact versions/hashes/commit.
+- [x] `scripts/test-release-reproducibility.ps1` run with recorded inputs/hashes on runner or controlled environment.
+- [x] Hosted-runner evidence recorded with workflow URL, HEAD SHA, artifact names, and hashes.
 
 ## Clean physical machine checklist (required for Windows 10/11 acceptance claim)
 
@@ -54,7 +55,7 @@ Run on genuine clean Windows 10 x64 and Windows 11 x64 machines/VM images with n
 - [ ] Official install command documented only after controlled host/domain exists.
 - [x] Remote `http(s)` release source is explicit opt-in (`CRANE_ALLOW_REMOTE_RELEASE_SOURCE=1`); no silent remote fallback.
 - [x] Same-host deterministic rebuild check script exists (`scripts/test-release-reproducibility.ps1`).
-- [ ] Same-host reproducibility evidence recorded for current release candidate inputs.
+- [x] Same-host reproducibility evidence recorded for current release candidate inputs.
 - [ ] Cross-environment reproducibility evidence recorded, or nondeterminism documented.
 
 ## Evidence log template
