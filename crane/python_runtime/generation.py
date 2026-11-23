@@ -10,9 +10,11 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
+from pathlib import PureWindowsPath
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -132,70 +134,120 @@ def _is_protected_rel(rel_posix: str) -> bool:
     for prefix in PROTECTED_PREFIXES:
         if lower == prefix[:-1] or lower.startswith(prefix):
             return True
-    # Protect common secret files
     if re.search(r"(^|/)(\.?env(\.|$)|.*secret.*|.*credential.*|.*\.pem$|.*\.key$|.*\.pfx$)", lower):
         return True
     return False
 
 
+def _is_reparse_point(info: os.stat_result) -> bool:
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    return bool(attributes & 0x0400)  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def _lstat_path(path: Path, description: str) -> Optional[os.stat_result]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise GenerationError(f"Cannot inspect {description} safely: {exc}") from exc
+    if _is_reparse_point(info):
+        raise GenerationError(f"Symlink or reparse-point path is not allowed: {description}")
+    return info
+
+
+def _safe_directory_tree(root: Path, parts: List[str], create: bool = False) -> Path:
+    root_real = root.resolve(strict=True)
+    current = root_real
+    root_info = _lstat_path(root_real, str(root_real))
+    if root_info is None or not stat.S_ISDIR(root_info.st_mode):
+        raise GenerationError(f"Workspace/staging root is not a directory: {root_real}")
+    for part in parts:
+        candidate = current / part
+        info = _lstat_path(candidate, str(candidate))
+        if info is None and create:
+            try:
+                candidate.mkdir()
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise GenerationError(f"Cannot create workspace directory {candidate}: {exc}") from exc
+            info = _lstat_path(candidate, str(candidate))
+        if info is None:
+            raise GenerationError(f"Required directory does not exist: {candidate}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise GenerationError(f"Path component is not a directory: {candidate}")
+        try:
+            candidate.resolve(strict=True).relative_to(root_real)
+        except (OSError, ValueError) as exc:
+            raise GenerationError(f"Directory escapes authorized root: {candidate}") from exc
+        current = candidate
+    return current
+
+
+def _workspace_root(workspace: Path) -> Path:
+    try:
+        root = Path(workspace).resolve(strict=True)
+    except OSError as exc:
+        raise GenerationError(f"Workspace is unavailable: {exc}") from exc
+    info = _lstat_path(root, str(root))
+    if info is None or not stat.S_ISDIR(info.st_mode):
+        raise GenerationError("Workspace must be an existing directory.")
+    return root
+
+
 def validate_relative_path(workspace: Path, rel_path: str) -> Path:
     if not isinstance(rel_path, str) or not rel_path.strip():
         raise GenerationError("File path must be a non-empty string.")
-    if "\x00" in rel_path:
-        raise GenerationError("File path contains invalid characters.")
-    # Reject absolute paths and drive-prefixed paths.
-    p = Path(rel_path)
-    if p.is_absolute():
-        raise GenerationError(f"Absolute paths are not allowed: {rel_path}")
-    if re.match(r"^[A-Za-z]:", rel_path):
-        raise GenerationError(f"Drive-prefixed paths are not allowed: {rel_path}")
+    if "\x00" in rel_path or any(ord(ch) < 32 for ch in rel_path):
+        raise GenerationError("File path contains invalid control characters.")
+
+    # Validate Windows syntax even when tests run on a non-Windows host.
+    windows_path = PureWindowsPath(rel_path)
+    if windows_path.drive or windows_path.root or windows_path.is_absolute():
+        raise GenerationError(f"Absolute, drive-prefixed, or device paths are not allowed: {rel_path}")
+
     normalized = rel_path.replace("\\", "/")
     if normalized.startswith("/") or normalized.startswith("//"):
-        raise GenerationError(f"Absolute paths are not allowed: {rel_path}")
+        raise GenerationError(f"Absolute or UNC paths are not allowed: {rel_path}")
+    parts = normalized.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise GenerationError(f"Empty, dot, and traversal path components are not allowed: {rel_path}")
 
-    candidate = (workspace / p).resolve(strict=False)
-    ws_real = workspace.resolve(strict=True)
-    try:
-        rel = candidate.relative_to(ws_real)
-    except Exception as exc:  # noqa: BLE001
-        raise GenerationError(f"Path escapes workspace: {rel_path}") from exc
+    for part in parts:
+        if any(ch in '<>:"|?*' for ch in part):
+            raise GenerationError(f"Invalid or alternate-stream filename is not allowed: {part}")
+        if part.endswith((" ", ".")):
+            raise GenerationError(f"Windows trailing-dot/space filename is not allowed: {part}")
+        _check_reserved_name(part)
 
-    rel_posix = rel.as_posix()
-    if rel_posix in {"", "."}:
-        raise GenerationError("File path must point to a file inside workspace.")
-    if any(part == ".." for part in p.parts):
-        raise GenerationError(f"Path traversal is not allowed: {rel_path}")
-
-    # Check every existing parent for symlink/junction escape.
-    cur = ws_real
-    for part in rel.parts:
-        cur = cur / part
-        if cur.exists():
-            try:
-                real_cur = cur.resolve(strict=True)
-            except Exception as exc:  # noqa: BLE001
-                raise GenerationError(f"Cannot resolve path safely: {rel_path}") from exc
-            try:
-                real_cur.relative_to(ws_real)
-            except Exception as exc:  # noqa: BLE001
-                raise GenerationError(f"Path escapes workspace via link/reparse point: {rel_path}") from exc
-            # On Windows, reject junctions/symlinks inside workspace for write targets.
-            if cur.is_symlink():
-                raise GenerationError(f"Symlinked paths are not allowed: {rel_path}")
-            if _is_windows() and hasattr(os, "stat"):
-                try:
-                    st = cur.lstat()
-                    attrs = getattr(st, "st_file_attributes", 0)
-                    # FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
-                    if attrs & 0x0400:
-                        raise GenerationError(f"Reparse point/junction paths are not allowed: {rel_path}")
-                except GenerationError:
-                    raise
-                except Exception:
-                    pass
-
+    rel_posix = "/".join(parts)
     if _is_protected_rel(rel_posix):
         raise GenerationError(f"Protected or sensitive path is not allowed: {rel_path}")
+
+    ws_real = _workspace_root(workspace)
+    current = ws_real
+    # lstat every component, including dangling links; exists()/resolve() alone
+    # follows links and misses dangling symlinks and junctions.
+    for index, part in enumerate(parts):
+        current = current / part
+        info = _lstat_path(current, rel_path)
+        if info is None:
+            break
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            raise GenerationError(f"Parent path component is not a directory: {current}")
+        try:
+            current.resolve(strict=True).relative_to(ws_real)
+        except (OSError, ValueError) as exc:
+            raise GenerationError(f"Path escapes workspace: {rel_path}") from exc
+
+    candidate = ws_real.joinpath(*parts)
+    try:
+        candidate.resolve(strict=False).relative_to(ws_real)
+    except (OSError, ValueError) as exc:
+        raise GenerationError(f"Path escapes workspace: {rel_path}") from exc
     return candidate
 
 
@@ -244,63 +296,116 @@ def validate_file_operations(workspace: Path, operations: List[Dict[str, Any]]) 
     return validated
 
 
+def _stage_root(workspace: Path, create: bool = False) -> Path:
+    ws = _workspace_root(workspace)
+    return _safe_directory_tree(ws, [".crane-staging"], create=create)
+
+
+def _validated_stage_dir(workspace: Path, stage: Dict[str, Any]) -> Tuple[Path, Path]:
+    ws = _workspace_root(workspace)
+    stage_root = _stage_root(ws, create=False)
+    raw_path = stage.get("stage_dir") if isinstance(stage, dict) else None
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise GenerationError("Staging directory is missing.")
+    stage_dir = Path(raw_path)
+    if not stage_dir.is_absolute():
+        raise GenerationError("Staging directory must be an absolute path.")
+    if _norm_case(str(stage_dir.parent.absolute())) != _norm_case(str(stage_root.absolute())):
+        raise GenerationError("Staging directory must be a direct child of the authorized staging root.")
+    if not stage_dir.name.startswith("crane-stage-"):
+        raise GenerationError("Invalid staging directory identifier.")
+    info = _lstat_path(stage_dir, str(stage_dir))
+    if info is None or not stat.S_ISDIR(info.st_mode):
+        raise GenerationError("Staging directory is missing or is not a directory.")
+    try:
+        resolved = stage_dir.resolve(strict=True)
+        if _norm_case(str(resolved.parent)) != _norm_case(str(stage_root.resolve(strict=True))):
+            raise GenerationError("Staging directory resolves outside the authorized staging root.")
+    except OSError as exc:
+        raise GenerationError(f"Cannot resolve staging directory: {exc}") from exc
+    return stage_root, stage_dir
+
+
+def _assert_no_reparse_tree(root: Path) -> None:
+    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        for name in list(dirs) + list(files):
+            child = current_path / name
+            info = _lstat_path(child, str(child))
+            if info is not None and _is_reparse_point(info):
+                raise GenerationError(f"Reparse point inside staging directory: {child}")
+            if name in dirs and info is not None and not stat.S_ISDIR(info.st_mode):
+                raise GenerationError(f"Invalid staging directory entry: {child}")
+
+
 def inspect_collisions(workspace: Path, ops: List[FileOperation]) -> List[Dict[str, Any]]:
-    ws = workspace.resolve(strict=True)
+    ws = _workspace_root(workspace)
     collisions = []
     for op in ops:
-        target = (ws / op.path).resolve(strict=False)
-        exists = target.exists()
-        is_file = target.is_file() if exists else False
-        is_dir = target.is_dir() if exists else False
+        target = validate_relative_path(ws, op.path)
+        info = _lstat_path(target, op.path)
+        exists = info is not None
         collisions.append({
             "path": op.path,
             "operation": op.operation,
             "exists": exists,
-            "is_file": is_file,
-            "is_dir": is_dir,
+            "is_file": bool(info and stat.S_ISREG(info.st_mode)),
+            "is_dir": bool(info and stat.S_ISDIR(info.st_mode)),
             "requires_approval": bool(exists or op.operation == "delete"),
         })
     return collisions
 
 
 def stage_operations(workspace: Path, ops: List[FileOperation]) -> Dict[str, Any]:
-    ws = workspace.resolve(strict=True)
-    stage_root = ws / ".crane-staging"
-    stage_root.mkdir(parents=True, exist_ok=True)
-    stamp = str(int(time.time() * 1000))
-    stage_dir = stage_root / stamp
-    stage_dir.mkdir(parents=True, exist_ok=False)
+    ws = _workspace_root(workspace)
+    stage_root = _stage_root(ws, create=True)
+    stage_dir = Path(tempfile.mkdtemp(prefix="crane-stage-", dir=str(stage_root)))
     staged = []
-    for op in ops:
-        target = validate_relative_path(ws, op.path)
-        rel = target.relative_to(ws).as_posix()
-        record: Dict[str, Any] = {"path": rel, "operation": op.operation, "description": op.description}
-        if op.operation == "write":
-            staged_path = stage_dir / rel
-            staged_path.parent.mkdir(parents=True, exist_ok=True)
-            staged_path.write_text(op.content, encoding="utf-8")
-            record["staged_path"] = str(staged_path)
-            record["bytes"] = len(op.content.encode("utf-8"))
-        else:
-            record["staged_path"] = None
-            record["bytes"] = 0
-        staged.append(record)
-    return {
-        "stage_dir": str(stage_dir),
-        "created_at": time.time(),
-        "files": staged,
-    }
+    try:
+        for op in ops:
+            target = validate_relative_path(ws, op.path)
+            rel_parts = op.path.replace("\\", "/").split("/")
+            record: Dict[str, Any] = {
+                "path": target.relative_to(ws).as_posix(),
+                "operation": op.operation,
+                "description": op.description,
+            }
+            if op.operation == "write":
+                staged_parent = _safe_directory_tree(stage_dir, rel_parts[:-1], create=True)
+                staged_path = staged_parent / rel_parts[-1]
+                fd = os.open(staged_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(op.content.encode("utf-8"))
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                except Exception:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise
+                record["staged_path"] = str(staged_path)
+                record["bytes"] = len(op.content.encode("utf-8"))
+            else:
+                record["staged_path"] = None
+                record["bytes"] = 0
+            staged.append(record)
+    except Exception:
+        cleanup_stage({"stage_dir": str(stage_dir)}, ws)
+        raise
+    return {"stage_dir": str(stage_dir), "created_at": time.time(), "files": staged}
 
 
 def summarize_changes(workspace: Path, ops: List[FileOperation]) -> Dict[str, Any]:
-    ws = workspace.resolve(strict=True)
+    ws = _workspace_root(workspace)
     summary = {"creates": [], "overwrites": [], "deletes": [], "protected_blocked": []}
     for op in ops:
-        target = (ws / op.path).resolve(strict=False)
-        exists = target.exists()
+        target = validate_relative_path(ws, op.path)
+        info = _lstat_path(target, op.path)
         if op.operation == "delete":
             summary["deletes"].append(op.path)
-        elif exists:
+        elif info is not None:
             summary["overwrites"].append(op.path)
         else:
             summary["creates"].append(op.path)
@@ -308,66 +413,108 @@ def summarize_changes(workspace: Path, ops: List[FileOperation]) -> Dict[str, An
 
 
 def apply_staged_operations(workspace: Path, stage: Dict[str, Any], approved_overwrites: bool = False) -> Dict[str, Any]:
-    ws = workspace.resolve(strict=True)
-    stage_dir = Path(str(stage.get("stage_dir") or ""))
-    if not stage_dir.exists() or not stage_dir.is_dir():
-        raise GenerationError("Staging directory is missing.")
-    # Ensure stage dir is inside workspace staging root.
-    stage_root = (ws / ".crane-staging").resolve(strict=True)
-    try:
-        stage_dir.resolve(strict=True).relative_to(stage_root)
-    except Exception as exc:  # noqa: BLE001
-        raise GenerationError("Invalid staging directory.") from exc
+    ws = _workspace_root(workspace)
+    stage_root, stage_dir = _validated_stage_dir(ws, stage)
+    _assert_no_reparse_tree(stage_dir)
+    files = stage.get("files")
+    if not isinstance(files, list) or not files or len(files) > MAX_FILES:
+        raise GenerationError("Staging manifest is invalid.")
 
     applied = []
-    files = stage.get("files") if isinstance(stage.get("files"), list) else []
-    for rec in files:
-        if not isinstance(rec, dict):
-            continue
-        rel = str(rec.get("path") or "")
-        op = str(rec.get("operation") or "write")
+    total_bytes = 0
+    for record in files:
+        if not isinstance(record, dict):
+            raise GenerationError("Staging manifest contains an invalid entry.")
+        rel = record.get("path")
+        operation = record.get("operation")
+        if operation not in {"write", "delete"}:
+            raise GenerationError(f"Invalid staged operation: {operation!r}")
+        if not isinstance(rel, str):
+            raise GenerationError("Staged file path must be a string.")
+
         target = validate_relative_path(ws, rel)
-        exists = target.exists()
+        parts = rel.replace("\\", "/").split("/")
+        staged_path = stage_dir.joinpath(*parts) if operation == "write" else None
+        supplied_stage_path = record.get("staged_path")
+        if operation == "write":
+            if not isinstance(supplied_stage_path, str) or _norm_case(os.path.abspath(supplied_stage_path)) != _norm_case(os.path.abspath(str(staged_path))):
+                raise GenerationError(f"Staged file reference does not match its validated path: {rel}")
+            staged_info = _lstat_path(staged_path, str(staged_path))
+            if staged_info is None or not stat.S_ISREG(staged_info.st_mode):
+                raise GenerationError(f"Staged file is missing or not a regular file: {rel}")
+            total_bytes += staged_info.st_size
+            if staged_info.st_size > MAX_FILE_BYTES or total_bytes > MAX_TOTAL_BYTES:
+                raise GenerationError("Staged content exceeds configured size limits.")
+
+        target_info = _lstat_path(target, rel)
+        exists = target_info is not None
         if exists and not approved_overwrites:
             raise GenerationError(f"Overwrite approval required: {rel}")
-        if op == "delete":
-            if exists and target.is_file():
+        if target_info is not None and not stat.S_ISREG(target_info.st_mode):
+            raise GenerationError(f"Refusing to replace a non-regular file: {rel}")
+
+        if operation == "delete":
+            if exists:
+                # Recheck immediately before unlink. Parent links are rejected by
+                # validate_relative_path; unlink never follows the final component.
+                latest = _lstat_path(target, rel)
+                if latest is None or not stat.S_ISREG(latest.st_mode):
+                    raise GenerationError(f"Target changed before deletion: {rel}")
                 target.unlink()
                 applied.append({"path": rel, "operation": "delete", "status": "deleted"})
-            elif exists:
-                raise GenerationError(f"Refusing to delete non-file path: {rel}")
             else:
                 applied.append({"path": rel, "operation": "delete", "status": "missing"})
             continue
-        staged_path = Path(str(rec.get("staged_path") or ""))
-        if not staged_path.exists():
-            raise GenerationError(f"Staged file missing: {rel}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic replace via temp file in same directory.
-        fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".crane-tmp-")
+
+        parent = _safe_directory_tree(ws, parts[:-1], create=True)
+        target = parent / parts[-1]
+        staged_bytes = staged_path.read_bytes()
+        fd, temporary_name = tempfile.mkstemp(dir=str(parent), prefix=".crane-tmp-")
         try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(staged_path.read_bytes())
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_name, str(target))
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(staged_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            # Revalidate parent components and final target immediately before
+            # applying. New files use a no-replace hard link so a file created
+            # after collision inspection cannot be overwritten accidentally.
+            _safe_directory_tree(ws, parts[:-1], create=False)
+            latest = _lstat_path(target, rel)
+            if latest is not None and not approved_overwrites:
+                raise GenerationError(f"Target appeared after staging; overwrite approval required: {rel}")
+            if latest is not None and not stat.S_ISREG(latest.st_mode):
+                raise GenerationError(f"Target changed to a non-regular file: {rel}")
+            if approved_overwrites:
+                os.replace(temporary_name, target)
+            else:
+                try:
+                    os.link(temporary_name, target)
+                except FileExistsError as exc:
+                    raise GenerationError(f"Target appeared during apply; refusing to overwrite: {rel}") from exc
+                except OSError as exc:
+                    raise GenerationError(f"Cannot safely create new file without replacement on this filesystem: {rel}") from exc
+                os.unlink(temporary_name)
         finally:
             try:
-                if os.path.exists(tmp_name):
-                    os.remove(tmp_name)
-            except Exception:
+                if os.path.exists(temporary_name):
+                    os.unlink(temporary_name)
+            except OSError:
                 pass
-        applied.append({"path": rel, "operation": "write", "status": "written", "bytes": rec.get("bytes", 0)})
+        applied.append({"path": rel, "operation": "write", "status": "written", "bytes": len(staged_bytes)})
+
     return {"applied": applied, "count": len(applied)}
 
 
-def cleanup_stage(stage: Dict[str, Any]) -> None:
-    stage_dir = Path(str(stage.get("stage_dir") or ""))
-    if stage_dir.exists() and stage_dir.is_dir() and stage_dir.name.isdigit():
-        try:
-            shutil.rmtree(stage_dir, ignore_errors=True)
-        except Exception:
-            pass
+def cleanup_stage(stage: Dict[str, Any], workspace: Path) -> bool:
+    try:
+        _, stage_dir = _validated_stage_dir(workspace, stage)
+        _assert_no_reparse_tree(stage_dir)
+        shutil.rmtree(stage_dir)
+        return True
+    except (GenerationError, OSError):
+        # Invalid or tampered staging metadata must never trigger arbitrary cleanup.
+        return False
 
 
 def allowed_validation_command(argv: List[str]) -> bool:

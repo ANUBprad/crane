@@ -706,13 +706,16 @@ func (r *taskStreamRenderer) HandleEvent(ev localclient.TaskEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if ev.Seq > 0 {
+		// Ignore events at or before the resume cursor. This suppresses replay
+		// duplicates and stale out-of-order events after reconnect.
+		if ev.Seq <= r.lastSeq {
+			return
+		}
 		if _, ok := r.seenSeq[ev.Seq]; ok {
 			return
 		}
 		r.seenSeq[ev.Seq] = struct{}{}
-		if ev.Seq > r.lastSeq {
-			r.lastSeq = ev.Seq
-		}
+		r.lastSeq = ev.Seq
 	}
 	if isTerminalStreamEvent(ev) {
 		r.terminalSeen = true

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,6 +36,87 @@ class GenerationSafetyTests(unittest.TestCase):
         with self.assertRaises(gen.GenerationError):
             gen.validate_relative_path(self.ws, "secrets/api.key")
 
+    def test_rejects_windows_device_ads_and_invalid_names_on_every_host(self):
+        invalid_paths = [
+            r"C:relative.txt", r"\\\\server\\share\\file.txt", r"\\\\?\\C:\\Windows\\win.ini",
+            "src/file.txt:secret", "folder/NUL.txt", "folder/COM1.log",
+            "folder/name. ", "folder/name.", "folder/bad?.txt", "folder/../escape.txt",
+        ]
+        for invalid in invalid_paths:
+            with self.subTest(path=invalid):
+                with self.assertRaises(gen.GenerationError):
+                    gen.validate_relative_path(self.ws, invalid)
+
+    def test_rejects_dangling_symlink_parent(self):
+        link = self.ws / "dangling"
+        try:
+            os.symlink(str(self.ws / "missing-target"), str(link), target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation is not permitted on this host")
+        with self.assertRaises(gen.GenerationError):
+            gen.validate_relative_path(self.ws, "dangling/new.txt")
+
+    def test_rejects_windows_directory_junction_escape(self):
+        if os.name != "nt":
+            self.skipTest("Windows junction validation")
+        outside = self.ws.parent / (self.ws.name + "-outside")
+        outside.mkdir()
+        junction = self.ws / "linked"
+        created = subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside)], capture_output=True, text=True, check=False)
+        if created.returncode != 0:
+            self.skipTest("directory junction creation is unavailable to this runner")
+        with self.assertRaises(gen.GenerationError):
+            gen.validate_relative_path(self.ws, "linked/escape.txt")
+
+    def test_rejects_staging_root_junction(self):
+        if os.name != "nt":
+            self.skipTest("Windows junction validation")
+        outside = self.ws.parent / (self.ws.name + "-staging-outside")
+        outside.mkdir()
+        junction = self.ws / ".crane-staging"
+        created = subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside)], capture_output=True, text=True, check=False)
+        if created.returncode != 0:
+            self.skipTest("directory junction creation is unavailable to this runner")
+        ops = gen.validate_file_operations(self.ws, [{"path": "src/app.py", "operation": "write", "content": "print('safe')"}])
+        with self.assertRaises(gen.GenerationError):
+            gen.stage_operations(self.ws, ops)
+        self.assertFalse((outside / "src" / "app.py").exists())
+
+    def test_stage_reference_cannot_be_forged_outside_staging_root(self):
+        outside = self.ws.parent / (self.ws.name + "-outside-stage")
+        outside.mkdir()
+        external_file = outside / "app.py"
+        external_file.write_text("do not read or apply", encoding="utf-8")
+        ops = gen.validate_file_operations(self.ws, [{"path": "app.py", "operation": "write", "content": "print('safe')"}])
+        stage = gen.stage_operations(self.ws, ops)
+        stage["files"][0]["staged_path"] = str(external_file)
+        try:
+            with self.assertRaises(gen.GenerationError):
+                gen.apply_staged_operations(self.ws, stage, approved_overwrites=False)
+        finally:
+            gen.cleanup_stage({"stage_dir": stage["stage_dir"]}, self.ws)
+        self.assertEqual(external_file.read_text(encoding="utf-8"), "do not read or apply")
+
+    def test_cleanup_stage_refuses_outside_numeric_directory(self):
+        outside = self.ws.parent / (self.ws.name + "-123")
+        outside.mkdir()
+        marker = outside / "keep.txt"
+        marker.write_text("preserve", encoding="utf-8")
+        self.assertFalse(gen.cleanup_stage({"stage_dir": str(outside)}, self.ws))
+        self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+
+    def test_new_file_created_after_staging_is_never_overwritten_without_approval(self):
+        ops = gen.validate_file_operations(self.ws, [{"path": "src/app.py", "operation": "write", "content": "generated"}])
+        stage = gen.stage_operations(self.ws, ops)
+        target = self.ws / "src" / "app.py"
+        target.parent.mkdir()
+        target.write_text("created by another process", encoding="utf-8")
+        try:
+            with self.assertRaises(gen.GenerationError):
+                gen.apply_staged_operations(self.ws, stage, approved_overwrites=False)
+        finally:
+            gen.cleanup_stage(stage, self.ws)
+        self.assertEqual(target.read_text(encoding="utf-8"), "created by another process")
     def test_validate_and_stage_and_apply(self):
         ops = gen.validate_file_operations(self.ws, [
             {"path": "src/app.py", "operation": "write", "content": "print('ok')\n"},
@@ -47,7 +129,7 @@ class GenerationSafetyTests(unittest.TestCase):
         applied = gen.apply_staged_operations(self.ws, stage, approved_overwrites=False)
         self.assertEqual(applied["count"], 2)
         self.assertEqual((self.ws / "src/app.py").read_text(encoding="utf-8"), "print('ok')\n")
-        gen.cleanup_stage(stage)
+        gen.cleanup_stage(stage, self.ws)
         self.assertFalse(Path(stage["stage_dir"]).exists())
 
     def test_overwrite_requires_approval(self):

@@ -1179,7 +1179,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
         for rec in state.generation["applied"]:
             if isinstance(rec, dict):
                 _event(state.task_id, "generation.file.written", {"path": rec.get("path"), "operation": rec.get("operation")})
-        gen.cleanup_stage(stage)
+        gen.cleanup_stage(stage, ws)
         return {"status": "succeeded", "output": {"applied_count": applied.get("count", 0), "files": [r.get("path") for r in state.generation["applied"] if isinstance(r, dict)]}}
 
     if sid == "validate_project":
@@ -1264,7 +1264,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             ops = gen.validate_file_operations(ws, repair_manifest)
             stage = gen.stage_operations(ws, ops)
             applied = gen.apply_staged_operations(ws, stage, approved_overwrites=True)
-            gen.cleanup_stage(stage)
+            gen.cleanup_stage(stage, ws)
         except Exception as exc:  # noqa: BLE001
             return {"status": "failed", "error": f"Repair apply failed: {exc}"}
         # Re-run validations
