@@ -52,7 +52,7 @@ try {
     if ($manifest.version -ne ($release.tag_name -replace '^v', '') -or $manifest.os -ne 'windows' -or $manifest.arch -ne 'x64') {
         throw 'Release metadata does not match the selected GitHub release or Windows x64 platform.'
     }
-    if ($manifest.signature.status -ne 'none' -or $manifest.signature.verification -ne 'unverified') {
+    if ($manifest.signature.scheme -ne 'none' -or $manifest.signature.status -ne 'unverified') {
         throw 'Unexpected release signature metadata. Refusing to continue.'
     }
 
