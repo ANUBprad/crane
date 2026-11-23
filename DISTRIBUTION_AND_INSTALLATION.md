@@ -12,8 +12,8 @@ This is a per-user PowerShell bootstrapper, not an MSI or graphical installer.
 
 Implemented:
 
-- `scripts/build-release.ps1` builds versioned Windows x64 release directories with tracked app staging, a private Python embeddable runtime, pinned hashed dependencies, deterministic ZIP/manifest/SHA256SUMS generation, and explicit `signature.status=none`/`signature.verification=unverified` metadata.
-- `scripts/install.ps1` performs verified Install/Update/Rollback from a local directory or an explicitly allowed `http(s)` source (`CRANE_ALLOW_REMOTE_RELEASE_SOURCE=1`). It validates manifest/SHA256SUMS, file hashes, platform metadata, and signature state before staging/switching; it rejects unverifiable authentic signatures. Updates health-check the new version before switching and roll back on failure.
+- `scripts/build-release.ps1` builds versioned Windows x64 release directories with tracked app staging, a private Python embeddable runtime, pinned hashed dependencies, deterministic ZIP/manifest/SHA256SUMS generation, and explicit `signature.scheme=none`/`signature.status=unverified` metadata.
+- `scripts/install.ps1` performs verified Install/Update/Rollback from a local directory or an explicitly allowed `http(s)` source. Remote sources require `CRANE_ALLOW_REMOTE_RELEASE_SOURCE=1`; local sources and the website bootstrap use a local verified directory. It validates manifest/SHA256SUMS, file hashes, platform metadata, and signature state before staging/switching; it rejects unverifiable authentic signatures. Updates stage and switch version pointers, then health-check the new version and restore the previous pointer on failure.
 - `scripts/uninstall.ps1` runs detached, removes install/PATH entries, preserves `%LOCALAPPDATA%\CRANE` data by default, and removes data only with `-RemoveData -Confirm REMOVE-CRANE-DATA`.
 - `scripts/acceptance-windows.ps1` provides an isolated lifecycle harness (install, version/doctor smoke, basic task/result, upgrade, rollback, uninstall/data preservation, PATH, integrity/failure cases). It mutates process LOCALAPPDATA and, for one check, the real user PATH with restore in `finally`; run it only on a machine where that is acceptable.
 - `scripts/test-release-reproducibility.ps1` compares two independent builds with identical declared inputs and checks byte-for-byte ZIP/manifest/SHA256SUMS equality.
@@ -26,7 +26,7 @@ Validated by current repository evidence:
 Not validated / external blockers:
 
 - **Clean physical Windows 10/11 x64 acceptance:** not performed on this dev host. GitHub-hosted runner evidence is not a substitute for clean physical Windows 10/11 acceptance.
-- **Authenticode / publisher authenticity:** no legitimate code-signing certificate/credentials are available in this environment. Artifacts are unsigned (`signature.status=none`, `verification=unverified`). SHA-256/checksum verification provides artifact-integrity evidence, not publisher authenticity.
+- **Authenticode / publisher authenticity:** no legitimate code-signing certificate/credentials are available in this environment. Artifacts are unsigned (`signature.scheme=none`, `signature.status=unverified`). SHA-256/checksum verification provides artifact-integrity evidence, not publisher authenticity.
 - **Controlled official release host/domain:** no controlled official release host/domain is verified. Do not publish or claim an official install URL. Remote `http(s)` install sources are opt-in only and must be operator-controlled.
 - **Cross-environment reproducibility:** `scripts/test-release-reproducibility.ps1` can provide same-host/same-input evidence; cross-environment/toolchain reproducibility is not proven while relevant environment differences remain uncontrolled.
 
@@ -43,21 +43,22 @@ irm https://anubprad.github.io/crane/install.ps1 | iex
 
 The bootstrap retrieves the latest stable release from the GitHub Releases API, downloads the manifest, checksum list, payload and lifecycle scripts into a temporary directory, checks the release/platform metadata, then calls the existing local-directory installer. The installer verifies SHA-256 values before activation. The bootstrap refuses missing assets, unexpected download hosts, mismatched platform/version metadata and unexpected signature metadata. Temporary download files are removed after the attempt.
 
-The publishing workflow is triggered by pushing a semantic-version tag such as `v0.1.0`. It builds the Windows x64 package on a Windows GitHub Actions runner and attaches the versioned package and metadata to the GitHub Release. Do not publish a tag until its source commit is intended for release.
+The publishing workflow is triggered by pushing a semantic-version tag such as `v0.1.0`. It sets up the pinned Go and Python toolchains, builds the Windows x64 package on a Windows GitHub Actions runner, installs that exact package into an isolated temporary root, runs version/doctor/task/result/uninstall smoke checks, and only then attaches the versioned package and metadata to the GitHub Release. Do not publish a tag until its source commit is intended for release.
 
 **Trust limitation:** artifacts remain unsigned until legitimate Authenticode signing credentials are configured. SHA-256 checks detect corruption/tampering relative to the downloaded manifest; they do not authenticate the publisher. The first public release also requires the GitHub Pages deployment to complete successfully and the public URL to be verified.
 
 ## Release source
 
-For controlled/manual packaging, the release source can still be supplied explicitly as a local directory or a controlled HTTPS base URL.
+For controlled/manual packaging, the release source can still be supplied explicitly as a local directory or a controlled HTTPS base URL. Remote sources are rejected unless remote use is explicitly enabled for that command.
 
 ```powershell
 .\scripts\install.ps1 -Action Install -ReleaseSource .\build\release\0.1.0
-# or
+# or, for an operator-controlled remote source only:
+$env:CRANE_ALLOW_REMOTE_RELEASE_SOURCE = '1'
 $env:CRANE_RELEASE_SOURCE = 'https://<your-controlled-release-host>/crane'
 ```
 
-`-ReleaseSource`/`CRANE_RELEASE_SOURCE` accepts either an existing local directory or an `http(s)` base URL. The installer fetches `release-manifest.json`, `SHA256SUMS.txt`, the payload, and the lifecycle scripts from that source.
+`-ReleaseSource`/`CRANE_RELEASE_SOURCE` accepts either an existing local directory or an `http(s)` base URL. A remote URL requires `CRANE_ALLOW_REMOTE_RELEASE_SOURCE=1`; without it the installer fails before any download. For a remote source, the installer fetches `release-manifest.json`, `SHA256SUMS.txt`, the payload, and the lifecycle scripts from that source. The website bootstrap downloads assets first and invokes the installer with the local temporary directory, so it does not need the remote opt-in.
 
 ## Build a release
 
@@ -146,9 +147,9 @@ PowerShell equivalents:
 5. Extracts the payload with path-traversal and reparse-point checks.
 6. Checks `install.json` against the manifest and runs `agent.exe --version`.
 7. Runs packaged Python `--health` and imports LangChain, LangGraph, MCP adapters, Ollama, and `jsonschema` from the private runtime.
-8. Switches version pointers only after staging and health checks succeed, then runs `agent doctor`.
+8. Stages the payload, switches version pointers, and then runs packaged runtime health checks and `agent doctor`.
 9. On a failed update after the pointer switch, restores the previous active version.
-10. Refuses downgrades.
+10. Refuses downgrades and rejects remote release sources unless `CRANE_ALLOW_REMOTE_RELEASE_SOURCE=1` is set.
 
 ## Update, rollback, and uninstall
 
@@ -178,7 +179,7 @@ This is **not** clean physical Windows 10/11 x64 acceptance and does not prove A
 
 Run on genuine clean Windows 10 x64 and Windows 11 x64 machines/VMs with no Go, Python, Node.js, npm, CRANE repository, or development dependencies:
 
-1. Obtain a verified release directory from a controlled source. Confirm `release-manifest.json` and `SHA256SUMS.txt` match the artifact hashes and record signature state (`none`/`unverified` means integrity checks only).
+1. Obtain a verified release directory from a controlled source. Confirm `release-manifest.json` and `SHA256SUMS.txt` match the artifact hashes and record signature state (`signature.scheme=none`, `signature.status=unverified` means integrity checks only).
 2. Install: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Action Install -ReleaseSource <dir-or-url>`.
 3. From a fresh terminal, run `agent --version`, `agent doctor`, `agent run "clean machine acceptance"`, `agent status <id>`, and `agent result <id>`.
 4. Validate supervisor start/stop, authenticated loopback API availability, packaged Python/SQLite operation, task persistence across restart, and PowerShell 7.x behavior.

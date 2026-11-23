@@ -453,8 +453,16 @@ function Assert-StagedPayload([object]$manifest, [string]$stagedDirectory) {
     if ($imports.Stdout.Trim() -ne '1') { throw 'Packaged Python dependency imports did not pass.' }
 }
 
+function Assert-RemoteReleaseSourceAllowed([string]$source, [bool]$isLocal) {
+    if ($isLocal) { return }
+    if ($env:CRANE_ALLOW_REMOTE_RELEASE_SOURCE -ne '1') {
+        throw "Remote release sources require CRANE_ALLOW_REMOTE_RELEASE_SOURCE=1. Set it explicitly for a controlled source: $source"
+    }
+}
+
 function Resolve-Release([string]$source, [bool]$isLocal, [string]$workDirectory) {
     if (-not $isLocal -and $source -notmatch '^https?://') { throw "-ReleaseSource must be an existing directory or an http(s) URL." }
+    Assert-RemoteReleaseSourceAllowed $source $isLocal
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     $manifestPath = Resolve-SourcePath $source 'release-manifest.json' $isLocal

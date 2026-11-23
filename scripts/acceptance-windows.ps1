@@ -12,6 +12,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $suffix = [guid]::NewGuid().ToString('N').Substring(0, 8)
+$system32 = Join-Path $env:WINDIR 'System32'
 $testRoot = Join-Path $env:TEMP "crane-acceptance-$suffix"
 $logPath = Join-Path $testRoot 'acceptance.log'
 New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
@@ -43,10 +44,10 @@ try {
     $processPathBaseline = $env:Path
     if ($MinimalEnvironment) {
         $minimalParts = @(
-            (Join-Path $env:WINDIR 'System32'),
+            $system32,
             $env:WINDIR,
-            (Join-Path $env:WINDIR 'System32\Wbem'),
-            (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0')
+            (Join-Path $system32 'Wbem'),
+            (Join-Path $system32 'WindowsPowerShell\v1.0')
         ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_) }
         $env:Path = ($minimalParts -join ';')
         $processPathBaseline = $env:Path
@@ -200,6 +201,19 @@ try {
     catch { $unsupportedFailed = $true }
     Assert-Step $unsupportedFailed 'Installer rejected unsupported OS/architecture metadata'
 
+    $savedAllowRemote = $env:CRANE_ALLOW_REMOTE_RELEASE_SOURCE
+    $remoteBlocked = $false
+    try {
+        Remove-Item Env:\CRANE_ALLOW_REMOTE_RELEASE_SOURCE -ErrorAction SilentlyContinue
+        & (Join-Path $release010 'install.ps1') -Action Install -ReleaseSource 'https://example.invalid/crane' -InstallRoot (Join-Path $testRoot 'Programs\RemoteBlocked') 2>&1 | Out-Null
+    }
+    catch { $remoteBlocked = $true }
+    finally {
+        if ($null -eq $savedAllowRemote) { Remove-Item Env:\CRANE_ALLOW_REMOTE_RELEASE_SOURCE -ErrorAction SilentlyContinue }
+        else { $env:CRANE_ALLOW_REMOTE_RELEASE_SOURCE = $savedAllowRemote }
+    }
+    Assert-Step $remoteBlocked 'Installer requires explicit opt-in for remote release sources'
+
     $savedLocal = $env:LOCALAPPDATA
     $rollbackDataLocal = Join-Path $testRoot 'rollback-local'
     $rollbackLocal = Join-Path $rollbackDataLocal 'Local'
@@ -230,8 +244,8 @@ try {
     $pathEntry = Join-Path $pathTestRoot 'bin'
     try {
         Remove-Item Env:\CRANE_SKIP_PATH_UPDATE -ErrorAction SilentlyContinue
-        [Environment]::SetEnvironmentVariable('Path', 'C:\Windows\System32', 'User')
-        $env:Path = 'C:\Windows\System32'
+        [Environment]::SetEnvironmentVariable('Path', $system32, 'User')
+        $env:Path = $system32
         & (Join-Path $release010 'install.ps1') -Action Install -ReleaseSource $release010 -InstallRoot $pathTestRoot
         $pathAfterInstall = [Environment]::GetEnvironmentVariable('Path', 'User')
         $pathAfterInstallRegistry = (Get-ItemProperty -Path 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
@@ -249,12 +263,12 @@ try {
         & (Join-Path $release010 'uninstall.ps1') -InstallRoot $pathTestRoot
         $pathAfterUninstall = [Environment]::GetEnvironmentVariable('Path', 'User')
         $pathAfterUninstallRegistry = (Get-ItemProperty -Path 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue).Path
-        $pathAfterUninstallEffective = if ($pathAfterUninstall -ceq 'C:\Windows\System32') { $pathAfterUninstall } else { $pathAfterUninstallRegistry }
-        if ($pathAfterUninstallEffective -cne 'C:\Windows\System32') {
+        $pathAfterUninstallEffective = if ($pathAfterUninstall -ceq $system32) { $pathAfterUninstall } else { $pathAfterUninstallRegistry }
+        if ($pathAfterUninstallEffective -cne $system32) {
             Write-Result "DIAG: GetEnvironmentVariable(User)=$pathAfterUninstall"
             Write-Result "DIAG: HKCU:\Environment\Path=$pathAfterUninstallRegistry"
         }
-        Assert-Step ($pathAfterUninstallEffective -ceq 'C:\Windows\System32') 'Uninstall restored the user PATH exactly'
+        Assert-Step ($pathAfterUninstallEffective -ceq $system32) 'Uninstall restored the user PATH exactly'
         Assert-Step (-not (Test-Path -LiteralPath $pathTestRoot)) 'PATH test uninstall removed installed binaries'
     }
     finally {

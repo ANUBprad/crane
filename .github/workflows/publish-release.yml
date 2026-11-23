@@ -25,6 +25,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12.7
+
       - name: Build verified release directory
         shell: pwsh
         run: |
@@ -37,6 +42,68 @@ jobs:
           ./scripts/build-release.ps1 -Version $version -Commit $env:GITHUB_SHA -BuildDate $buildDate -PythonVersion '3.12.7'
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
           "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Smoke-test packaged release before publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testRoot = Join-Path $env:RUNNER_TEMP 'crane-publish-smoke'
+          $releaseRoot = Join-Path (Join-Path $env:GITHUB_WORKSPACE 'build\release') $env:RELEASE_VERSION
+          $installRoot = Join-Path $testRoot 'Programs\CRANE'
+          $env:LOCALAPPDATA = Join-Path $testRoot 'AppData\Local'
+          $env:CRANE_SKIP_PATH_UPDATE = '1'
+          New-Item -ItemType Directory -Path $env:LOCALAPPDATA -Force | Out-Null
+
+          & (Join-Path $releaseRoot 'install.ps1') -Action Install -ReleaseSource $releaseRoot -InstallRoot $installRoot
+          $agent = Join-Path $installRoot 'bin\agent.cmd'
+          if (-not (Test-Path -LiteralPath $agent)) { throw 'Publish smoke: installer did not create agent.cmd.' }
+
+          $version = & $agent --version
+          if ($LASTEXITCODE -ne 0 -or ($version -join "`n") -notmatch [regex]::Escape($env:RELEASE_VERSION)) {
+            throw "Publish smoke: packaged version check failed: $version"
+          }
+
+          $doctor = & $agent doctor 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "Publish smoke: packaged doctor failed: $doctor" }
+          foreach ($expected in @('Python runtime available: yes', 'SQLite available: yes', 'MCP modules available: yes')) {
+            if (($doctor -join "`n") -notmatch [regex]::Escape($expected)) { throw "Publish smoke: doctor did not report: $expected" }
+          }
+
+          $run = & $agent run 'Publish smoke task' 2>&1
+          $runText = $run -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "Publish smoke: task submission failed: $runText" }
+          if ($runText -notmatch 'task\s+(task-[^\s]+)\s+queued') {
+            throw "Publish smoke: no durable task ID returned: $runText"
+          }
+          $taskId = $Matches[1]
+
+          $statusText = ''
+          for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            $status = & $agent status $taskId 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              $statusText = $status -join "`n"
+              if ($statusText -match 'Status: succeeded') { break }
+            }
+            Start-Sleep -Milliseconds 500
+          }
+          if ($statusText -notmatch 'Status: succeeded') { throw "Publish smoke: task did not succeed: $statusText" }
+
+          $result = & $agent result $taskId 2>&1
+          if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'execution_mode') {
+            throw "Publish smoke: task result was not retrievable: $result"
+          }
+
+          $sentinel = Join-Path $env:LOCALAPPDATA 'CRANE\data\publish-smoke-sentinel.txt'
+          Set-Content -LiteralPath $sentinel -Value 'preserve-user-data'
+          $uninstall = & $agent uninstall 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "Publish smoke: uninstall failed: $uninstall" }
+          for ($attempt = 0; $attempt -lt 80 -and (Test-Path -LiteralPath $installRoot); $attempt++) {
+            Start-Sleep -Milliseconds 250
+          }
+          if (Test-Path -LiteralPath $installRoot) { throw 'Publish smoke: uninstall did not remove installation files.' }
+          if ((Get-Content -LiteralPath $sentinel -Raw).Trim() -ne 'preserve-user-data') {
+            throw 'Publish smoke: uninstall did not preserve user data.'
+          }
 
       - name: Publish immutable versioned assets
         uses: softprops/action-gh-release@v2

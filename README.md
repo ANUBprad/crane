@@ -67,7 +67,7 @@ Builds are deterministic for identical declared inputs on the same host as valid
 
 ### Install / update / rollback / uninstall
 
-Release source must be explicit (local directory or controlled `http(s)` source). Do not use unverified download sources.
+Release source must be explicit (local directory or controlled `http(s)` source). Remote sources require `CRANE_ALLOW_REMOTE_RELEASE_SOURCE=1`; otherwise installation fails before any download. Do not use unverified download sources.
 
 ```powershell
 .\scripts\install.ps1 -Action Install -ReleaseSource <dir-or-url> [-Version <version>]

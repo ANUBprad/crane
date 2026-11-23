@@ -21,6 +21,8 @@ function Fail([string]$message) {
     exit 1
 }
 
+# ZipArchiveEntry.Crc32 is not available in Windows PowerShell 5.1. SHA-256
+# over the decompressed entry content provides a stronger equality check.
 function Get-ZipEntryInfo([string]$zipPath) {
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -43,7 +45,6 @@ function Get-ZipEntryInfo([string]$zipPath) {
                 length = [long]$entry.Length
                 compressedLength = [long]$entry.CompressedLength
                 lastWriteTimeUtc = $entry.LastWriteTime.ToUniversalTime().ToString('o')
-                crc32 = [uint32]$entry.Crc32
                 sha256 = $hash
             }
         }
@@ -74,7 +75,7 @@ function Compare-Zips([string]$zipA, [string]$zipB) {
         if ($null -eq $eb) {
             return "ZIP entry missing in second build: $($ea.name)"
         }
-        if ($ea.sha256 -ne $eb.sha256 -or $ea.length -ne $eb.length -or $ea.compressedLength -ne $eb.compressedLength -or $ea.lastWriteTimeUtc -ne $eb.lastWriteTimeUtc -or $ea.crc32 -ne $eb.crc32) {
+        if ($ea.sha256 -ne $eb.sha256 -or $ea.length -ne $eb.length -or $ea.compressedLength -ne $eb.compressedLength -or $ea.lastWriteTimeUtc -ne $eb.lastWriteTimeUtc) {
             return "First differing ZIP entry: $($ea.name)"
         }
     }
