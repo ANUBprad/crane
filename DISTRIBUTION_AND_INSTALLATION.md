@@ -8,7 +8,7 @@ This is a per-user PowerShell bootstrapper, not an MSI or graphical installer.
 
 ## Current status
 
-**As of HEAD `8ae928f7e9c9074e7626bc77b8d269b4992b5325` (Windows CI run [45253450966](https://github.com/ANUBprad/crane/actions/runs/45253450966), success, completed `2026-11-23T20:02:16Z`).**
+**As of release code HEAD `07f0c84ddc077136529bfff09c8991b22854c967` (Windows CI run [45255583424](https://github.com/ANUBprad/crane/actions/runs/45255583424), success, completed `2026-11-23T20:17:45Z`).**
 
 Implemented:
 
@@ -22,8 +22,9 @@ Implemented:
 Validated by current repository evidence:
 
 - GitHub-hosted `windows-2025` CI builds, formats/vets, runs Go/Python tests (76 Python tests), packages a release, and smoke-tests packaged install/`agent --version`/`agent doctor`/basic task submission. The repair source-context regression and the approval-checkpoint restart regression both ran and passed.
-- The current run built versioned `0.1.0`–`0.1.2` releases, verified all six `0.1.2-repro` outputs byte-for-byte identical (ZIP SHA-256 `a822f1333ec240e8eaf8a506a5d770ec787c3defcac369ec05fa51d3bff1e3ee`, manifest SHA-256 `859bab52628d634d38f51900ca07d34baf5d50bcc91da557de17b6a94c325d5f`), and ran the full isolated acceptance harness with `ACCEPTANCE RESULT: ALL ISOLATED CHECKS PASSED` (install, version/doctor, task/result, update, rollback, uninstall/data preservation, PATH, integrity/failure cases, and SBOM checks).
-- Artifact [`crane-windows-ci-54`](https://github.com/ANUBprad/crane/actions/runs/45253450966/artifacts/14858345897) is 150,074,220 bytes; uploaded ZIP SHA-256 `f0f1466144c996753c89203f4ea48bf449f6213627c5f743a06f44f5f78889c5`.
+- The current run built versioned `0.1.0`–`0.1.2` releases, verified all six `0.1.2-repro` outputs byte-for-byte identical (ZIP SHA-256 `274489c418f26abe33088d5616e4248fa06e4c735eb2f5fc4d48a1450d2cae17`, manifest SHA-256 `b8760908bd728ebf9786b8e3fb288e7f5827ee643ccae7bded100a3825ab07aa`), and ran the full isolated acceptance harness with `ACCEPTANCE RESULT: ALL ISOLATED CHECKS PASSED` (install, version/doctor, task/result, update, rollback, uninstall/data preservation, PATH, integrity/failure cases, and SBOM checks).
+- The `windows-2022` job compared seven release artifacts against the `windows-2025` build and reported `CROSS-ENV RESULT=PASS`; payload SHA-256 `3da1c021cdc2e744e15ce03a5e1d7ec84cd8e07dc112cb701aa92c6bacce90c4`.
+- Artifact [`crane-windows-ci-55`](https://github.com/ANUBprad/crane/actions/runs/45255583424/artifacts/14858007684) is 150,073,641 bytes; uploaded ZIP SHA-256 `ac451412083eb08b4f493fb7dff8700bcc0a276a48a6cab9bf4fa0474bb6c0e0`.
 - A local Windows 11 x64 release build produced a CycloneDX 1.5 SBOM with 82 components (57 PyPI, 25 Go); every manifest artifact (including `sbom.cdx.json`) matched its manifest and `SHA256SUMS.txt` hash. An isolated install with `CRANE_SKIP_PATH_UPDATE=1` left the user PATH unchanged, and removing the `sbom` artifact made the installer fail closed.
 
 Not validated / external blockers:
@@ -31,7 +32,7 @@ Not validated / external blockers:
 - **Clean physical Windows 10/11 x64 acceptance:** not performed. `GET /repos/ANUBprad/crane/actions/runners` returned `total_count: 0`, so the clean Windows 10/11 workflow was not dispatched. GitHub-hosted runner evidence is not a substitute for clean physical Windows 10/11 acceptance.
 - **Authenticode / publisher authenticity:** no legitimate code-signing certificate/credentials are available in this environment. Artifacts are unsigned (`signature.scheme=none`, `signature.status=unverified`). SHA-256/checksum verification provides artifact-integrity evidence, not publisher authenticity.
 - **Controlled official release host/domain:** no controlled official release host/domain is verified. Do not publish or claim an official install URL. Remote `http(s)` install sources are opt-in only and must be operator-controlled.
-- **Cross-environment reproducibility:** same-host/same-input determinism is proven for the current inputs. A `windows-2022` vs `windows-2025` comparison job has been added to `windows-ci.yml`; its first result is pending on the next run.
+- **Cross-environment reproducibility:** proven for the current inputs by byte-for-byte equality of seven release artifacts between GitHub-hosted `windows-2025` and `windows-2022` runners. Physical Windows 10/11 cross-machine evidence remains outside this result.
 
 ## Public website and bootstrap installer
 
@@ -203,7 +204,7 @@ Run on genuine clean Windows 10 x64 and Windows 11 x64 machines/VMs with no Go, 
 - Legitimate Authenticode signing certificate/credentials and verification enforced in release validation. Without them, CRANE can claim checksum/integrity validation only, not publisher authenticity.
 - Controlled official release host/domain with verified ownership and a documented install command.
 - Clean physical Windows 10/11 x64 acceptance (PowerShell 5.1 and PowerShell 7.x) with recorded evidence; no self-hosted runners are registered.
-- Cross-environment reproducibility: first `windows-2022` vs `windows-2025` result pending on the next CI run.
+- Cross-environment reproducibility: `windows-2022` vs `windows-2025` comparison is passing for current inputs; physical Windows 10/11 cross-machine evidence is still external.
 - Packaged-install approval persistence/recovery: the production defect is fixed and the exact checkpoint/resume contract is covered by `TestApprovalCheckpointSurvivesSupervisorRestartAndResumesExactGrant` using a real SQLite store and supervisor restart; no separate packaged interactive-approval scenario was executed.
 - SBOM generation is complete and authenticated through manifest/checksum/installer/bootstrap. Database migration compatibility is covered by `TestLegacyV1DatabaseMigratesWithoutLosingTasksEventsApprovalsOrCheckpoints`; packaged upgrade/rollback/data preservation is covered by the acceptance harness, but not against historical packaged versions with older schemas.
 - GitHub Pages site must be enabled by the repository owner (Settings → Pages → Build and deployment → Source: GitHub Actions) before the bootstrap URL can be published.
