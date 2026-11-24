@@ -41,6 +41,7 @@ from crane.python_runtime.provider import (
     selected_provider,
     warm_provider,
 )
+from crane.python_runtime.provider import MAX_TOOL_ROUNDS
 from crane.python_runtime.workflow_state import (
     DEFAULT_TOOL_TIMEOUT_MS,
     EvaluationOutcome,
@@ -54,6 +55,7 @@ from crane.python_runtime.workflow_state import (
     MAX_PLAN_REVISIONS,
     MAX_RETRIES_PER_STEP,
     MAX_TOOL_CALLS_PER_TASK,
+    MAX_TOOL_ERROR_CHARS,
     MAX_TOOL_OUTPUT_CHARS,
     MAX_WALL_CLOCK_MS,
     PlanStep,
@@ -262,6 +264,129 @@ def _find_tool(manager: Optional[MCPManager], name: str) -> Optional[Dict[str, A
     if not name:
         return None
     return _tool_index(manager).get(name)
+
+
+def _record_result_text(value: Any) -> str:
+    if isinstance(value, dict):
+        text = value.get("text")
+        if isinstance(text, str):
+            return _text(text, MAX_TOOL_OUTPUT_CHARS).strip()
+        structured = value.get("structured")
+        if structured is not None:
+            return _text(structured, MAX_TOOL_OUTPUT_CHARS).strip()
+    return _text(value, MAX_TOOL_OUTPUT_CHARS).strip()
+
+
+def _tool_call_matches_invocation(call: Dict[str, Any], invocation: Dict[str, Any]) -> bool:
+    call_name = str(call.get("name") or call.get("tool_name") or "")
+    invocation_name = str(invocation.get("tool_name") or "")
+    if not call_name or not invocation_name:
+        return False
+    if call_name != invocation_name and not call_name.endswith(f"_{invocation_name}"):
+        return False
+    call_args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+    invocation_args = invocation.get("arguments") if isinstance(invocation.get("arguments"), dict) else {}
+    try:
+        if canonical_json(redact(call_args)) != canonical_json(redact(invocation_args)):
+            return False
+    except (TypeError, ValueError):
+        return False
+    call_result = _record_result_text(call.get("result"))
+    invocation_result = _record_result_text(invocation.get("result"))
+    return not call_result or not invocation_result or call_result == invocation_result
+
+
+def _normalize_tool_status(value: Any, result_text: str = "", error: Any = None) -> Tuple[str, Optional[str]]:
+    status = str(value or "succeeded").lower()
+    if status == "error":
+        status = "failed"
+    if status in {"failed", "blocked"} and not error:
+        error = result_text[:MAX_TOOL_ERROR_CHARS] or "MCP tool call did not complete"
+    return status, str(error) if error else None
+
+
+def _merge_tool_call_records(
+    state: WorkflowState,
+    step_id: str,
+    output: Any,
+    manager: Optional[MCPManager],
+) -> None:
+    """Merge authoritative MCP records with provider observations without duplicates."""
+    invocations = manager.invocations() if manager is not None else []
+    provider_calls = output.get("tool_calls") if isinstance(output, dict) else None
+    if not isinstance(provider_calls, list):
+        provider_calls = []
+    seen = {tc.invocation_id for tc in state.tool_calls if tc.invocation_id}
+
+    for invocation in invocations:
+        invocation_id = str(invocation.get("invocation_id") or "")
+        if not invocation_id or invocation_id in seen:
+            continue
+        result_text = _record_result_text(invocation.get("result"))
+        status, error = _normalize_tool_status(invocation.get("status"), result_text, invocation.get("error"))
+        arguments = invocation.get("arguments") if isinstance(invocation.get("arguments"), dict) else {}
+        raw_result = invocation.get("result")
+        record = ToolCallRecord(
+            invocation_id=invocation_id,
+            step_id=step_id,
+            server_id=str(invocation.get("server_id") or ""),
+            tool_name=str(invocation.get("tool_name") or ""),
+            arguments=arguments,
+            result=raw_result if isinstance(raw_result, dict) else ({"value": raw_result} if raw_result is not None else None),
+            error=error,
+            status=status,
+            duration_ms=int(invocation.get("duration_ms") or 0),
+        )
+        state.tool_calls.append(record)
+        state.tool_outputs.append({
+            "step_id": step_id,
+            "server_id": record.server_id,
+            "tool_name": record.tool_name,
+            "arguments": record.arguments,
+            "status": record.status,
+            "result": _text(record.result, MAX_TOOL_OUTPUT_CHARS),
+            "error": record.error,
+            "duration_ms": record.duration_ms,
+        })
+        seen.add(invocation_id)
+
+    for call in provider_calls:
+        if not isinstance(call, dict):
+            continue
+        if any(_tool_call_matches_invocation(call, invocation) for invocation in invocations):
+            continue
+        invocation_id = str(call.get("invocation_id") or "")
+        if not invocation_id:
+            invocation_id = f"{step_id}-observed-{len(state.tool_calls) + 1}"
+        if invocation_id in seen:
+            continue
+        result_text = _record_result_text(call.get("result"))
+        status, error = _normalize_tool_status(call.get("status"), result_text, call.get("error"))
+        arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+        raw_result = call.get("result")
+        record = ToolCallRecord(
+            invocation_id=invocation_id,
+            step_id=step_id,
+            server_id=str(call.get("server_id") or ""),
+            tool_name=str(call.get("name") or call.get("tool_name") or ""),
+            arguments=arguments,
+            result=raw_result if isinstance(raw_result, dict) else ({"value": raw_result} if raw_result is not None else None),
+            error=error,
+            status=status,
+            duration_ms=int(call.get("duration_ms") or 0),
+        )
+        state.tool_calls.append(record)
+        state.tool_outputs.append({
+            "step_id": step_id,
+            "server_id": record.server_id,
+            "tool_name": record.tool_name,
+            "arguments": record.arguments,
+            "status": record.status,
+            "result": _text(record.result, MAX_TOOL_OUTPUT_CHARS),
+            "error": record.error,
+            "duration_ms": record.duration_ms,
+        })
+        seen.add(invocation_id)
 
 
 def _risk_for_tools(tool_names: List[str], tools_by_name: Dict[str, Dict[str, Any]]) -> Tuple[str, bool]:
@@ -989,12 +1114,22 @@ async def _invoke_model_for_step(state: WorkflowState, step: PlanStep, manager: 
         if state.model_calls > MAX_MODEL_CALLS_PER_TASK:
             raise ProviderError("model_call_limit", f"Exceeded maximum model calls per task ({MAX_MODEL_CALLS_PER_TASK})")
         if tools:
+            limits = state.persistent_state.get("limits") if isinstance(state.persistent_state.get("limits"), dict) else {}
+            remaining_model_calls = MAX_MODEL_CALLS_PER_TASK - state.model_calls + 1
+            max_tool_rounds = max(1, min(MAX_TOOL_ROUNDS, remaining_model_calls))
+            used_tool_calls = max(len(state.tool_calls), len(manager.invocations()) if manager is not None else 0)
+            remaining_tool_calls = MAX_TOOL_CALLS_PER_TASK - used_tool_calls
+            if remaining_tool_calls < 1:
+                raise ProviderError("tool_call_limit", f"Exceeded maximum tool calls per task ({MAX_TOOL_CALLS_PER_TASK})")
             out = await _await_with_cancellation(
                 invoke_with_tools(
                     f"Objective: {state.objective}\nCurrent step: {step.description}\nExpected outcome: {step.expected_outcome}\nUse available tools as needed. Return a factual result based on actual tool outputs.",
                     tools,
                     system_prompt=system_prompt,
                     messages=conversation_messages,
+                    max_tool_rounds=max_tool_rounds,
+                    max_tool_calls=remaining_tool_calls,
+                    max_tool_output_chars=int(limits.get("max_tool_output_chars") or MAX_TOOL_OUTPUT_CHARS),
                 ),
                 state.task_id,
             )
@@ -1674,30 +1809,7 @@ async def node_execute_step(raw: Dict[str, Any]) -> Dict[str, Any]:
             state.persistent_state["last_action_output"] = out
             state.persistent_state["last_model_output"] = out
             _event(state.task_id, "provider_result", {"step_id": step.step_id, "provider": out.get("provider"), "model": out.get("model")})
-            for inv in manager.invocations():
-                if not any(tc.invocation_id == inv.get("invocation_id") for tc in state.tool_calls):
-                    tc = ToolCallRecord(
-                        invocation_id=str(inv.get("invocation_id") or ""),
-                        step_id=step.step_id,
-                        server_id=str(inv.get("server_id") or ""),
-                        tool_name=str(inv.get("tool_name") or ""),
-                        arguments=inv.get("arguments") if isinstance(inv.get("arguments"), dict) else {},
-                        result=inv.get("result") if isinstance(inv.get("result"), dict) else {"value": inv.get("result")},
-                        error=inv.get("error") or None,
-                        status=str(inv.get("status") or "succeeded"),
-                        duration_ms=int(inv.get("duration_ms") or 0),
-                    )
-                    state.tool_calls.append(tc)
-                    state.tool_outputs.append({
-                        "step_id": step.step_id,
-                        "server_id": tc.server_id,
-                        "tool_name": tc.tool_name,
-                        "arguments": tc.arguments,
-                        "status": tc.status,
-                        "result": _text(tc.result, MAX_TOOL_OUTPUT_CHARS),
-                        "error": tc.error,
-                        "duration_ms": tc.duration_ms,
-                    })
+            _merge_tool_call_records(state, step.step_id, out, manager)
             # If model output reports blocked/approval, surface it.
             if isinstance(out, dict) and out.get("error") == "approval_required":
                 state.execution_status = ExecutionStatus.WAITING_FOR_APPROVAL.value
@@ -1750,8 +1862,24 @@ def _evaluation_from_output(state: WorkflowState, step: PlanStep, output: Any) -
         exec_mode = str(output.get("execution_mode") or "")
         if exec_mode == "deterministic_local" and _step_needs_tool(step, _tool_index(_get_manager(state.task_id))):
             return EvaluationResult(step.step_id, EvaluationOutcome.FAILED.value, "Deterministic local mode cannot autonomously execute MCP tools", [model_output or "local mode"], "fail")
-        if tool_calls or model_output or state.tool_outputs:
-            if _step_needs_tool(step, _tool_index(_get_manager(state.task_id))) and not tool_calls and not state.tool_outputs:
+        current_outputs = [item for item in state.tool_outputs if item.get("step_id") == step.step_id]
+        failed_outputs = [
+            item for item in current_outputs
+            if str(item.get("status") or "").lower() in {"failed", "error", "blocked"}
+        ]
+        if failed_outputs:
+            approval_outputs = [item for item in failed_outputs if str(item.get("status") or "").lower() == "blocked"]
+            if approval_outputs:
+                evidence = [str(item.get("error") or "approval_required")[:300] for item in approval_outputs]
+                return EvaluationResult(step.step_id, EvaluationOutcome.NEEDS_APPROVAL.value, "A tool action requires approval", evidence, "wait_for_approval")
+            evidence = [
+                str(item.get("error") or _record_result_text(item.get("result")))[:300]
+                for item in failed_outputs
+            ]
+            outcome = EvaluationOutcome.FAILED if len(failed_outputs) == len(current_outputs) else EvaluationOutcome.PARTIALLY_COMPLETED
+            return EvaluationResult(step.step_id, outcome.value, "One or more tool calls did not complete", evidence, "recover")
+        if tool_calls or model_output or current_outputs:
+            if _step_needs_tool(step, _tool_index(_get_manager(state.task_id))) and not tool_calls and not current_outputs:
                 return EvaluationResult(step.step_id, EvaluationOutcome.PARTIALLY_COMPLETED.value, "Model responded without required tool evidence", [model_output[:200]], "replan")
             return EvaluationResult(step.step_id, EvaluationOutcome.COMPLETED.value, "Model produced a grounded step result", [model_output[:300] or "tool output observed"], "continue")
         if exec_mode == "deterministic_local":
@@ -1798,27 +1926,8 @@ async def node_observe_evaluate(raw: Dict[str, Any]) -> Dict[str, Any]:
         return state_to_checkpoint(state)
 
     output = state.persistent_state.get("last_action_output")
-    # Compatibility: capture tool calls from model output if mock/provider returned them
-    if isinstance(output, dict) and isinstance(output.get("tool_calls"), list):
-        for inv in output.get("tool_calls"):
-            if not isinstance(inv, dict):
-                continue
-            inv_id = str(inv.get("invocation_id") or f"{step.step_id}-{len(state.tool_calls)+1}")
-            if any(tc.invocation_id == inv_id for tc in state.tool_calls):
-                continue
-            tc = ToolCallRecord(
-                invocation_id=inv_id,
-                step_id=step.step_id,
-                server_id=str(inv.get("server_id") or ""),
-                tool_name=str(inv.get("tool_name") or inv.get("name") or ""),
-                arguments=inv.get("arguments") if isinstance(inv.get("arguments"), dict) else {},
-                result=inv.get("result") if isinstance(inv.get("result"), dict) else {"value": inv.get("result")},
-                error=inv.get("error") or None,
-                status=str(inv.get("status") or "succeeded"),
-                duration_ms=int(inv.get("duration_ms") or 0),
-            )
-            state.tool_calls.append(tc)
-            state.tool_outputs.append({"step_id": step.step_id, "server_id": tc.server_id, "tool_name": tc.tool_name, "status": tc.status, "result": _text(tc.result, MAX_TOOL_OUTPUT_CHARS), "error": tc.error})
+    # Compatibility: capture provider-observed tool calls not already persisted as MCP records.
+    _merge_tool_call_records(state, step.step_id, output, _get_manager(state.task_id))
 
     evaluation = _evaluation_from_output(state, step, output)
     state.evaluation_results.append(evaluation)

@@ -20,7 +20,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+from crane.python_runtime.workflow_state import MAX_TOOL_CALLS_PER_TASK, MAX_TOOL_OUTPUT_CHARS
 
 
 DEFAULT_MODEL = "llama3.2:3b"
@@ -560,17 +562,126 @@ def _tool_output_text(output: Any) -> str:
         return str(output)
 
 
+def _bounded_tool_count(value: Optional[int], default: int, maximum: int, label: str) -> int:
+    if value is None:
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ProviderError("tool_loop_limit", f"{label} must be a whole number.") from exc
+    if number < 1:
+        raise ProviderError("tool_loop_limit", f"{label} must be at least 1.")
+    return min(number, maximum)
+
+
+def _extract_tool_calls(response: Any) -> List[Dict[str, Any]]:
+    """Read standard or additional-kwargs tool calls from a LangChain response."""
+    calls = getattr(response, "tool_calls", None)
+    if isinstance(calls, (list, tuple)):
+        return [item if isinstance(item, dict) else {} for item in calls]
+    additional = getattr(response, "additional_kwargs", None)
+    raw = additional.get("tool_calls") if isinstance(additional, dict) else None
+    if not isinstance(raw, (list, tuple)):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            normalized.append({})
+            continue
+        function = item.get("function") if isinstance(item.get("function"), dict) else {}
+        normalized.append({
+            "id": item.get("id"),
+            "name": function.get("name") or item.get("name"),
+            "args": function.get("arguments") if function.get("arguments") is not None else item.get("args"),
+        })
+    return normalized
+
+
+def _parse_tool_arguments(value: Any) -> Dict[str, Any]:
+    """Accept object arguments and serialized JSON objects, rejecting other shapes."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+        raise ValueError("tool arguments must be a JSON object")
+    raise ValueError("tool arguments must be an object")
+
+
+def _resolve_tool(name: str, tools: List[Any]) -> Tuple[Any, Optional[str]]:
+    """Resolve exact names first, then an unambiguous unprefixed raw name."""
+    if not name:
+        return None, "Malformed tool call response"
+    exact = next((item for item in tools if getattr(item, "name", None) == name), None)
+    if exact is not None:
+        return exact, None
+    suffix = f"_{name}"
+    matches = [item for item in tools if str(getattr(item, "name", "") or "").endswith(suffix)]
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) > 1:
+        return None, f"MCP tool name {name!r} is ambiguous"
+    return None, f"MCP tool {name!r} is not available"
+
+
+def _bounded_tool_result(output: Any, limit: int) -> str:
+    text = _tool_output_text(output)
+    if len(text) > limit:
+        return text[:limit] + "…[truncated]"
+    return text
+
+
+def _classify_tool_result(text: str) -> Tuple[str, Optional[str]]:
+    lower = text.lower()
+    if "approval" in lower and any(word in lower for word in ("failed", "error", "requires")):
+        return "blocked", "approval_required"
+    if "mcp tool failed:" in lower or "mcp tool call failed" in lower or "mcp tool returned an error" in lower or "tool returned an error" in lower:
+        return "failed", "MCP tool reported an error"
+    return "succeeded", None
+
+
+def _append_observed_call(
+    observed: List[Dict[str, Any]],
+    *,
+    name: str,
+    call_id: str,
+    arguments: Dict[str, Any],
+    result: str,
+    status: str,
+    error: Optional[str] = None,
+) -> None:
+    record: Dict[str, Any] = {
+        "name": name,
+        "tool_call_id": call_id,
+        "arguments": arguments,
+        "result": result,
+        "status": status,
+    }
+    if error:
+        record["error"] = error
+    from crane.mcp_runtime import redact
+    observed.append(redact(record))
+
+
 async def _invoke_ollama_with_tools(
     user_input: str,
     tools: List[Any],
     env: Optional[Mapping[str, str]] = None,
     system_prompt: str = "",
     messages: Optional[List[Dict[str, str]]] = None,
+    *,
+    max_tool_rounds: Optional[int] = None,
+    max_tool_calls: Optional[int] = None,
+    max_tool_output_chars: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run a bounded Ollama tool loop using real LangChain MCP tools."""
-    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-
-    from crane.mcp_runtime import redact
+    from langchain_core.messages import AIMessage, ToolMessage
 
     config = load_ollama_config(env)
     preflight_ollama(config)
@@ -583,6 +694,10 @@ async def _invoke_ollama_with_tools(
             "The configured Ollama model could not bind the discovered MCP tools.",
         ) from exc
 
+    rounds = _bounded_tool_count(max_tool_rounds, MAX_TOOL_ROUNDS, MAX_TOOL_ROUNDS, "max_tool_rounds")
+    call_limit = _bounded_tool_count(max_tool_calls, MAX_TOOL_CALLS_PER_TASK, MAX_TOOL_CALLS_PER_TASK, "max_tool_calls")
+    result_limit = _bounded_tool_count(max_tool_output_chars, MAX_TOOL_OUTPUT_CHARS, MAX_TOOL_OUTPUT_CHARS, "max_tool_output_chars")
+
     default_system = (
         "You are CRANE, a headless execution agent. Use the provided MCP tools "
         "when a task requires a tool action. When a tool is used, base the final "
@@ -590,22 +705,53 @@ async def _invoke_ollama_with_tools(
     )
     prompt = system_prompt.strip() or default_system
     convo: List[Any] = _build_messages(user_input, system_prompt=prompt, messages=messages)
-    # _build_messages returns a full message list; use it directly.
-    messages = convo
     observed: List[Dict[str, Any]] = []
-    for _ in range(MAX_TOOL_ROUNDS):
+    used_call_ids: set[str] = set()
+    calls_executed = 0
+
+    for round_index in range(rounds):
         try:
-            response = await asyncio.to_thread(bound_model.invoke, messages)
+            # Non-streaming invoke keeps tool_calls and content in one final AIMessage.
+            response = await asyncio.to_thread(bound_model.invoke, convo, stream=False)
         except Exception as exc:  # noqa: BLE001 - provider errors must be actionable
             raise ProviderError(
                 "provider_invocation_failed",
                 f"The configured Ollama model {config.model!r} did not complete the tool workflow.",
             ) from exc
-        calls = list(getattr(response, "tool_calls", None) or [])
+
+        raw_calls = _extract_tool_calls(response)
+        prepared_calls: List[Tuple[str, Dict[str, Any]]] = []
+        message_calls: List[Dict[str, Any]] = []
+        for index, raw_call in enumerate(raw_calls):
+            call = dict(raw_call)
+            raw_id = str(call.get("id") or "").strip()
+            call_id = raw_id or f"call-{round_index + 1}-{index + 1}"
+            candidate = call_id
+            suffix = 2
+            while candidate in used_call_ids:
+                candidate = f"{call_id}-{suffix}"
+                suffix += 1
+            call_id = candidate
+            used_call_ids.add(call_id)
+            call["id"] = call_id
+            prepared_calls.append((call_id, call))
+            # LangChain requires dictionary args in AIMessage.tool_calls; pass
+            # malformed/serialized args through to the execution parser instead.
+            message_args: Dict[str, Any] = {}
+            try:
+                message_args = _parse_tool_arguments(call.get("args"))
+            except (TypeError, ValueError):
+                pass
+            message_calls.append({
+                "id": call_id,
+                "name": str(call.get("name") or "invalid_tool_call"),
+                "args": message_args,
+            })
+
         content = getattr(response, "content", "")
-        content_text = _tool_output_text(content) if content is not None else ""
-        messages.append(AIMessage(content=content_text, tool_calls=calls))
-        if not calls:
+        content_text = _content_to_text(content) if content is not None else ""
+        convo.append(AIMessage(content=content_text, tool_calls=message_calls))
+        if not prepared_calls:
             if not content_text.strip():
                 raise ProviderError("provider_empty_response", "The configured model returned an empty response.")
             return {
@@ -617,28 +763,67 @@ async def _invoke_ollama_with_tools(
                 "tool_calls": observed,
             }
 
-        for call in calls:
-            name = str(call.get("name") or "")
-            args = call.get("args") or {}
-            call_id = str(call.get("id") or name)
-            tool = next((item for item in tools if getattr(item, "name", None) == name), None)
+        if calls_executed + len(prepared_calls) > call_limit:
+            raise ProviderError(
+                "tool_call_limit",
+                f"The model exceeded the bounded MCP tool call limit ({MAX_TOOL_CALLS_PER_TASK}).",
+            )
+
+        for call_id, call in prepared_calls:
+            calls_executed += 1
+            name = str(call.get("name") or "").strip()
+            tool, resolve_error = _resolve_tool(name, tools)
             if tool is None:
-                tool_text = f"MCP tool {name!r} is not available"
-                messages.append(ToolMessage(content=tool_text, tool_call_id=call_id, status="error"))
-                observed.append(redact({"name": name, "arguments": args, "result": tool_text}))
+                error_text = resolve_error or "MCP tool call failed"
+                convo.append(ToolMessage(content=error_text, tool_call_id=call_id, status="error"))
+                _append_observed_call(
+                    observed,
+                    name=name,
+                    call_id=call_id,
+                    arguments={},
+                    result=error_text,
+                    status="failed",
+                    error=error_text,
+                )
                 continue
             try:
-                raw_output = await tool.ainvoke(args)
-                tool_text = _tool_output_text(raw_output)
-                messages.append(ToolMessage(content=tool_text, tool_call_id=call_id))
+                arguments = _parse_tool_arguments(call.get("args"))
+            except (TypeError, ValueError) as exc:
+                error_text = str(exc)
+                convo.append(ToolMessage(content=error_text, tool_call_id=call_id, status="error"))
+                _append_observed_call(
+                    observed,
+                    name=name,
+                    call_id=call_id,
+                    arguments={},
+                    result=error_text,
+                    status="failed",
+                    error=error_text,
+                )
+                continue
+            try:
+                raw_output = await tool.ainvoke(arguments)
+                tool_text = _bounded_tool_result(raw_output, result_limit)
             except Exception:  # noqa: BLE001 - never leak transport internals to the model
                 tool_text = "MCP tool call failed"
-                messages.append(ToolMessage(content=tool_text, tool_call_id=call_id, status="error"))
-            observed.append(redact({"name": name, "arguments": args, "result": tool_text}))
+            status, error = _classify_tool_result(tool_text)
+            if status == "succeeded":
+                convo.append(ToolMessage(content=tool_text, tool_call_id=call_id))
+            else:
+                convo.append(ToolMessage(content=tool_text, tool_call_id=call_id, status="error"))
+            _append_observed_call(
+                observed,
+                name=name,
+                call_id=call_id,
+                arguments=arguments,
+                result=tool_text,
+                status=status,
+                error=error,
+            )
 
     raise ProviderError(
         "tool_loop_limit",
-        f"The model exceeded the bounded MCP tool loop ({MAX_TOOL_ROUNDS} rounds).",
+        f"The model exceeded the bounded MCP tool loop ({rounds} rounds).",
     )
 
 

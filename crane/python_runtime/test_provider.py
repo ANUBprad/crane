@@ -13,9 +13,11 @@ import os
 import sys
 import types
 import unittest
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from unittest.mock import patch
 from urllib.error import URLError
+
+from langchain_core.messages import AIMessage, ToolMessage
 
 from crane.python_runtime import provider, workflow_engine
 
@@ -76,6 +78,52 @@ def reset_fake_chat() -> None:
     FakeChatOllama.calls = []
     FakeChatOllama.answer = "Mocked Ollama answer"
     FakeChatOllama.failure = None
+
+
+class FakeTool:
+    def __init__(self, name: str, result: Any = None, error: Optional[Exception] = None) -> None:
+        self.name = name
+        self.result = {"ok": True} if result is None else result
+        self.error = error
+        self.calls: List[Dict[str, Any]] = []
+
+    async def ainvoke(self, arguments: Dict[str, Any]) -> Any:
+        self.calls.append(arguments)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class FakeToolResponse:
+    def __init__(
+        self,
+        content: str = "",
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        additional_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.content = content
+        self.tool_calls = tool_calls
+        self.additional_kwargs = additional_kwargs or {}
+
+
+class FakeBoundChat:
+    def __init__(self, responses: List[FakeToolResponse]) -> None:
+        self.responses = list(responses)
+        self.invocations: List[tuple[List[Any], Dict[str, Any]]] = []
+
+    def invoke(self, messages: List[Any], **kwargs: Any) -> FakeToolResponse:
+        self.invocations.append((list(messages), dict(kwargs)))
+        return self.responses.pop(0)
+
+
+class FakeToolChat:
+    def __init__(self, responses: List[FakeToolResponse]) -> None:
+        self.bound = FakeBoundChat(responses)
+        self.bound_tools: List[Any] = []
+
+    def bind_tools(self, tools: List[Any]) -> FakeBoundChat:
+        self.bound_tools = list(tools)
+        return self.bound
 
 
 class ProviderConfigurationTests(unittest.TestCase):
@@ -243,6 +291,197 @@ class ProviderInvocationTests(unittest.TestCase):
         self.assertEqual(result["provider"], "local")
         self.assertIsNone(result["model_output"])
         self.assertIn("deterministic workflow output only", result["notice"])
+
+
+class ProviderToolLoopTests(unittest.TestCase):
+    def run_loop(
+        self,
+        responses: List[FakeToolResponse],
+        tools: List[FakeTool],
+        **kwargs: Any,
+    ) -> tuple[Dict[str, Any], FakeToolChat]:
+        chat = FakeToolChat(responses)
+        with patch.dict(os.environ, OLLAMA_ENV, clear=True), \
+                patch.object(provider.urllib.request, "urlopen", return_value=tags_response("crane-test:latest")), \
+                patch.object(provider, "_create_chat_model", return_value=chat):
+            result = asyncio.run(provider.invoke_with_tools("run tool", tools, **kwargs))
+        return result, chat
+
+    def test_successful_call_delivers_arguments_and_follows_up_with_tool_result(self) -> None:
+        tool = FakeTool("probe_tool_probe", {"probe": "TOOL_CALL_OK", "value": "TOOL_CALL_OK"})
+        responses = [
+            FakeToolResponse(tool_calls=[{
+                "id": "call-1",
+                "name": "probe_tool_probe",
+                "args": '{"value": "TOOL_CALL_OK"}',
+            }]),
+            FakeToolResponse("Tool result processed."),
+        ]
+        result, chat = self.run_loop(responses, [tool])
+
+        self.assertEqual(tool.calls, [{"value": "TOOL_CALL_OK"}])
+        self.assertEqual(result["model_output"], "Tool result processed.")
+        self.assertEqual(result["execution_mode"], "langchain_ollama_mcp")
+        self.assertEqual(len(result["tool_calls"]), 1)
+        observed = result["tool_calls"][0]
+        self.assertEqual(observed["status"], "succeeded")
+        self.assertEqual(observed["tool_call_id"], "call-1")
+        self.assertEqual(observed["arguments"], {"value": "TOOL_CALL_OK"})
+        self.assertIn("TOOL_CALL_OK", observed["result"])
+
+        self.assertEqual(len(chat.bound.invocations), 2)
+        self.assertTrue(all(kwargs.get("stream") is False for _, kwargs in chat.bound.invocations))
+        second_messages = chat.bound.invocations[1][0]
+        tool_messages = [message for message in second_messages if isinstance(message, ToolMessage)]
+        self.assertEqual(len(tool_messages), 1)
+        self.assertEqual(tool_messages[0].tool_call_id, "call-1")
+        self.assertIn("TOOL_CALL_OK", str(tool_messages[0].content))
+        assistant_messages = [message for message in second_messages if isinstance(message, AIMessage)]
+        self.assertTrue(any(message.tool_calls for message in assistant_messages))
+
+    def test_unprefixed_tool_name_resolves_to_unique_registered_tool(self) -> None:
+        tool = FakeTool("probe_tool_probe", {"invoked": True})
+        responses = [
+            FakeToolResponse(tool_calls=[{"id": "raw-1", "name": "tool_probe", "args": {"value": "TOOL_CALL_OK"}}]),
+            FakeToolResponse("Done"),
+        ]
+        result, _ = self.run_loop(responses, [tool])
+        self.assertEqual(tool.calls, [{"value": "TOOL_CALL_OK"}])
+        self.assertEqual(result["tool_calls"][0]["name"], "tool_probe")
+        self.assertEqual(result["tool_calls"][0]["status"], "succeeded")
+
+    def test_additional_kwargs_tool_calls_are_parsed(self) -> None:
+        tool = FakeTool("probe_tool_probe", {"ok": True})
+        responses = [
+            FakeToolResponse(tool_calls=None, additional_kwargs={"tool_calls": [{
+                "id": "legacy-1",
+                "function": {"name": "probe_tool_probe", "arguments": '{"value": "legacy"}'},
+            }]}),
+            FakeToolResponse("Done"),
+        ]
+        result, _ = self.run_loop(responses, [tool])
+        self.assertEqual(tool.calls, [{"value": "legacy"}])
+        self.assertEqual(result["tool_calls"][0]["tool_call_id"], "legacy-1")
+
+    def test_multiple_tool_calls_are_executed_and_correlated(self) -> None:
+        tool = FakeTool("probe_tool_probe", {"ok": True})
+        responses = [
+            FakeToolResponse(tool_calls=[
+                {"id": "multi-1", "name": "probe_tool_probe", "args": {"value": "one"}},
+                {"id": "multi-2", "name": "probe_tool_probe", "args": {"value": "two"}},
+            ]),
+            FakeToolResponse("Both tools completed."),
+        ]
+        result, chat = self.run_loop(responses, [tool])
+
+        self.assertEqual(tool.calls, [{"value": "one"}, {"value": "two"}])
+        self.assertEqual([call["status"] for call in result["tool_calls"]], ["succeeded", "succeeded"])
+        tool_messages = [message for message in chat.bound.invocations[1][0] if isinstance(message, ToolMessage)]
+        self.assertEqual([message.tool_call_id for message in tool_messages], ["multi-1", "multi-2"])
+
+    def test_unknown_tool_and_invalid_arguments_are_reported_as_failures(self) -> None:
+        tool = FakeTool("probe_tool_probe", {"ok": True})
+        responses = [
+            FakeToolResponse(tool_calls=[
+                {"id": "bad-1", "name": "missing_tool", "args": {"value": "x"}},
+                {"id": "bad-2", "name": "probe_tool_probe", "args": "[]"},
+            ]),
+            FakeToolResponse("Recovered from failed tool calls."),
+        ]
+        result, chat = self.run_loop(responses, [tool])
+
+        self.assertEqual(tool.calls, [])
+        self.assertEqual([call["status"] for call in result["tool_calls"]], ["failed", "failed"])
+        self.assertEqual(result["tool_calls"][0]["error"], "MCP tool 'missing_tool' is not available")
+        self.assertEqual(result["tool_calls"][1]["error"], "tool arguments must be a JSON object")
+        tool_messages = [message for message in chat.bound.invocations[1][0] if isinstance(message, ToolMessage)]
+        self.assertEqual([message.status for message in tool_messages], ["error", "error"])
+
+    def test_tool_exception_does_not_fabricate_a_result(self) -> None:
+        tool = FakeTool("probe_tool_probe", error=RuntimeError("secret transport detail"))
+        responses = [
+            FakeToolResponse(tool_calls=[{"id": "exc-1", "name": "probe_tool_probe", "args": {}}]),
+            FakeToolResponse("Tool failed."),
+        ]
+        result, chat = self.run_loop(responses, [tool])
+
+        self.assertEqual(len(tool.calls), 1)
+        observed = result["tool_calls"][0]
+        self.assertEqual(observed["status"], "failed")
+        self.assertEqual(observed["result"], "MCP tool call failed")
+        self.assertNotIn("secret transport detail", json.dumps(result))
+        tool_message = next(message for message in chat.bound.invocations[1][0] if isinstance(message, ToolMessage))
+        self.assertEqual(tool_message.status, "error")
+
+    def test_approval_blocked_tool_result_is_not_reported_as_success(self) -> None:
+        tool = FakeTool("probe_tool_probe", "MCP tool failed: This tool requires explicit approval for this exact action")
+        responses = [
+            FakeToolResponse(tool_calls=[{"id": "blocked-1", "name": "probe_tool_probe", "args": {}}]),
+            FakeToolResponse("Approval required."),
+        ]
+        result, chat = self.run_loop(responses, [tool])
+
+        observed = result["tool_calls"][0]
+        self.assertEqual(observed["status"], "blocked")
+        self.assertEqual(observed["error"], "approval_required")
+        tool_message = next(message for message in chat.bound.invocations[1][0] if isinstance(message, ToolMessage))
+        self.assertEqual(tool_message.status, "error")
+
+    def test_malformed_tool_call_and_empty_response_are_handled(self) -> None:
+        responses = [
+            FakeToolResponse(tool_calls=[{}, {"name": ""}]),
+            FakeToolResponse("Recovered."),
+        ]
+        result, _ = self.run_loop(responses, [])
+
+        self.assertEqual(len(result["tool_calls"]), 2)
+        self.assertTrue(all(call["status"] == "failed" for call in result["tool_calls"]))
+        self.assertEqual(result["tool_calls"][0]["error"], "Malformed tool call response")
+
+        with patch.dict(os.environ, OLLAMA_ENV, clear=True), \
+                patch.object(provider.urllib.request, "urlopen", return_value=tags_response("crane-test:latest")), \
+                patch.object(provider, "_create_chat_model", return_value=FakeToolChat([FakeToolResponse("")])):
+            with self.assertRaises(provider.ProviderError) as raised:
+                asyncio.run(provider.invoke_with_tools("run tool", []))
+        self.assertEqual(raised.exception.code, "provider_empty_response")
+
+    def test_tool_result_is_bounded(self) -> None:
+        tool = FakeTool("probe_tool_probe", "x" * 50_000)
+        responses = [
+            FakeToolResponse(tool_calls=[{"id": "large-1", "name": "probe_tool_probe", "args": {}}]),
+            FakeToolResponse("Done"),
+        ]
+        result, chat = self.run_loop(responses, [tool], max_tool_output_chars=1000)
+
+        observed_result = result["tool_calls"][0]["result"]
+        self.assertLessEqual(len(observed_result), 1020)
+        self.assertIn("[truncated]", observed_result)
+        tool_message = next(message for message in chat.bound.invocations[1][0] if isinstance(message, ToolMessage))
+        self.assertLessEqual(len(str(tool_message.content)), 1020)
+
+    def test_max_tool_iterations_and_call_budget_are_enforced(self) -> None:
+        tool = FakeTool("probe_tool_probe", {"ok": True})
+        repeated_call = FakeToolResponse(tool_calls=[
+            {"id": "loop-1", "name": "probe_tool_probe", "args": {}},
+        ])
+        with patch.dict(os.environ, OLLAMA_ENV, clear=True), \
+                patch.object(provider.urllib.request, "urlopen", return_value=tags_response("crane-test:latest")), \
+                patch.object(provider, "_create_chat_model", return_value=FakeToolChat([repeated_call])):
+            with self.assertRaises(provider.ProviderError) as rounds_error:
+                asyncio.run(provider.invoke_with_tools("run tool", [tool], max_tool_rounds=1))
+        self.assertEqual(rounds_error.exception.code, "tool_loop_limit")
+
+        two_calls = FakeToolResponse(tool_calls=[
+            {"id": "budget-1", "name": "probe_tool_probe", "args": {}},
+            {"id": "budget-2", "name": "probe_tool_probe", "args": {}},
+        ])
+        with patch.dict(os.environ, OLLAMA_ENV, clear=True), \
+                patch.object(provider.urllib.request, "urlopen", return_value=tags_response("crane-test:latest")), \
+                patch.object(provider, "_create_chat_model", return_value=FakeToolChat([two_calls])):
+            with self.assertRaises(provider.ProviderError) as call_error:
+                asyncio.run(provider.invoke_with_tools("run tool", [tool], max_tool_calls=1))
+        self.assertEqual(call_error.exception.code, "tool_call_limit")
+        self.assertEqual(len(tool.calls), 1)
 
 
 class WorkflowIntegrationTests(unittest.TestCase):
