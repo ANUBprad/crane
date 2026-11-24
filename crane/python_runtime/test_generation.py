@@ -341,6 +341,72 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.ws / "app" / "main.py").exists())
         self.assertTrue(result.get("checkpoint") or result.get("result"))
 
+    async def test_generation_intent_without_workspace_fails_honestly(self):
+        with mock.patch("crane.python_runtime.protocol.write_stdout"):
+            result = await workflow_engine.execute_task(
+                "Create a Python project with tests and repair any failures",
+                task_id="gen-missing-workspace",
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result.get("execution_status"), "failed")
+        payload = result.get("result") or {}
+        self.assertNotEqual(payload.get("execution_status"), "fully_completed")
+        self.assertEqual(payload.get("plan"), [])
+        reason = result.get("failure_reason") or ""
+        self.assertIn("--workspace", reason)
+        self.assertIn("No files were created", reason)
+
+    async def test_generation_intent_with_workspace_reaches_generation_plan(self):
+        state = workflow_engine.WorkflowState(
+            task_id="gen-dispatch", user_input="Create a Python project with tests and repair failures", workspace=str(self.ws),
+        )
+        with mock.patch("crane.python_runtime.protocol.write_stdout"):
+            normalized = await workflow_engine.node_normalize(workflow_engine.state_to_checkpoint(state))
+            planned = await workflow_engine.node_plan(normalized)
+        planned_state = workflow_engine._as_state(planned)
+        step_ids = [step.step_id for step in planned_state.plan]
+        for expected in ("analyze_requirements", "generate_files", "validate_project", "repair_project"):
+            self.assertIn(expected, step_ids)
+        self.assertNotIn("respond", step_ids)
+        self.assertTrue(planned_state.generation.get("enabled"))
+
+    async def test_generation_completion_requires_file_and_validation_evidence(self):
+        (self.ws / "README.md").write_text("# verified\n", encoding="utf-8")
+        applied = [{"path": "README.md", "operation": "write", "status": "written", "bytes": 10}]
+        validation = {"name": "pytest", "status": "succeeded", "exit_code": 0, "stdout": "1 passed"}
+
+        def state_with(records, validations):
+            state = workflow_engine.WorkflowState(
+                task_id="gen-evidence", user_input="Create a Python project with tests", workspace=str(self.ws),
+            )
+            state.generation["enabled"] = True
+            state.generation["applied"] = records
+            state.generation["validation_results"] = validations
+            state.plan = [workflow_engine.PlanStep(
+                step_id="respond", description="respond", expected_outcome="respond", status="completed",
+            )]
+            state.completed_steps = ["respond"]
+            state.evaluation_results = [workflow_engine.EvaluationResult(
+                step_id="respond", outcome="completed", summary="model said done",
+            )]
+            return state
+
+        async def verify(state):
+            with mock.patch("crane.python_runtime.protocol.write_stdout"):
+                result = await workflow_engine.node_verify(workflow_engine.state_to_checkpoint(state))
+            return workflow_engine._as_state(result)
+
+        without_evidence = await verify(state_with([], []))
+        self.assertNotEqual(without_evidence.execution_status, workflow_engine.ExecutionStatus.FULLY_COMPLETED.value)
+        self.assertIn("workspace", (without_evidence.failure_reason or "").lower())
+
+        without_validation = await verify(state_with(applied, []))
+        self.assertNotEqual(without_validation.execution_status, workflow_engine.ExecutionStatus.FULLY_COMPLETED.value)
+        self.assertIn("validation", (without_validation.failure_reason or "").lower())
+
+        with_evidence = await verify(state_with(applied, [validation]))
+        self.assertEqual(with_evidence.execution_status, workflow_engine.ExecutionStatus.FULLY_COMPLETED.value)
+
     async def test_generation_task_applies_with_approval_grant(self):
         # Pre-grant approvals by passing through checkpoint-like resume is complex; instead test module directly.
         spec = gen._default_generation_spec if False else None

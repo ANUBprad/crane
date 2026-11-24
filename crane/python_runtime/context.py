@@ -142,7 +142,7 @@ def build_runtime_context(
 
     # GitHub auth capability is reported based on actual command availability in CLI, not assumed.
     not_implemented.append("GitHub Device Flow authentication (unless auth commands are implemented in this build)")
-    not_implemented.append("Application/project generation workflow (unless generation tools/commands are implemented in this build)")
+    available.append("Workspace-authorized project generation with staged file writes, allowlisted validation, and bounded repair")
 
     limitations = [
         "Responses must be grounded in actual runtime state and tool results.",

@@ -275,21 +275,85 @@ func runTaskCreate(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func runTaskPrompt(args []string, stdout, stderr io.Writer) error {
+type taskSubmitter interface {
+	CreateTaskWithContext(ctx context.Context, id, input, conversationID string, messages []localclient.ConversationMessage, workspace string) (persistence.TaskRecord, error)
+}
+
+func submitTask(ctx context.Context, submitter taskSubmitter, id, input, workspace string) (persistence.TaskRecord, error) {
+	return submitter.CreateTaskWithContext(ctx, id, input, "", nil, workspace)
+}
+
+// normalizeFlagArgs lets task text remain the primary positional argument while
+// still accepting flags such as --workspace on either side of it.
+func normalizeFlagArgs(args []string, valueFlags, boolFlags []string) []string {
+	values := make(map[string]bool, len(valueFlags))
+	for _, name := range valueFlags {
+		values[name] = true
+	}
+	bools := make(map[string]bool, len(boolFlags))
+	for _, name := range boolFlags {
+		bools[name] = true
+	}
+
+	flags := make([]string, 0, len(args))
+	positional := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			positional = append(positional, arg)
+			continue
+		}
+		name := strings.TrimLeft(arg, "-")
+		if index := strings.Index(name, "="); index >= 0 {
+			name = name[:index]
+		}
+		switch {
+		case values[name]:
+			flags = append(flags, arg)
+			if !strings.Contains(arg, "=") && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		case bools[name]:
+			flags = append(flags, arg)
+		default:
+			positional = append(positional, arg)
+		}
+	}
+	return append(flags, positional...)
+}
+
+type runArgs struct {
+	input     string
+	workspace string
+	mode      outputMode
+}
+
+func parseRunArgs(args []string) (runArgs, error) {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	output := flags.String("output", "text", "output mode: text or json")
-	if err := flags.Parse(args); err != nil {
-		return err
+	workspace := flags.String("workspace", "", "Authorized workspace directory for file-creation and repair tasks")
+	if err := flags.Parse(normalizeFlagArgs(args, []string{"output", "workspace"}, nil)); err != nil {
+		return runArgs{}, err
 	}
 	mode, err := parseOutputMode(*output)
 	if err != nil {
-		return err
+		return runArgs{}, err
 	}
 	input := strings.TrimSpace(strings.Join(flags.Args(), " "))
 	if input == "" {
-		return errors.New("run requires task text")
+		return runArgs{}, errors.New("run requires task text")
 	}
+	return runArgs{input: input, workspace: strings.TrimSpace(*workspace), mode: mode}, nil
+}
+
+func runTaskPrompt(args []string, stdout, stderr io.Writer) error {
+	parsed, err := parseRunArgs(args)
+	if err != nil {
+		return err
+	}
+	input, workspace, mode := parsed.input, parsed.workspace, parsed.mode
 	if err := runtimeenv.EnsureDataDirectories(); err != nil {
 		return err
 	}
@@ -321,7 +385,7 @@ func runTaskPrompt(args []string, stdout, stderr io.Writer) error {
 	healthCancel()
 
 	submitCtx, submitCancel := context.WithTimeout(ctx, 30*time.Second)
-	created, err := client.CreateTask(submitCtx, id, input)
+	created, err := submitTask(submitCtx, client, id, input, workspace)
 	submitCancel()
 	if err != nil {
 		return err
@@ -362,7 +426,7 @@ func runCreate(args []string, stdout, stderr io.Writer) error {
 	workspace := flags.String("workspace", "", "Authorized workspace directory for generated project files")
 	planOnly := flags.Bool("plan-only", false, "Plan the generation task without applying file changes")
 	output := flags.String("output", "text", "output mode: text or json")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.Parse(normalizeFlagArgs(args, []string{"workspace", "output"}, []string{"plan-only"})); err != nil {
 		return errors.New("usage: agent create \"<objective>\" --workspace <dir>")
 	}
 	mode, err := parseOutputMode(*output)
@@ -412,7 +476,7 @@ func runCreate(args []string, stdout, stderr io.Writer) error {
 
 	fmt.Fprintf(stderr, "workspace: %s\n", *workspace)
 	submitCtx, submitCancel := context.WithTimeout(ctx, 30*time.Second)
-	created, err := client.CreateTaskWithContext(submitCtx, id, objective, "", nil, *workspace)
+	created, err := submitTask(submitCtx, client, id, objective, *workspace)
 	submitCancel()
 	if err != nil {
 		return err

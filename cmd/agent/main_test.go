@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"crane/internal/localclient"
+	"crane/persistence"
 )
 
 func TestRunAPITokenLifecycleAndTaskCreate(t *testing.T) {
@@ -122,6 +126,43 @@ func TestLifecycleCommandsRejectUnsafeDataRemoval(t *testing.T) {
 	}
 	if err := run([]string{"run"}, &out, &errOut); err == nil {
 		t.Fatal("run accepted empty task text")
+	}
+}
+
+type recordingTaskSubmitter struct {
+	workspace string
+	input     string
+}
+
+func (r *recordingTaskSubmitter) CreateTaskWithContext(_ context.Context, _, input, _ string, _ []localclient.ConversationMessage, workspace string) (persistence.TaskRecord, error) {
+	r.input = input
+	r.workspace = workspace
+	return persistence.TaskRecord{ID: "task-workspace", Status: "queued"}, nil
+}
+
+func TestRunSubmitsAuthorizedWorkspaceForActionTasks(t *testing.T) {
+	workspace := t.TempDir()
+	objective := "Create a Python project with tests and repair any failures"
+	parsed, err := parseRunArgs([]string{objective, "--workspace", workspace})
+	if err != nil {
+		t.Fatalf("parseRunArgs() error = %v", err)
+	}
+	if parsed.input != objective {
+		t.Fatalf("input = %q, want %q", parsed.input, objective)
+	}
+	if parsed.workspace != workspace {
+		t.Fatalf("workspace = %q, want %q", parsed.workspace, workspace)
+	}
+
+	submitter := &recordingTaskSubmitter{}
+	if _, err := submitTask(context.Background(), submitter, "task-workspace", parsed.input, parsed.workspace); err != nil {
+		t.Fatalf("submitTask() error = %v", err)
+	}
+	if submitter.workspace != workspace {
+		t.Fatalf("submitted workspace = %q, want %q", submitter.workspace, workspace)
+	}
+	if submitter.input != objective {
+		t.Fatalf("submitted input = %q, want %q", submitter.input, objective)
 	}
 }
 

@@ -332,18 +332,70 @@ GENERATION_INTENT_RE = re.compile(
 )
 
 
-def _is_generation_task(state: WorkflowState) -> bool:
-    if state.generation.get("enabled"):
-        return True
-    if not state.workspace:
-        return False
+def _has_generation_intent(state: WorkflowState) -> bool:
     obj = state.objective or state.user_input or ""
-    if GENERATION_INTENT_RE.search(obj):
+    return bool(GENERATION_INTENT_RE.search(obj)) or state.runtime_context.get("task_kind") == "create"
+
+
+def _is_generation_task(state: WorkflowState) -> bool:
+    return bool(state.generation.get("enabled") or _has_generation_intent(state))
+
+
+def _require_generation_workspace(state: WorkflowState) -> bool:
+    if not _is_generation_task(state) or state.workspace:
         return True
-    # Explicit create-style commands often come through agent create with workspace.
-    if state.runtime_context.get("task_kind") == "create":
-        return True
+    failure = (
+        "This objective requires file creation or repair, but no authorized workspace was supplied. "
+        "Re-run with `agent run --workspace <dir>` or `agent create --workspace <dir>`. No files were created."
+    )
+    _mark_terminal(state, ExecutionStatus.FAILED, "Authorized workspace required", failure)
+    state.current_step = "workspace_required"
+    _event(state.task_id, "task_failed", {"error": failure})
+    _persist_task_state(state)
     return False
+
+
+def _generation_evidence_error(state: WorkflowState) -> Optional[str]:
+    """Return why a generation task cannot be reported as fully completed."""
+    if state.generation.get("plan_only"):
+        return None
+
+    applied = state.generation.get("applied")
+    if not isinstance(applied, list) or not applied:
+        return "No generated files were applied to the authorized workspace."
+
+    try:
+        workspace = gen.canonicalize_workspace(state.workspace)
+    except Exception as exc:  # noqa: BLE001
+        return f"The authorized workspace is no longer valid: {exc}"
+
+    saw_applied_file = False
+    for record in applied:
+        if not isinstance(record, dict):
+            continue
+        path = record.get("path")
+        operation = record.get("operation")
+        status = record.get("status")
+        if not isinstance(path, str):
+            continue
+        try:
+            target = gen.validate_relative_path(workspace, path)
+        except Exception:  # noqa: BLE001
+            continue
+        if operation == "write" and status == "written" and target.is_file():
+            saw_applied_file = True
+        elif operation == "delete" and status in {"deleted", "missing"} and not target.exists():
+            saw_applied_file = True
+    if not saw_applied_file:
+        return "No applied file could be verified in the authorized workspace."
+
+    validations = state.generation.get("validation_results")
+    if not isinstance(validations, list):
+        return "No validation command output was recorded."
+    for record in validations:
+        if isinstance(record, dict) and record.get("status") == "succeeded" and "exit_code" in record:
+            return None
+    return "No successful allowlisted validation command output was recorded."
 
 
 def _default_generation_plan(state: WorkflowState) -> List[PlanStep]:
@@ -662,6 +714,9 @@ async def node_normalize(raw: Dict[str, Any]) -> Dict[str, Any]:
         "max_model_context_chars": MAX_MODEL_CONTEXT_CHARS,
     })
 
+    if not _require_generation_workspace(state):
+        return state_to_checkpoint(state)
+
     if state.workspace:
         try:
             ws = gen.canonicalize_workspace(state.workspace)
@@ -781,6 +836,8 @@ async def node_plan(raw: Dict[str, Any]) -> Dict[str, Any]:
         _mark_terminal(state, ExecutionStatus.FAILED, "Task exceeded graph step limit during planning", f"Exceeded maximum graph steps ({MAX_GRAPH_STEPS})")
         _persist_task_state(state)
         return state_to_checkpoint(state)
+    if not _require_generation_workspace(state):
+        return state_to_checkpoint(state)
 
     manager = _get_manager(state.task_id)
     tools_by_name = _tool_index(manager)
@@ -795,7 +852,8 @@ async def node_plan(raw: Dict[str, Any]) -> Dict[str, Any]:
         _persist_task_state(state)
         return state_to_checkpoint(state)
 
-    if _is_generation_task(state):
+    generation_task = _is_generation_task(state)
+    if generation_task:
         state.generation["enabled"] = True
         state.generation["status"] = "planned"
         state.generation["workspace"] = state.workspace
@@ -808,7 +866,7 @@ async def node_plan(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     ok, err = _validate_plan(state, plan, tools_by_name)
     if not ok:
-        repaired = _default_plan(state.objective, tools_by_name)
+        repaired = _default_generation_plan(state) if generation_task else _default_plan(state.objective, tools_by_name)
         ok2, err2 = _validate_plan(state, repaired, tools_by_name)
         if not ok2:
             _mark_terminal(state, ExecutionStatus.FAILED, "Planner produced an invalid plan", err2 or err)
@@ -1870,7 +1928,7 @@ async def node_recover(raw: Dict[str, Any]) -> Dict[str, Any]:
             # simple replan: keep completed steps, rebuild remaining from default planner
             manager = _get_manager(state.task_id)
             tools_by_name = _tool_index(manager)
-            new_tail = _default_plan(state.objective, tools_by_name)
+            new_tail = _default_generation_plan(state) if _is_generation_task(state) else _default_plan(state.objective, tools_by_name)
             # avoid duplicate step IDs
             existing = {s.step_id for s in state.plan}
             rebuilt: List[PlanStep] = [s for s in state.plan if s.status == "completed"]
@@ -1927,7 +1985,14 @@ async def node_verify(raw: Dict[str, Any]) -> Dict[str, Any]:
     else:
         # verify objective with evidence
         has_evidence = bool(state.tool_outputs) or bool(state.evaluation_results)
-        if not has_evidence and selected_provider() == "local" and any(s.required_tools for s in state.plan):
+        generation_evidence_error = None
+        if _is_generation_task(state):
+            generation_evidence_error = _generation_evidence_error(state)
+            if generation_evidence_error:
+                has_evidence = False
+        if generation_evidence_error:
+            _mark_terminal(state, ExecutionStatus.FAILED, "Generation could not be verified", generation_evidence_error)
+        elif not has_evidence and selected_provider() == "local" and any(s.required_tools for s in state.plan):
             _mark_terminal(state, ExecutionStatus.FAILED, "No verified evidence was produced", "Local mode could not execute required tools")
         else:
             _mark_terminal(state, ExecutionStatus.FULLY_COMPLETED, "Objective completed and verified", None)

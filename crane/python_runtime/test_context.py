@@ -15,6 +15,11 @@ class ContextTest(unittest.TestCase):
         ctx = build_runtime_context(user_input="hello", mcp_tools=[])
         self.assertIn("No MCP/external tools", ctx["system_prompt"])
 
+    def test_runtime_context_reports_generation_capability(self) -> None:
+        ctx = build_runtime_context(user_input="Create a project", mcp_tools=[])
+        self.assertTrue(any("project generation" in item.lower() for item in ctx["capabilities"]["available"]))
+        self.assertFalse(any("project generation" in item.lower() for item in ctx["capabilities"]["not_implemented"]))
+
 
 if __name__ == "__main__":
     unittest.main()
