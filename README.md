@@ -6,7 +6,7 @@
 
 CRANE runs as a local supervisor: it accepts tasks through a CLI or authenticated loopback API, executes bounded workflows through a Python/LangGraph runtime, invokes MCP tools under policy control, persists state in SQLite, and returns concise results. It is designed for local-first operation, not as a chatbot, RAG product, or dashboard.
 
-> **Project status:** working vertical slice with active hardening. Core task admission, Python/LangGraph execution, MCP stdio/Streamable HTTP tool integration, local Ollama execution, SQLite persistence, authenticated loopback API/SSE, approval gating, and Windows packaging scripts are implemented and exercised by tests and CI. CRANE is **not** production-ready: clean physical-machine Windows 10/11 x64 acceptance, Authenticode signing and publisher-authenticity verification, a controlled official release host/domain, and cross-environment reproducibility proof remain pending or external blockers.
+> **Project status:** working vertical slice with active hardening. Core task admission, Python/LangGraph execution, MCP stdio/Streamable HTTP tool integration, local Ollama execution, SQLite persistence, authenticated loopback API/SSE, approval gating, Windows packaging, SBOM generation, and cross-environment GitHub-hosted reproducibility are implemented and exercised by tests and CI. CRANE is **not** production-ready: clean physical-machine Windows 10/11 x64 acceptance, Authenticode signing and publisher-authenticity verification, a controlled official release host/domain, and GitHub Pages enablement remain pending or external blockers.
 
 ## What CRANE does
 
@@ -198,7 +198,7 @@ The following are intentionally **not** claimed as complete:
 - **Clean-machine Windows acceptance:** no verified clean Windows 10/11 x64 acceptance on machines without dev toolchains/repo dependencies.
 - **Authenticode/code signing:** manifests/artifacts are currently unsigned/unverified; checksum validation is not code-signature verification.
 - **Official release host:** no verified controlled official download domain/hosted release channel. Release source must be explicitly provided and controlled.
-- **Cross-environment reproducibility:** identical-input deterministic outputs are validated on this host; cross-environment/toolchain reproducibility is not proven.
+- **Cross-environment reproducibility:** `windows-2022` and `windows-2025` GitHub-hosted builds produced 7 byte-for-byte identical release artifacts; physical Windows 10/11 cross-machine evidence is still external.
 - **Packaged upgrade/rollback evidence:** best-effort packaged upgrade/rollback checks exist, but same-commit true upgrade/rollback proof may be environment-limited; report limitations explicitly.
 - **Production readiness:** external side-effect ambiguity, timeout/concurrency saturation, packaged non-idempotent replay prevention, and full clean-machine security acceptance remain active validation areas.
 

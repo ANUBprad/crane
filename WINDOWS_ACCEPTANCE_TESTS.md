@@ -66,7 +66,7 @@ Run on genuine clean Windows 10 x64 and Windows 11 x64 machines/VM images with n
 - [x] Remote `http(s)` release source is explicit opt-in (`CRANE_ALLOW_REMOTE_RELEASE_SOURCE=1`); no silent remote fallback.
 - [x] Same-host deterministic rebuild check script exists (`scripts/test-release-reproducibility.ps1`).
 - [x] Same-host reproducibility evidence recorded for current release candidate inputs.
-- [ ] Cross-environment reproducibility: `windows-2022` vs `windows-2025` comparison job added; first result pending on the next CI run.
+- [x] Cross-environment reproducibility: `windows-2022` vs `windows-2025` comparison passed in [45255583424](https://github.com/ANUBprad/crane/actions/runs/45255583424) (7 artifacts byte-for-byte identical).
 
 ## Evidence log template
 
