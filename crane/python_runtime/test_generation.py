@@ -261,6 +261,18 @@ class GenerationSafetyTests(unittest.TestCase):
         self.assertEqual(workflow_engine._normalize_repair_manifest(None), [])
         self.assertEqual(workflow_engine._normalize_repair_manifest({"path": "main.py"}), [])
 
+    def test_generated_file_content_decodes_literal_newlines_only_when_needed(self):
+        manifest = [
+            {"path": "main.py", "operation": "write", "content": "line1\\nline2"},
+            {"path": "notes.py", "operation": "write", "content": "line1\nline2"},
+            {"path": "text.txt", "operation": "write", "content": "line1\\nline2"},
+        ]
+        normalized = workflow_engine._normalize_generated_file_content(manifest)
+        self.assertEqual(normalized[0]["content"], "line1\nline2")
+        self.assertEqual(normalized[1]["content"], "line1\nline2")
+        self.assertEqual(normalized[2]["content"], "line1\\nline2")
+        self.assertEqual(manifest[0]["content"], "line1\\nline2")
+
     def test_validation_plan_accepts_pinned_pytest_command(self):
         commands = workflow_engine._normalize_validation_plan([{
             "name": "pytest",

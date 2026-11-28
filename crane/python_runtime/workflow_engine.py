@@ -1355,6 +1355,26 @@ def _normalize_repair_manifest(manifest: Any) -> List[Any]:
     return normalized
 
 
+def _normalize_generated_file_content(manifest: Any) -> List[Any]:
+    """Convert escaped newlines when a model wrote literal backslash-n text."""
+    if not isinstance(manifest, list):
+        return []
+    normalized: List[Any] = []
+    for item in manifest:
+        if not isinstance(item, dict):
+            normalized.append(item)
+            continue
+        content = item.get("content")
+        path = str(item.get("path") or "")
+        operation = str(item.get("operation") or "write").strip().lower()
+        if (operation == "write" and path.lower().endswith(".py")
+                and isinstance(content, str) and "\n" not in content and "\\n" in content):
+            item = dict(item)
+            item["content"] = content.replace("\\n", "\n")
+        normalized.append(item)
+    return normalized
+
+
 def _normalize_validation_plan(raw: Any) -> List[gen.ValidationCommand]:
     """Resolve safe commands while rejecting pytest selectors from model plans."""
     if not isinstance(raw, list):
@@ -1746,7 +1766,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                 "Use Python's standard-library sqlite3 directly and never add sqlite3 to requirements.txt. "
                 "Write tests that exercise health plus the CRUD lifecycle with TestClient. "
                 "Paths must be relative to the authorized workspace. No absolute paths, no .., no .git/env writes. "
-                "Python file content must use real newline characters encoded as \\n in JSON, never semicolon-separated statements; decorators and indented bodies must be on separate lines. "
+                "Python file content must contain real line breaks, never literal backslash-n sequences or semicolon-separated statements; decorators and indented bodies must be on separate lines. "
                 "Generate complete file contents, no placeholders. "
                 f"Specification: {json.dumps(spec, ensure_ascii=False)[:12000]}\n"
             )
@@ -1758,6 +1778,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
         if not isinstance(manifest, list) or not manifest:
             manifest = _default_generation_manifest(state, spec)
             state.generation.setdefault("validation_plan", [])
+        manifest = _normalize_generated_file_content(manifest)
         try:
             ops = gen.validate_file_operations(ws, manifest)
         except Exception as exc:  # noqa: BLE001
@@ -1886,7 +1907,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                     "For FastAPI tests use fastapi.testclient.TestClient(app); app.test_client() is Flask-only and is invalid. "
                     "Remove pytest_configure hooks that call addinivalue_line('pytest.ini', ...); they are invalid pytest configuration. "
                     "Remove stray top-level raise statements and placeholder marker strings from generated source; they are not part of the requested application. "
-                    "Python file content must use real newline characters encoded as \\n in JSON, never semicolon-separated statements; decorators and indented bodies must be on separate lines. "
+                    "Python file content must contain real line breaks, never literal backslash-n sequences or semicolon-separated statements; decorators and indented bodies must be on separate lines. "
                     "Never pin the standard-library sqlite3 module in requirements.txt. "
                     "Do not emit duplicate path entries; if a path repeats, only its final operation is applied, so prefer exactly one write with complete content. "
                     "For an assertion mismatch, change the production source to satisfy the expected behavior unless the test itself is invalid. "
@@ -1903,7 +1924,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                     repair_manifest = obj.get("files")
         if not repair_manifest:
             return {"status": "failed", "error": "Unable to generate repair plan; manual review required", "output": {"validation_results": results}}
-        repair_manifest = _normalize_repair_manifest(repair_manifest)
+        repair_manifest = _normalize_generated_file_content(_normalize_repair_manifest(repair_manifest))
         try:
             ops = gen.validate_file_operations(ws, repair_manifest)
         except Exception as exc:  # noqa: BLE001
