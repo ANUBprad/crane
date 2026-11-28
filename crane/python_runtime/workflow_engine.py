@@ -1448,7 +1448,7 @@ def _normalize_validation_plan(raw: Any) -> List[gen.ValidationCommand]:
     return commands
 
 
-async def _model_json(state: WorkflowState, prompt: str, system: str) -> Optional[Dict[str, Any]]:
+async def _model_json(state: WorkflowState, prompt: str, system: str, json_mode: bool = False) -> Optional[Dict[str, Any]]:
     if selected_provider() != "ollama":
         return None
     try:
@@ -1462,7 +1462,7 @@ async def _model_json(state: WorkflowState, prompt: str, system: str) -> Optiona
                 invoke_provider, prompt, None, system,
                 state.persistent_state.get("conversation_messages") or [],
                 state.runtime_context,
-                json_mode=True,
+                json_mode=json_mode,
             ),
             state.task_id,
         )
@@ -1972,7 +1972,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                     "Current generated workspace source (fresh disk reads, bounded and secret-redacted):\n"
                     f"{source_context}\n"
                 )
-                obj = await _model_json(state, prompt, "You produce strict JSON minimal repair file operations.")
+                obj = await _model_json(state, prompt, "You produce strict JSON minimal repair file operations.", json_mode=True)
                 if isinstance(obj, dict) and isinstance(obj.get("files"), list):
                     repair_manifest = obj.get("files")
         if not repair_manifest:
