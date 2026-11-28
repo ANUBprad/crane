@@ -1287,16 +1287,43 @@ def _consume_grant(state: WorkflowState, scope: str) -> bool:
 
 
 def _parse_model_json(text: str) -> Optional[Dict[str, Any]]:
+    """Extract the first balanced JSON object from a model response.
+
+    Models often wrap the requested object in Markdown fences and continue with
+    prose containing more braces. A greedy ``{.*}`` match spans those trailing
+    examples and discards an otherwise valid repair manifest.
+    """
     if not isinstance(text, str):
         return None
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        obj = json.loads(m.group(0))
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            current = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == '"':
+                    in_string = False
+                continue
+            if current == '"':
+                in_string = True
+            elif current == "{":
+                depth += 1
+            elif current == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:index + 1])
+                    except Exception:
+                        break
+                    return obj if isinstance(obj, dict) else None
+    return None
 
 
 async def _model_json(state: WorkflowState, prompt: str, system: str) -> Optional[Dict[str, Any]]:
@@ -1660,6 +1687,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                 "validation_commands (array of {name, argv, cwd, timeout_seconds, required}), "
                 "notes (array). operation must be exactly \"write\" for new or updated files or exactly \"delete\" for removals. "
                 "argv[0] must be an allowlisted runtime executable; use python -m pytest -q for Python tests, never bare pytest. "
+                "For FastAPI tests use fastapi.testclient.TestClient(app); app.test_client() is Flask-only and is invalid. "
                 "Paths must be relative to the authorized workspace. No absolute paths, no .., no .git/env writes. "
                 "Generate complete file contents, no placeholders. "
                 f"Specification: {json.dumps(spec, ensure_ascii=False)[:12000]}\n"
@@ -1809,9 +1837,12 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                     "Return ONLY JSON with key 'files' as an array of {path, operation, description, content} for minimal repairs. "
                     "operation must be exactly \"write\" for new or updated files or exactly \"delete\" for removals. "
                     "Only include files that must change. Paths must be relative to workspace. Provide complete file contents, never patches or placeholders. "
+                    "Return only that JSON object and stop; no Markdown fences, no explanation, no examples after it. "
                     "Diagnose the actual validation output against the current source below. Follow tracebacks and import chains; for missing imports/modules, "
-                    "check the referenced module path, package __init__.py files, symbol names, and declared dependencies. Fix the root cause rather than "
-                    "suppressing the error or adding a stub. Preserve existing public behavior and unrelated code. Include every file required for a coherent fix.\n"
+                    "check the referenced module path, package __init__.py files, symbol names, and declared dependencies. "
+                    "For FastAPI tests use fastapi.testclient.TestClient(app); app.test_client() is Flask-only and is invalid. "
+                    "Fix the root cause rather than suppressing the error or adding a stub. Preserve existing public behavior and unrelated code. "
+                    "Include every file required for a coherent fix.\n"
                     f"Objective: {state.objective}\n"
                     f"Validation failures: {json.dumps(failed, ensure_ascii=False)[:12000]}\n"
                     f"Current manifest paths: {json.dumps([m.get('path') for m in (state.generation.get('manifest') or []) if isinstance(m, dict)], ensure_ascii=False)}\n"

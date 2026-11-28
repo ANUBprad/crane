@@ -220,6 +220,21 @@ class GenerationSafetyTests(unittest.TestCase):
         self.assertFalse(gen.allowed_validation_command([str(shim), "-q"]))
         self.assertEqual(gen._validation_environment()["PYTEST_DISABLE_PLUGIN_AUTOLOAD"], "1")
 
+    def test_model_json_extracts_first_balanced_object_ignoring_prose(self):
+        response = (
+            "```json\n"
+            '{"files": [{"path": "main.py", "operation": "write"}]}\n'
+            "```\n"
+            "Explanation: use {\"files\": []} instead.\n"
+            "```python\nprint({'broken': True})\n```\n"
+        )
+        parsed = workflow_engine._parse_model_json(response)
+        self.assertEqual(parsed, {"files": [{"path": "main.py", "operation": "write"}]})
+
+    def test_model_json_rejects_unbalanced_and_non_object_output(self):
+        self.assertIsNone(workflow_engine._parse_model_json("no json here"))
+        self.assertIsNone(workflow_engine._parse_model_json('{"files": ['))
+
     def test_validation_executable_is_pinned_and_python_env_is_ignored(self):
         shim_dir = self.ws / "shim"
         shim_dir.mkdir()
