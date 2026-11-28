@@ -234,3 +234,26 @@ func TestDefaultStartTimeoutIsColdStartSafe(t *testing.T) {
 		t.Fatalf("defaultStartTimeout = %s, want >= 60s for packaged cold start", defaultStartTimeout)
 	}
 }
+
+func TestEnsureBuiltinServerUsesAllowedConfiguration(t *testing.T) {
+	store := newControllerStore(t)
+	controller := New(store, Config{})
+	controller.ensureBuiltinServer()
+
+	record, err := store.GetMCPServer("crane-builtin")
+	if err != nil {
+		t.Fatalf("GetMCPServer() error = %v", err)
+	}
+	if err := persistence.ValidateMCPServerRecord(record); err != nil {
+		t.Fatalf("built-in server failed validation: %v", err)
+	}
+	if record.Command != "python" {
+		t.Fatalf("built-in command = %q, want python", record.Command)
+	}
+	if len(record.Args) != 1 || record.Args[0] != "crane/mcp_runtime/builtin_entry.py" {
+		t.Fatalf("built-in args = %#v", record.Args)
+	}
+	if len(record.Env) != 0 {
+		t.Fatalf("built-in env = %#v, want none", record.Env)
+	}
+}

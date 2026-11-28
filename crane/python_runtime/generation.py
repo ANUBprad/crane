@@ -58,7 +58,8 @@ MAX_VALIDATION_ARGV = 64
 MAX_VALIDATION_ARG_CHARS = 4096
 VALIDATION_ENV_KEYS = (
     "SYSTEMROOT", "SystemRoot", "PATH", "Path", "TEMP", "TMP", "TMPDIR",
-    "HOME", "USERPROFILE", "LANG", "LC_ALL", "PYTHONIOENCODING", "PYTHONUTF8",
+    "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "LANG", "LC_ALL",
+    "PYTHONIOENCODING", "PYTHONUTF8",
 )
 _REDACTION_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?[A-Za-z0-9._~+/=-]+"),

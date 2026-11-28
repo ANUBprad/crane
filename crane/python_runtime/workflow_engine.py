@@ -1233,6 +1233,21 @@ async def _execute_tool_direct(state: WorkflowState, step: PlanStep, manager: MC
         state.selected_tool = None
 
 
+def _validation_event_details(result: Any, limit: int = 2000) -> Dict[str, Any]:
+    """Bound the real validation output carried by a durable event."""
+    if not isinstance(result, dict):
+        return {}
+    details: Dict[str, Any] = {}
+    for key in ("name", "status", "exit_code", "error"):
+        if result.get(key) is not None:
+            details[key] = result[key]
+    for key in ("stdout", "stderr"):
+        text = str(result.get(key) or "")
+        if text:
+            details[key] = text[-limit:]
+    return details
+
+
 def _generation_digest(state: WorkflowState, action: str, payload: Any) -> str:
     workspace = os.path.normcase(str(state.workspace)).lower() if os.name == "nt" else str(state.workspace)
     bound = {"task_id": state.task_id, "workspace": workspace, "action": action, "payload": payload}
@@ -1347,8 +1362,181 @@ def _default_generation_manifest(state: WorkflowState, spec: Dict[str, Any]) -> 
             {"path": "README.md", "operation": "write", "description": "Project overview", "content": f"# {name}\n\n{obj}\n\n## Run\n\n```bash\npython -m venv .venv\n# install dependencies with approval\n# uvicorn app.main:app --reload\n```\n\n## Tests\n\n```bash\npython -m pytest -q\n```\n"},
             {"path": "requirements.txt", "operation": "write", "description": "Python dependencies", "content": "fastapi\nuvicorn\npytest\nhttpx\n"},
             {"path": "app/__init__.py", "operation": "write", "description": "App package", "content": ""},
-            {"path": "app/main.py", "operation": "write", "description": "FastAPI app", "content": "from fastapi import FastAPI, HTTPException\nfrom pydantic import BaseModel, Field\n\napp = FastAPI(title=\"Task API\")\n\nclass TaskIn(BaseModel):\n    title: str = Field(min_length=1, max_length=200)\n    completed: bool = False\n\nclass Task(TaskIn):\n    id: int\n\n_tasks: dict[int, Task] = {}\n_next_id = 1\n\n@app.get('/health')\ndef health():\n    return {'status': 'ok'}\n\n@app.get('/tasks', response_model=list[Task])\ndef list_tasks():\n    return list(_tasks.values())\n\n@app.post('/tasks', response_model=Task, status_code=201)\ndef create_task(payload: TaskIn):\n    global _next_id\n    task = Task(id=_next_id, **payload.model_dump())\n    _tasks[_next_id] = task\n    _next_id += 1\n    return task\n\n@app.get('/tasks/{task_id}', response_model=Task)\ndef get_task(task_id: int):\n    task = _tasks.get(task_id)\n    if not task:\n        raise HTTPException(status_code=404, detail='Task not found')\n    return task\n\n@app.put('/tasks/{task_id}', response_model=Task)\ndef update_task(task_id: int, payload: TaskIn):\n    if task_id not in _tasks:\n        raise HTTPException(status_code=404, detail='Task not found')\n    task = Task(id=task_id, **payload.model_dump())\n    _tasks[task_id] = task\n    return task\n\n@app.delete('/tasks/{task_id}', status_code=204)\ndef delete_task(task_id: int):\n    if task_id not in _tasks:\n        raise HTTPException(status_code=404, detail='Task not found')\n    del _tasks[task_id]\n    return None\n"},
-            {"path": "tests/test_app.py", "operation": "write", "description": "Basic API tests", "content": "from fastapi.testclient import TestClient\nfrom app.main import app\n\nclient = TestClient(app)\n\ndef test_health():\n    r = client.get('/health')\n    assert r.status_code == 200\n    assert r.json()['status'] == 'ok'\n\ndef test_crud():\n    r = client.post('/tasks', json={'title': 'Write tests', 'completed': False})\n    assert r.status_code == 201\n    task = r.json()\n    tid = task['id']\n    r = client.get(f'/tasks/{tid}')\n    assert r.status_code == 200\n    r = client.put(f'/tasks/{tid}', json={'title': 'Write tests', 'completed': True})\n    assert r.status_code == 200\n    assert r.json()['completed'] is True\n    r = client.delete(f'/tasks/{tid}')\n    assert r.status_code == 204\n    r = client.get(f'/tasks/{tid}')\n    assert r.status_code == 404\n"},
+            {"path": "app/main.py", "operation": "write", "description": "FastAPI app backed by SQLite", "content": '''import os
+import sqlite3
+from contextlib import closing, contextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="Task API")
+
+
+def database_path() -> Path:
+    return Path(os.environ.get("TASKS_DB_PATH", "tasks.db"))
+
+
+def connect() -> sqlite3.Connection:
+    path = database_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+@contextmanager
+def database():
+    with closing(connect()) as connection:
+        with connection:
+            yield connection
+
+
+def initialize_database() -> None:
+    with database() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 200),
+                completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1))
+            )
+            """
+        )
+
+
+class TaskIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    completed: bool = False
+
+
+class Task(TaskIn):
+    id: int
+
+
+def row_to_task(row: sqlite3.Row) -> Task:
+    return Task(id=row["id"], title=row["title"], completed=bool(row["completed"]))
+
+
+initialize_database()
+
+
+@app.get('/health')
+def health():
+    with database() as connection:
+        connection.execute('SELECT 1').fetchone()
+    return {'status': 'ok'}
+
+
+@app.get('/tasks', response_model=list[Task])
+def list_tasks():
+    with database() as connection:
+        rows = connection.execute('SELECT id, title, completed FROM tasks ORDER BY id').fetchall()
+    return [row_to_task(row) for row in rows]
+
+
+@app.post('/tasks', response_model=Task, status_code=201)
+def create_task(payload: TaskIn):
+    with database() as connection:
+        cursor = connection.execute(
+            'INSERT INTO tasks (title, completed) VALUES (?, ?)',
+            (payload.title, int(payload.completed)),
+        )
+        row = connection.execute(
+            'SELECT id, title, completed FROM tasks WHERE id = ?', (cursor.lastrowid,)
+        ).fetchone()
+    return row_to_task(row)
+
+
+@app.get('/tasks/{task_id}', response_model=Task)
+def get_task(task_id: int):
+    with database() as connection:
+        row = connection.execute(
+            'SELECT id, title, completed FROM tasks WHERE id = ?', (task_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail='Task not found')
+    return row_to_task(row)
+
+
+@app.put('/tasks/{task_id}', response_model=Task)
+def update_task(task_id: int, payload: TaskIn):
+    with database() as connection:
+        cursor = connection.execute(
+            'UPDATE tasks SET title = ?, completed = ? WHERE id = ?',
+            (payload.title, int(payload.completed), task_id),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail='Task not found')
+        row = connection.execute(
+            'SELECT id, title, completed FROM tasks WHERE id = ?', (task_id,)
+        ).fetchone()
+    return row_to_task(row)
+
+
+@app.delete('/tasks/{task_id}', status_code=204)
+def delete_task(task_id: int):
+    with database() as connection:
+        cursor = connection.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail='Task not found')
+    return Response(status_code=204)
+'''},
+            {"path": "tests/test_app.py", "operation": "write", "description": "API and SQLite tests", "content": '''import os
+import sqlite3
+import tempfile
+from pathlib import Path
+
+test_root = tempfile.mkdtemp(prefix="crane-fastapi-test-")
+os.environ["TASKS_DB_PATH"] = str(Path(test_root) / "tasks.db")
+
+from fastapi.testclient import TestClient
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_health():
+    response = client.get('/health')
+    assert response.status_code == 200
+    assert response.json() == {'status': 'ok'}
+
+
+def test_crud_persists_to_sqlite():
+    created = client.post('/tasks', json={'title': 'Write tests', 'completed': False})
+    assert created.status_code == 201
+    task_id = created.json()['id']
+
+    listed = client.get('/tasks')
+    assert listed.status_code == 200
+    assert any(item['id'] == task_id for item in listed.json())
+
+    fetched = client.get(f'/tasks/{task_id}')
+    assert fetched.status_code == 200
+    assert fetched.json()['title'] == 'Write tests'
+
+    updated = client.put(f'/tasks/{task_id}', json={'title': 'Write tests', 'completed': True})
+    assert updated.status_code == 200
+    assert updated.json()['completed'] is True
+
+    connection = sqlite3.connect(os.environ['TASKS_DB_PATH'])
+    try:
+        stored = connection.execute(
+            'SELECT title, completed FROM tasks WHERE id = ?', (task_id,)
+        ).fetchone()
+    finally:
+        connection.close()
+    assert stored == ('Write tests', 1)
+
+    deleted = client.delete(f'/tasks/{task_id}')
+    assert deleted.status_code == 204
+    assert client.get(f'/tasks/{task_id}').status_code == 404
+
+
+def test_validation_rejects_empty_title():
+    response = client.post('/tasks', json={'title': ''})
+    assert response.status_code == 422
+'''},
         ]
     if "go" in stack:
         return [
@@ -1590,7 +1778,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             _event(state.task_id, "validation.started", {"name": cmd.name, "argv": cmd.argv})
             res = gen.run_validation_command(ws, cmd)
             results.append(res)
-            _event(state.task_id, "validation.completed", {"name": cmd.name, "status": res.get("status"), "exit_code": res.get("exit_code")})
+            _event(state.task_id, "validation.completed", _validation_event_details(res))
             if res.get("status") != "succeeded" and cmd.required:
                 break
         safe_results = [gen.redact_validation_result(r) if isinstance(r, dict) else r for r in results]
@@ -1681,6 +1869,17 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             state.generation.pop("pending_repair_digest", None)
         except Exception as exc:  # noqa: BLE001
             return {"status": "failed", "error": f"Repair apply failed: {exc}"}
+        repair_applied = [r.get("path") for r in applied.get("applied", []) if isinstance(r, dict)]
+        for rec in applied.get("applied", []):
+            if isinstance(rec, dict):
+                _event(state.task_id, "generation.file.written", {
+                    "path": rec.get("path"), "operation": rec.get("operation"),
+                    "repair_attempt": attempts + 1, "source": "repair",
+                })
+        _event(state.task_id, "repair.applied", {
+            "attempt": attempts + 1, "digest": digest,
+            "files": repair_applied[:50], "file_count": len(repair_applied),
+        })
         # Re-run validations
         cmds = []
         raw_cmds = state.generation.get("validation_plan")
@@ -1695,12 +1894,20 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             _event(state.task_id, "validation.started", {"name": cmd.name, "argv": cmd.argv, "repair_attempt": attempts + 1})
             res = gen.redact_validation_result(gen.run_validation_command(ws, cmd))
             safe_results2.append(res)
-            _event(state.task_id, "validation.completed", {"name": cmd.name, "status": res.get("status"), "exit_code": res.get("exit_code"), "repair_attempt": attempts + 1})
+            details = _validation_event_details(res)
+            details["repair_attempt"] = attempts + 1
+            _event(state.task_id, "validation.completed", details)
             if res.get("status") != "succeeded" and cmd.required:
                 break
         state.generation["validation_results"] = safe_results2
         ok = all(r.get("status") == "succeeded" for r in safe_results2 if r.get("status") != "skipped")
         state.generation["status"] = "validated" if ok else "validation_failed"
+        _event(state.task_id, "repair.completed", {
+            "attempt": attempts + 1, "status": "succeeded" if ok else "failed",
+            "files": repair_applied[:50], "file_count": len(repair_applied),
+            "validation_status": [r.get("status") for r in safe_results2],
+            "exit_codes": [r.get("exit_code") for r in safe_results2],
+        })
         return {"status": "succeeded" if ok else "failed", "output": {"applied": applied.get("applied", []), "validation_results": safe_results2, "attempt": attempts + 1}}
 
     if sid == "final_report":
@@ -2436,8 +2643,8 @@ async def execute_task(
             state.result = _result_payload(state)
         if state.state not in {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED}:
             # Should not happen, but never leave ambiguous terminal state.
-            await node_verify(state_to_checkpoint(state))
-            state = _as_state(state_to_checkpoint(state)) if False else state
+            verified = await node_verify(state_to_checkpoint(state))
+            state = _as_state(verified)
         if not state.final_result:
             state.final_result = _final_response(state)
         if not state.result:

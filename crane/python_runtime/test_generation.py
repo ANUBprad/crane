@@ -256,6 +256,40 @@ class GenerationSafetyTests(unittest.TestCase):
             else:
                 os.environ["PYTHON"] = previous_python
 
+    def test_default_fastapi_manifest_is_sqlite_backed_and_validates(self):
+        objective = (
+            "Create a small FastAPI application backed by SQLite. Implement a health endpoint "
+            "and a basic CRUD endpoint. Include appropriate validation and automated tests."
+        )
+        state = workflow_engine.WorkflowState(
+            task_id="fastapi-default", user_input=objective, objective=objective,
+            workspace=str(self.ws),
+        )
+        spec = workflow_engine._default_generation_spec(state)
+        manifest = workflow_engine._default_generation_manifest(state, spec)
+        self.assertTrue(any(item["path"] == "tests/test_app.py" for item in manifest))
+
+        ops = gen.validate_file_operations(self.ws, manifest)
+        for op in ops:
+            target = gen.validate_relative_path(self.ws, op.path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(op.content, encoding="utf-8")
+
+        source = (self.ws / "app" / "main.py").read_text(encoding="utf-8")
+        self.assertIn("import sqlite3", source)
+        self.assertIn("CREATE TABLE IF NOT EXISTS tasks", source)
+        self.assertNotIn("_tasks: dict", source)
+        self.assertNotIn("_tasks =", source)
+        self.assertIn("{'status': 'ok'}", source)
+
+        results = [
+            gen.run_validation_command(self.ws, cmd)
+            for cmd in gen.default_validation_commands(self.ws)
+        ]
+        self.assertTrue(any(r.get("name") == "pytest" for r in results), results)
+        for result in results:
+            self.assertEqual(result["status"], "succeeded", result)
+
     def test_validation_environment_is_minimal_and_output_is_redacted(self):
         previous = {key: os.environ.get(key) for key in ("MY_CREDENTIAL", "DATABASE_URL")}
         os.environ["MY_CREDENTIAL"] = "canary-credential"
@@ -563,6 +597,32 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(replayed["approval_scope"], scope)
             self.assertNotIn(scope, state.granted_approvals)
 
+    async def test_validation_failure_event_carries_actual_output(self):
+        state, step = self._state_and_step("validate_project")
+        state.generation["validation_plan"] = [{
+            "name": "failing_check",
+            "argv": ["python", "-c", "import sys; print('VALIDATION_FAILURE_DETAIL'); sys.exit(3)"],
+            "cwd": ".", "timeout_seconds": 20, "required": True,
+        }]
+        with mock.patch("crane.python_runtime.protocol.write_stdout") as write:
+            blocked = await workflow_engine._exec_generation_step(state, step)
+            scope = blocked["approval_scope"]
+            state.granted_approvals = [scope]
+            state.generation["approvals_granted"] = [scope]
+            result = await workflow_engine._exec_generation_step(state, step)
+
+        self.assertEqual(result["status"], "failed", result)
+        validation = result["output"]["validation_results"][0]
+        self.assertEqual(validation["exit_code"], 3)
+        events = [
+            call.args[0] for call in write.call_args_list
+            if call.args and isinstance(call.args[0], dict)
+            and call.args[0].get("event_type") == "validation.completed"
+        ]
+        self.assertTrue(events)
+        self.assertEqual(events[-1]["payload"]["exit_code"], 3)
+        self.assertIn("VALIDATION_FAILURE_DETAIL", events[-1]["payload"]["stdout"])
+
     async def test_repair_prompt_includes_current_source_and_redacts_secrets(self):
         state, step = self._state_and_step("repair_project")
         state.objective = "Repair the generated FastAPI application"
@@ -644,6 +704,46 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(repaired["status"], "succeeded", repaired)
             self.assertEqual((self.ws / "app.py").read_text(encoding="utf-8"), "fixed = True\n")
             self.assertNotIn(scope, state.granted_approvals)
+
+    async def test_repair_emits_real_apply_and_revalidation_evidence(self):
+        state, step = self._state_and_step("repair_project")
+        state.generation["validation_results"] = [{
+            "name": "pytest", "status": "failed", "exit_code": 1,
+            "stdout": "1 failed", "stderr": "AssertionError: expected ok",
+        }]
+        ops = gen.validate_file_operations(self.ws, [
+            {"path": "app.py", "operation": "write", "content": "status = 'ok'\n"},
+        ])
+        state.generation["pending_repair_manifest"] = [op.to_dict() for op in ops]
+
+        with mock.patch("crane.python_runtime.protocol.write_stdout") as write:
+            blocked = await workflow_engine._exec_generation_step(state, step)
+            self.assertEqual(blocked["status"], "blocked", blocked)
+            scope = blocked["approval_scope"]
+            state.granted_approvals = [scope]
+            state.generation["approvals_granted"] = [scope]
+            repaired = await workflow_engine._exec_generation_step(state, step)
+
+        self.assertEqual(repaired["status"], "succeeded", repaired)
+        events = [
+            call.args[0] for call in write.call_args_list
+            if call.args and isinstance(call.args[0], dict)
+            and call.args[0].get("type") == "task_event"
+        ]
+        written = [e for e in events if e.get("event_type") == "generation.file.written"]
+        self.assertTrue(any(e["payload"].get("path") == "app.py" for e in written), events)
+        repair_applied = [e for e in events if e.get("event_type") == "repair.applied"]
+        self.assertEqual(repair_applied[-1]["payload"]["files"], ["app.py"])
+        repair_completed = [e for e in events if e.get("event_type") == "repair.completed"]
+        self.assertEqual(repair_completed[-1]["payload"]["status"], "succeeded")
+        self.assertEqual(repair_completed[-1]["payload"]["exit_codes"], [0])
+        validated = [
+            e for e in events if e.get("event_type") == "validation.completed"
+            and e["payload"].get("repair_attempt") == 1
+        ]
+        self.assertTrue(validated, events)
+        self.assertEqual(validated[-1]["payload"]["exit_code"], 0)
+        self.assertEqual((self.ws / "app.py").read_text(encoding="utf-8"), "status = 'ok'\n")
 
     async def test_tampered_repair_manifest_is_rejected_after_approval(self):
         state, step = self._state_and_step("repair_project")

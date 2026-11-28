@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -164,7 +165,7 @@ func (c *Controller) Start() error {
 	if pythonPath == "" {
 		pythonPath = runtimeenv.PythonCandidates()[0]
 	}
-	c.ensureBuiltinServer(pythonPath)
+	c.ensureBuiltinServer()
 	args := append([]string{}, c.cfg.PythonArgs...)
 	if len(args) == 0 {
 		args = []string{"-m", "crane.python_runtime", "--mcp-protocol"}
@@ -222,29 +223,28 @@ func (c *Controller) Start() error {
 	return nil
 }
 
-func (c *Controller) ensureBuiltinServer(pythonPath string) {
+func (c *Controller) ensureBuiltinServer() {
 	const builtinID = "crane-builtin"
 	if _, err := c.store.GetMCPServer(builtinID); err == nil {
 		return
 	}
-	env := map[string]string{}
-	if pp := os.Getenv("PYTHONPATH"); pp != "" {
-		env["PYTHONPATH"] = pp
-	}
+	// Launch the trusted entry script through the ordinary allowlisted Python
+	// command. Storing an absolute interpreter path or "-m" would be rejected by
+	// the same configuration policy that constrains user-provided MCP servers.
 	rec := persistence.MCPServerRecord{
 		ID:                       builtinID,
 		Name:                     "CRANE Built-in Tools",
 		Transport:                "stdio",
-		Command:                  pythonPath,
-		Args:                     []string{"-m", "crane.mcp_runtime.builtin_server"},
-		Env:                      env,
+		Command:                  "python",
+		Args:                     []string{filepath.ToSlash(filepath.Join("crane", "mcp_runtime", "builtin_entry.py"))},
+		Env:                      map[string]string{},
 		Enabled:                  true,
 		ConnectTimeoutSeconds:    10,
 		InvocationTimeoutSeconds: 60,
 		Status:                   "registered",
 	}
 	if err := c.store.UpsertMCPServer(rec); err != nil {
-		fmt.Fprintln(os.Stderr, "CRANE MCP: failed to seed built-in MCP server")
+		fmt.Fprintln(os.Stderr, "CRANE MCP: failed to seed built-in MCP server:", err)
 	}
 }
 
