@@ -708,6 +708,40 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["payload"]["exit_code"], 3)
         self.assertIn("VALIDATION_FAILURE_DETAIL", events[-1]["payload"]["stdout"])
 
+    def test_repair_context_focuses_on_traceback_source_file(self):
+        state, _ = self._state_and_step("repair_project")
+        state.generation["manifest"] = [
+            {"path": "app/__init__.py", "operation": "write", "content": "broken\n"},
+            {"path": "app/main.py", "operation": "write", "content": "app_source_marker = True\n"},
+            {"path": "tests/test_app.py", "operation": "write", "content": "test_marker = True\n"},
+        ]
+        state.generation["validation_results"] = [{
+            "status": "failed",
+            "stdout": "tests\\test_app.py:10: in <module>\napp\\__init__.py:1: raise RuntimeError\n",
+        }]
+        self.ws.joinpath("app").mkdir()
+        self.ws.joinpath("app/__init__.py").write_text("broken\n", encoding="utf-8")
+        self.ws.joinpath("app/main.py").write_text("app_source_marker = True\n", encoding="utf-8")
+        self.ws.joinpath("tests").mkdir()
+        self.ws.joinpath("tests/test_app.py").write_text("test_marker = True\n", encoding="utf-8")
+
+        paths = workflow_engine._repair_context_paths(state)
+        self.assertEqual(paths, ["app/__init__.py"])
+        context = workflow_engine._generation_repair_source_context(state, self.ws, paths=paths)
+        self.assertIn("broken", context)
+        self.assertNotIn("app_source_marker", context)
+        self.assertNotIn("test_marker", context)
+
+    def test_repair_context_falls_back_without_traceback_paths(self):
+        state, _ = self._state_and_step("repair_project")
+        state.generation["manifest"] = [{"path": "app/main.py", "operation": "write", "content": "ok"}]
+        state.generation["validation_results"] = [{"status": "failed", "stderr": "ModuleNotFoundError: app.helpers"}]
+        self.ws.joinpath("app").mkdir()
+        self.ws.joinpath("app/main.py").write_text("fallback_marker = True\n", encoding="utf-8")
+        self.assertEqual(workflow_engine._repair_context_paths(state), [])
+        context = workflow_engine._generation_repair_source_context(state, self.ws, paths=None)
+        self.assertIn("fallback_marker", context)
+
     async def test_repair_prompt_includes_current_source_and_redacts_secrets(self):
         state, step = self._state_and_step("repair_project")
         state.objective = "Repair the generated FastAPI application"

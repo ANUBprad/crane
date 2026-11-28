@@ -1710,7 +1710,50 @@ MAX_REPAIR_CONTEXT_FILE_CHARS = 4000
 MAX_REPAIR_CONTEXT_CHARS = 24000
 
 
-def _generation_repair_source_context(state: WorkflowState, workspace: Any) -> str:
+def _repair_context_paths(state: WorkflowState) -> List[str]:
+    """Select generated source files named by a validation traceback.
+
+    Small local models copy long contexts poorly. When a traceback names a
+    generated source file, limiting context to that file keeps the repair
+    focused; tests are excluded because a source failure should be fixed in
+    source. If no path is present, callers fall back to the full manifest.
+    """
+    allowed: set[str] = set()
+    for records in (state.generation.get("manifest"), state.generation.get("applied")):
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if isinstance(record, dict):
+                value = record.get("path")
+                if isinstance(value, str) and value.strip():
+                    allowed.add(os.path.normcase(value.replace("\\", "/")))
+
+    found: List[str] = []
+    seen: set[str] = set()
+    pattern = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z0-9_./\\-]+\.py)")
+    results = state.generation.get("validation_results")
+    if not isinstance(results, list):
+        return []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        text = f"{result.get('stdout') or ''}\n{result.get('stderr') or ''}"
+        for match in pattern.findall(text):
+            path = match.replace("\\", "/")
+            if path.startswith("./"):
+                path = path[2:]
+            key = os.path.normcase(path)
+            basename = path.rsplit("/", 1)[-1]
+            if key not in allowed or key in seen:
+                continue
+            if path.startswith("tests/") or basename.startswith("test_"):
+                continue
+            seen.add(key)
+            found.append(path)
+    return found
+
+
+def _generation_repair_source_context(state: WorkflowState, workspace: Any, paths: Optional[List[str]] = None) -> str:
     """Read a bounded, redacted snapshot of generated files relevant to repair.
 
     Only paths already present in the validated generation manifest or apply
@@ -1718,7 +1761,11 @@ def _generation_repair_source_context(state: WorkflowState, workspace: Any) -> s
     directory walk or arbitrary user-file discovery is performed.
     """
     raw_paths: List[str] = []
+    if paths is not None:
+        raw_paths.extend(paths)
     for records in (state.generation.get("manifest"), state.generation.get("applied")):
+        if paths is not None:
+            break
         if not isinstance(records, list):
             continue
         for record in records:
@@ -1947,7 +1994,10 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
         if not isinstance(repair_manifest, list) or not repair_manifest:
             repair_manifest = None
             if selected_provider() == "ollama":
-                source_context = _generation_repair_source_context(state, ws)
+                focused_paths = _repair_context_paths(state)
+                source_context = _generation_repair_source_context(
+                    state, ws, paths=focused_paths or None
+                )
                 prompt = (
                     "Return ONLY JSON with key 'files' as an array of {path, operation, description, content} for minimal repairs. "
                     "operation must be exactly \"write\" for new or updated files or exactly \"delete\" for removals. "
