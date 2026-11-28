@@ -1355,6 +1355,29 @@ def _normalize_repair_manifest(manifest: Any) -> List[Any]:
     return normalized
 
 
+def _normalize_validation_plan(raw: Any) -> List[gen.ValidationCommand]:
+    """Resolve safe commands while rejecting pytest selectors from model plans."""
+    if not isinstance(raw, list):
+        return []
+    commands: List[gen.ValidationCommand] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        argv = gen._resolved_validation_argv(item.get("argv"))
+        if argv is None:
+            continue
+        if argv[1:3] == ["-m", "pytest"] and len(argv) != 4:
+            continue
+        commands.append(gen.ValidationCommand(
+            name=str(item.get("name") or "pytest"),
+            argv=argv,
+            cwd=str(item.get("cwd") or "."),
+            timeout_seconds=int(item.get("timeout_seconds") or gen.DEFAULT_COMMAND_TIMEOUT_SECONDS),
+            required=bool(item.get("required", True)),
+        ))
+    return commands
+
+
 async def _model_json(state: WorkflowState, prompt: str, system: str) -> Optional[Dict[str, Any]]:
     if selected_provider() != "ollama":
         return None
@@ -1715,12 +1738,13 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                 "Return ONLY JSON with keys: files (array of {path, operation, description, content}), "
                 "validation_commands (array of {name, argv, cwd, timeout_seconds, required}), "
                 "notes (array). operation must be exactly \"write\" for new or updated files or exactly \"delete\" for removals. "
-                "argv[0] must be an allowlisted runtime executable; use python -m pytest -q for Python tests, never bare pytest. "
+                "For Python, validation_commands must be exactly one entry with argv [\"python\",\"-m\",\"pytest\",\"-q\"], cwd \".\", timeout_seconds 300, required true; do not add paths or selectors. "
                 "For FastAPI tests generate from fastapi.testclient import TestClient and use TestClient(app). "
                 "Never use app.test_client() (Flask-only), and do not generate conftest.py hooks such as addinivalue_line('pytest.ini', ...). "
                 "When SQLite CRUD is requested, implement working Pydantic request models and create/read/list/update/delete routes; do not leave TODO stubs. "
+                "Include GET /health returning {'status': 'ok'} and initialize the SQLite table before serving requests. "
                 "Use Python's standard-library sqlite3 directly and never add sqlite3 to requirements.txt. "
-                "Keep the health response at {'status': 'ok'} and write tests that exercise health plus the CRUD lifecycle with TestClient. "
+                "Write tests that exercise health plus the CRUD lifecycle with TestClient. "
                 "Paths must be relative to the authorized workspace. No absolute paths, no .., no .git/env writes. "
                 "Generate complete file contents, no placeholders. "
                 f"Specification: {json.dumps(spec, ensure_ascii=False)[:12000]}\n"
@@ -1798,22 +1822,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
         if state.generation.get("plan_only"):
             state.generation["validation_results"] = [{"name": "plan_only", "status": "skipped", "reason": "Plan-only mode; no files applied."}]
             return {"status": "succeeded", "output": {"skipped": True, "reason": "plan_only"}}
-        commands = []
-        raw_cmds = state.generation.get("validation_plan")
-        if isinstance(raw_cmds, list) and raw_cmds:
-            for c in raw_cmds:
-                if not isinstance(c, dict):
-                    continue
-                argv = c.get("argv") if isinstance(c.get("argv"), list) else []
-                if not argv:
-                    continue
-                commands.append(gen.ValidationCommand(
-                    name=str(c.get("name") or "command"),
-                    argv=[str(a) for a in argv],
-                    cwd=str(c.get("cwd") or "."),
-                    timeout_seconds=int(c.get("timeout_seconds") or gen.DEFAULT_COMMAND_TIMEOUT_SECONDS),
-                    required=bool(c.get("required", True)),
-                ))
+        commands = _normalize_validation_plan(state.generation.get("validation_plan"))
         if not commands:
             commands = gen.default_validation_commands(ws)
         if not commands:
@@ -1875,6 +1884,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                     "check the referenced module path, package __init__.py files, symbol names, and declared dependencies. "
                     "For FastAPI tests use fastapi.testclient.TestClient(app); app.test_client() is Flask-only and is invalid. "
                     "Remove pytest_configure hooks that call addinivalue_line('pytest.ini', ...); they are invalid pytest configuration. "
+                    "Remove stray top-level raise statements and placeholder marker strings from generated source; they are not part of the requested application. "
                     "Never pin the standard-library sqlite3 module in requirements.txt. "
                     "Do not emit duplicate path entries; if a path repeats, only its final operation is applied, so prefer exactly one write with complete content. "
                     "For an assertion mismatch, change the production source to satisfy the expected behavior unless the test itself is invalid. "
@@ -1950,12 +1960,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             "files": repair_applied[:50], "file_count": len(repair_applied),
         })
         # Re-run validations
-        cmds = []
-        raw_cmds = state.generation.get("validation_plan")
-        if isinstance(raw_cmds, list) and raw_cmds:
-            for c in raw_cmds:
-                if isinstance(c, dict) and isinstance(c.get("argv"), list):
-                    cmds.append(gen.ValidationCommand(name=str(c.get("name") or "command"), argv=[str(a) for a in c.get("argv")], cwd=str(c.get("cwd") or "."), timeout_seconds=int(c.get("timeout_seconds") or gen.DEFAULT_COMMAND_TIMEOUT_SECONDS), required=bool(c.get("required", True))))
+        cmds = _normalize_validation_plan(state.generation.get("validation_plan"))
         if not cmds:
             cmds = gen.default_validation_commands(ws)
         safe_results2 = []

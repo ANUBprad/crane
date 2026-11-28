@@ -261,6 +261,27 @@ class GenerationSafetyTests(unittest.TestCase):
         self.assertEqual(workflow_engine._normalize_repair_manifest(None), [])
         self.assertEqual(workflow_engine._normalize_repair_manifest({"path": "main.py"}), [])
 
+    def test_validation_plan_accepts_pinned_pytest_command(self):
+        commands = workflow_engine._normalize_validation_plan([{
+            "name": "pytest",
+            "argv": ["python", "-m", "pytest", "-q"],
+            "cwd": ".",
+            "timeout_seconds": 300,
+            "required": True,
+        }])
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0].argv[1:], ["-m", "pytest", "-q"])
+
+    def test_validation_plan_rejects_selectors_and_unknown_executables(self):
+        self.assertEqual(workflow_engine._normalize_validation_plan([{
+            "name": "validate_input_data",
+            "argv": ["python", "-m", "pytest", "-q", "tests.py", "validate_input_data"],
+        }]), [])
+        self.assertEqual(workflow_engine._normalize_validation_plan([{
+            "name": "unknown", "argv": ["definitely_not_a_tool", "-q"],
+        }]), [])
+        self.assertEqual(workflow_engine._normalize_validation_plan(None), [])
+
     def test_validation_executable_is_pinned_and_python_env_is_ignored(self):
         shim_dir = self.ws / "shim"
         shim_dir.mkdir()
