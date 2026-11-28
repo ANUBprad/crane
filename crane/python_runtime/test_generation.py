@@ -235,6 +235,32 @@ class GenerationSafetyTests(unittest.TestCase):
         self.assertIsNone(workflow_engine._parse_model_json("no json here"))
         self.assertIsNone(workflow_engine._parse_model_json('{"files": ['))
 
+    def test_repair_manifest_collapses_duplicate_writes_to_last_operation(self):
+        manifest = [
+            {"path": "main.py", "operation": "write", "content": "first"},
+            {"path": "notes.txt", "operation": "write", "content": "keep"},
+            {"path": "main.py", "operation": "write", "content": "final"},
+        ]
+        normalized = workflow_engine._normalize_repair_manifest(manifest)
+        self.assertEqual(normalized, [
+            {"path": "main.py", "operation": "write", "content": "final"},
+            {"path": "notes.txt", "operation": "write", "content": "keep"},
+        ])
+
+    def test_repair_manifest_collapses_conflicting_operations_to_last_write(self):
+        manifest = [
+            {"path": "tests/conftest.py", "operation": "delete", "content": ""},
+            {"path": "tests/conftest.py", "operation": "write", "content": "fixed"},
+        ]
+        normalized = workflow_engine._normalize_repair_manifest(manifest)
+        self.assertEqual(normalized, [
+            {"path": "tests/conftest.py", "operation": "write", "content": "fixed"},
+        ])
+
+    def test_repair_manifest_rejects_non_list(self):
+        self.assertEqual(workflow_engine._normalize_repair_manifest(None), [])
+        self.assertEqual(workflow_engine._normalize_repair_manifest({"path": "main.py"}), [])
+
     def test_validation_executable_is_pinned_and_python_env_is_ignored(self):
         shim_dir = self.ws / "shim"
         shim_dir.mkdir()

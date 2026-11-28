@@ -1326,6 +1326,35 @@ def _parse_model_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _normalize_repair_manifest(manifest: Any) -> List[Any]:
+    """Collapse repeated paths to their final operation.
+
+    Small models sometimes emit the same path more than once. Applying the
+    final operation in order is deterministic and keeps the exact manifest
+    that receives approval identical to the manifest that is applied.
+    """
+    if not isinstance(manifest, list):
+        return []
+    normalized: List[Any] = []
+    by_path: Dict[str, int] = {}
+    for item in manifest:
+        if not isinstance(item, dict):
+            normalized.append(item)
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path:
+            normalized.append(item)
+            continue
+        key = os.path.normcase(path.replace("\\", "/"))
+        index = by_path.get(key)
+        if index is None:
+            by_path[key] = len(normalized)
+            normalized.append(item)
+        else:
+            normalized[index] = item
+    return normalized
+
+
 async def _model_json(state: WorkflowState, prompt: str, system: str) -> Optional[Dict[str, Any]]:
     if selected_provider() != "ollama":
         return None
@@ -1687,7 +1716,11 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                 "validation_commands (array of {name, argv, cwd, timeout_seconds, required}), "
                 "notes (array). operation must be exactly \"write\" for new or updated files or exactly \"delete\" for removals. "
                 "argv[0] must be an allowlisted runtime executable; use python -m pytest -q for Python tests, never bare pytest. "
-                "For FastAPI tests use fastapi.testclient.TestClient(app); app.test_client() is Flask-only and is invalid. "
+                "For FastAPI tests generate from fastapi.testclient import TestClient and use TestClient(app). "
+                "Never use app.test_client() (Flask-only), and do not generate conftest.py hooks such as addinivalue_line('pytest.ini', ...). "
+                "When SQLite CRUD is requested, implement working Pydantic request models and create/read/list/update/delete routes; do not leave TODO stubs. "
+                "Use Python's standard-library sqlite3 directly and never add sqlite3 to requirements.txt. "
+                "Keep the health response at {'status': 'ok'} and write tests that exercise health plus the CRUD lifecycle with TestClient. "
                 "Paths must be relative to the authorized workspace. No absolute paths, no .., no .git/env writes. "
                 "Generate complete file contents, no placeholders. "
                 f"Specification: {json.dumps(spec, ensure_ascii=False)[:12000]}\n"
@@ -1841,6 +1874,10 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                     "Diagnose the actual validation output against the current source below. Follow tracebacks and import chains; for missing imports/modules, "
                     "check the referenced module path, package __init__.py files, symbol names, and declared dependencies. "
                     "For FastAPI tests use fastapi.testclient.TestClient(app); app.test_client() is Flask-only and is invalid. "
+                    "Remove pytest_configure hooks that call addinivalue_line('pytest.ini', ...); they are invalid pytest configuration. "
+                    "Never pin the standard-library sqlite3 module in requirements.txt. "
+                    "Do not emit duplicate path entries; if a path repeats, only its final operation is applied, so prefer exactly one write with complete content. "
+                    "For an assertion mismatch, change the production source to satisfy the expected behavior unless the test itself is invalid. "
                     "Fix the root cause rather than suppressing the error or adding a stub. Preserve existing public behavior and unrelated code. "
                     "Include every file required for a coherent fix.\n"
                     f"Objective: {state.objective}\n"
@@ -1854,6 +1891,7 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                     repair_manifest = obj.get("files")
         if not repair_manifest:
             return {"status": "failed", "error": "Unable to generate repair plan; manual review required", "output": {"validation_results": results}}
+        repair_manifest = _normalize_repair_manifest(repair_manifest)
         try:
             ops = gen.validate_file_operations(ws, repair_manifest)
         except Exception as exc:  # noqa: BLE001
