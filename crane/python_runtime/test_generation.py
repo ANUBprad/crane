@@ -868,6 +868,51 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(validated[-1]["payload"]["exit_code"], 0)
         self.assertEqual((self.ws / "app.py").read_text(encoding="utf-8"), "status = 'ok'\n")
 
+    async def test_successful_repair_recovers_failed_validation_step(self):
+        state, step = self._state_and_step("repair_project")
+        state.plan = [
+            workflow_engine.PlanStep(
+                step_id="validate_project", description="validate", expected_outcome="valid",
+                status="failed",
+            ),
+            workflow_engine.PlanStep(
+                step_id="repair_project", description="repair", expected_outcome="repaired",
+                status="running",
+            ),
+            workflow_engine.PlanStep(
+                step_id="final_report", description="report", expected_outcome="report",
+                status="pending",
+            ),
+        ]
+        state.generation["validation_results"] = [{
+            "name": "pytest", "status": "failed", "exit_code": 1,
+            "stdout": "1 failed", "stderr": "AssertionError",
+        }]
+        ops = gen.validate_file_operations(self.ws, [
+            {"path": "app.py", "operation": "write", "content": "status = 'ok'\n"},
+        ])
+        state.generation["pending_repair_manifest"] = [op.to_dict() for op in ops]
+        with mock.patch("crane.python_runtime.protocol.write_stdout") as write:
+            blocked = await workflow_engine._exec_generation_step(state, step)
+            scope = blocked["approval_scope"]
+            state.granted_approvals = [scope]
+            state.generation["approvals_granted"] = [scope]
+            repaired = await workflow_engine._exec_generation_step(state, step)
+
+        self.assertEqual(repaired["status"], "succeeded", repaired)
+        validation_step = next(s for s in state.plan if s.step_id == "validate_project")
+        self.assertEqual(validation_step.status, "completed")
+        self.assertEqual(state.failed_steps, [])
+        events = [
+            call.args[0] for call in write.call_args_list
+            if call.args and isinstance(call.args[0], dict)
+            and call.args[0].get("type") == "task_event"
+        ]
+        recovered = [e for e in events if e.get("event_type") == "step_recovered"]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["payload"]["step_id"], "validate_project")
+        self.assertEqual(recovered[0]["payload"]["via"], "repair_project")
+
     async def test_tampered_repair_manifest_is_rejected_after_approval(self):
         state, step = self._state_and_step("repair_project")
         state.generation["validation_results"] = [{"name": "test", "status": "failed"}]

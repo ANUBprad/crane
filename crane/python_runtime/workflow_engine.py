@@ -2108,6 +2108,20 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
             "validation_status": [r.get("status") for r in safe_results2],
             "exit_codes": [r.get("exit_code") for r in safe_results2],
         })
+        if ok:
+            # A successful repair revalidated the same project, so the failed
+            # validation step is resolved by recovery rather than left as a
+            # permanent failure that forces partial completion.
+            validation_step = next(
+                (s for s in state.plan if s.step_id == "validate_project"), None
+            )
+            if validation_step is not None and validation_step.status in {"failed", "skipped"}:
+                validation_step.status = "completed"
+                _plan_status_sync(state)
+                _event(state.task_id, "step_recovered", {
+                    "step_id": "validate_project", "via": "repair_project",
+                    "attempt": attempts + 1,
+                })
         return {"status": "succeeded" if ok else "failed", "output": {"applied": applied.get("applied", []), "validation_results": safe_results2, "attempt": attempts + 1}}
 
     if sid == "final_report":
