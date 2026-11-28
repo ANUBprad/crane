@@ -208,6 +208,12 @@ class ProviderInvocationTests(unittest.TestCase):
         self.assertEqual(chat.kwargs["num_ctx"], 4096)
         self.assertEqual(chat.kwargs["client_kwargs"]["timeout"], 180.0)
 
+    def test_json_mode_is_passed_to_chat_ollama_for_structured_calls(self) -> None:
+        config = provider.load_ollama_config(OLLAMA_ENV)
+        with patch.dict(sys.modules, fake_chat_module()):
+            provider._create_chat_model(config, json_mode=True)
+        self.assertEqual(FakeChatOllama.calls[0]["format"], "json")
+
     def test_custom_num_ctx_is_passed_to_chat_ollama(self) -> None:
         config = provider.load_ollama_config({
             **OLLAMA_ENV,

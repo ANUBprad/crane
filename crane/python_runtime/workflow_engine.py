@@ -1462,6 +1462,7 @@ async def _model_json(state: WorkflowState, prompt: str, system: str) -> Optiona
                 invoke_provider, prompt, None, system,
                 state.persistent_state.get("conversation_messages") or [],
                 state.runtime_context,
+                json_mode=True,
             ),
             state.task_id,
         )

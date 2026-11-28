@@ -414,7 +414,7 @@ def preflight_ollama(config: OllamaConfig) -> List[str]:
     return models
 
 
-def _create_chat_model(config: OllamaConfig) -> Any:
+def _create_chat_model(config: OllamaConfig, json_mode: bool = False) -> Any:
     try:
         chat_class = _import_chat_ollama()
     except ImportError as exc:
@@ -423,13 +423,16 @@ def _create_chat_model(config: OllamaConfig) -> Any:
             f"Ollama provider dependency is missing. Install {OLLAMA_DEPENDENCY} or use CRANE_MODEL_PROVIDER=local.",
         ) from exc
     try:
-        return chat_class(
-            model=config.model,
-            base_url=config.base_url,
-            temperature=0,
-            num_ctx=config.num_ctx,
-            client_kwargs={"timeout": config.invoke_timeout_seconds},
-        )
+        kwargs: Dict[str, Any] = {
+            "model": config.model,
+            "base_url": config.base_url,
+            "temperature": 0,
+            "num_ctx": config.num_ctx,
+            "client_kwargs": {"timeout": config.invoke_timeout_seconds},
+        }
+        if json_mode:
+            kwargs["format"] = "json"
+        return chat_class(**kwargs)
     except Exception as exc:  # noqa: BLE001 - normalize third-party initialization errors
         raise ProviderError(
             "provider_initialization_failed",
@@ -477,10 +480,11 @@ def _invoke_ollama(
     system_prompt: str = "",
     messages: Optional[List[Dict[str, str]]] = None,
     on_delta: Optional[Any] = None,
+    json_mode: bool = False,
 ) -> Dict[str, Any]:
     config = load_ollama_config(env)
     preflight_ollama(config)
-    chat_model = _create_chat_model(config)
+    chat_model = _create_chat_model(config, json_mode=json_mode)
     prompt_messages = _build_messages(user_input, system_prompt=system_prompt, messages=messages)
     try:
         if on_delta is None or not hasattr(chat_model, "stream"):
@@ -834,6 +838,7 @@ def invoke(
     messages: Optional[List[Dict[str, str]]] = None,
     context: Optional[Dict[str, Any]] = None,
     on_delta: Optional[Any] = None,
+    json_mode: bool = False,
 ) -> Dict[str, Any]:
     """Execute the configured provider path. No fallback is permitted."""
     provider = selected_provider(env)
@@ -852,6 +857,7 @@ def invoke(
             system_prompt=system_prompt,
             messages=messages,
             on_delta=on_delta,
+            json_mode=json_mode,
         )
     raise ProviderError(
         "provider_not_supported",
