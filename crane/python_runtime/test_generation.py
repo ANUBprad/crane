@@ -235,6 +235,16 @@ class GenerationSafetyTests(unittest.TestCase):
         self.assertIsNone(workflow_engine._parse_model_json("no json here"))
         self.assertIsNone(workflow_engine._parse_model_json('{"files": ['))
 
+    def test_model_json_recovers_unescaped_triple_quoted_source(self):
+        text = '{"files":[{"path":"app/main.py","operation":"write","content":"x = \\"hello\\"\\ny = """sql"""\\n"}]}'
+        parsed = workflow_engine._parse_model_json(text)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["files"][0]["content"], 'x = "hello"\ny = """sql"""\n')
+
+    def test_model_json_preserves_valid_escaped_quotes(self):
+        parsed = workflow_engine._parse_model_json('{"content":"say \\"hi\\""}')
+        self.assertEqual(parsed, {"content": 'say "hi"'})
+
     def test_repair_manifest_collapses_duplicate_writes_to_last_operation(self):
         manifest = [
             {"path": "main.py", "operation": "write", "content": "first"},

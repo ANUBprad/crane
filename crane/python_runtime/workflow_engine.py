@@ -1286,15 +1286,8 @@ def _consume_grant(state: WorkflowState, scope: str) -> bool:
     return True
 
 
-def _parse_model_json(text: str) -> Optional[Dict[str, Any]]:
-    """Extract the first balanced JSON object from a model response.
-
-    Models often wrap the requested object in Markdown fences and continue with
-    prose containing more braces. A greedy ``{.*}`` match spans those trailing
-    examples and discards an otherwise valid repair manifest.
-    """
-    if not isinstance(text, str):
-        return None
+def _balanced_json_objects(text: str):
+    """Yield balanced brace-delimited substrings from model output."""
     for start, char in enumerate(text):
         if char != "{":
             continue
@@ -1318,11 +1311,68 @@ def _parse_model_json(text: str) -> Optional[Dict[str, Any]]:
             elif current == "}":
                 depth -= 1
                 if depth == 0:
-                    try:
-                        obj = json.loads(text[start:index + 1])
-                    except Exception:
-                        break
-                    return obj if isinstance(obj, dict) else None
+                    yield text[start:index + 1]
+                    break
+
+
+def _escape_internal_json_quotes(candidate: str) -> str:
+    """Escape unescaped quotes inside JSON string values.
+
+    Small local models sometimes emit Python triple-quoted strings directly
+    inside a JSON content value. A real closing quote is followed by a JSON
+    value separator, so other unescaped quotes are source content.
+    """
+    out: List[str] = []
+    in_string = False
+    escaped = False
+    for index, char in enumerate(candidate):
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            out.append(char)
+            if in_string:
+                escaped = True
+            continue
+        if char == '"':
+            if in_string:
+                lookahead = index + 1
+                while lookahead < len(candidate) and candidate[lookahead].isspace():
+                    lookahead += 1
+                if lookahead < len(candidate) and candidate[lookahead] in ":,}]":
+                    in_string = False
+                else:
+                    out.append('\\"')
+                    continue
+            else:
+                in_string = True
+        out.append(char)
+    return "".join(out)
+
+
+def _parse_model_json(text: str) -> Optional[Dict[str, Any]]:
+    """Extract the first balanced JSON object from a model response.
+
+    Models often wrap the requested object in Markdown fences and continue with
+    prose containing more braces. A greedy ``{.*}`` match spans those trailing
+    examples and discards an otherwise valid repair manifest. A bounded second
+    pass recovers strings whose source quotes were not escaped by the model.
+    """
+    if not isinstance(text, str):
+        return None
+    for candidate in _balanced_json_objects(text):
+        try:
+            obj = json.loads(candidate)
+        except Exception:
+            continue
+        return obj if isinstance(obj, dict) else None
+    for candidate in _balanced_json_objects(_escape_internal_json_quotes(text)):
+        try:
+            obj = json.loads(candidate)
+        except Exception:
+            continue
+        return obj if isinstance(obj, dict) else None
     return None
 
 
@@ -1909,6 +1959,8 @@ async def _exec_generation_step(state: WorkflowState, step: PlanStep) -> Dict[st
                     "Remove stray top-level raise statements and placeholder marker strings from generated source; they are not part of the requested application. "
                     "Python file content must contain real line breaks, never literal backslash-n sequences or semicolon-separated statements; decorators and indented bodies must be on separate lines. "
                     "Never pin the standard-library sqlite3 module in requirements.txt. "
+                    "Escape every double quote inside JSON string values, including Python triple-quoted strings. "
+                    "When the traceback points to one generated file, change only that file and preserve every other file byte-for-byte. "
                     "Do not emit duplicate path entries; if a path repeats, only its final operation is applied, so prefer exactly one write with complete content. "
                     "For an assertion mismatch, change the production source to satisfy the expected behavior unless the test itself is invalid. "
                     "Fix the root cause rather than suppressing the error or adding a stub. Preserve existing public behavior and unrelated code. "
