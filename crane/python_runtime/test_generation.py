@@ -534,6 +534,7 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(prompts), 1)
         self.assertIn('"write"', prompts[0])
         self.assertIn('"delete"', prompts[0])
+        self.assertIn("semicolon-separated", prompts[0])
 
     def test_repair_step_is_runnable_after_failed_validation(self):
         state = workflow_engine.WorkflowState(
@@ -742,6 +743,7 @@ class GenerationWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[redacted]", prompts[0])
         self.assertNotIn("canary-secret-value", prompts[0])
         self.assertIn("package __init__.py", prompts[0])
+        self.assertIn("semicolon-separated", prompts[0])
 
     async def test_repair_requires_exact_manifest_digest_and_never_regenerates_under_grant(self):
         state, step = self._state_and_step("repair_project")
