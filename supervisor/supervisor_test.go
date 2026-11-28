@@ -758,3 +758,51 @@ func TestStartupRecoveryPolicies(t *testing.T) {
 		waitForStatus(t, store, "recover-approval", "waiting_approval")
 	})
 }
+
+type discardWriteCloser struct{}
+
+func (discardWriteCloser) Write(data []byte) (int, error) { return len(data), nil }
+func (discardWriteCloser) Close() error                   { return nil }
+
+func TestRetiredRuntimeCannotOverwriteApprovedCheckpoint(t *testing.T) {
+	s, store := newHelperSupervisor(t, "success")
+	taskID := "retired-runtime-task"
+	if _, err := store.CreateTask(taskID, "running", "work"); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := []byte(`{"state":"running","execution_status":"running","current_step":"repair_project"}`)
+	if err := store.SaveTaskState(taskID, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+
+	active := &runningTask{
+		id:     taskID,
+		cancel: func() {},
+		stdin:  discardWriteCloser{},
+		done:   make(chan struct{}),
+	}
+	s.active[taskID] = active
+	s.retireActiveTask(taskID)
+
+	if !active.retired.Load() {
+		t.Fatal("active runtime was not marked retired")
+	}
+	if _, exists := s.active[taskID]; exists {
+		t.Fatal("retired runtime remained registered as active")
+	}
+	if err := active.finish(s, "failed", `{"code":"stale"}`, "stale runtime result", nil); err != nil {
+		t.Fatalf("retired finish() error = %v", err)
+	}
+
+	record, err := store.GetTaskRecord(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "running" {
+		t.Fatalf("retired runtime changed task status to %q", record.Status)
+	}
+	latest, ok := store.GetLatestTaskState(taskID)
+	if !ok || string(latest) != string(checkpoint) {
+		t.Fatalf("retired runtime overwrote the approved checkpoint: %s", latest)
+	}
+}

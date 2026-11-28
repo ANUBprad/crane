@@ -51,13 +51,14 @@ type taskContext struct {
 }
 
 type runningTask struct {
-	id     string
-	cancel context.CancelFunc
-	stdin  io.WriteCloser
-	stderr *boundedBuffer
-	write  sync.Mutex
-	done   chan struct{}
-	once   sync.Once
+	id      string
+	cancel  context.CancelFunc
+	stdin   io.WriteCloser
+	stderr  *boundedBuffer
+	write   sync.Mutex
+	done    chan struct{}
+	once    sync.Once
+	retired atomic.Bool
 
 	assistantMu          sync.Mutex
 	assistantText        strings.Builder
@@ -75,6 +76,24 @@ func (r *runningTask) send(message any) error {
 	defer r.write.Unlock()
 	_, err = r.stdin.Write(encoded)
 	return err
+}
+
+// retireActiveTask stops a still-live runtime before a replacement run starts.
+// Approval can arrive while the old runtime is writing its final checkpoint;
+// without retirement its late result can overwrite the granted checkpoint.
+func (s *Supervisor) retireActiveTask(id string) {
+	s.activeMu.Lock()
+	active := s.active[id]
+	if active != nil {
+		delete(s.active, id)
+	}
+	s.activeMu.Unlock()
+	if active == nil {
+		return
+	}
+	active.retired.Store(true)
+	active.cancel()
+	_ = active.stdin.Close()
 }
 
 type eventSubscription struct {
@@ -426,6 +445,10 @@ func (s *Supervisor) ApproveTask(id string, approved bool, scope string) (persis
 		}
 		return s.store.GetTaskRecord(id)
 	}
+
+	// Retire any runtime that is still finalizing the approval pause before the
+	// replacement run is enqueued with the newly granted checkpoint.
+	s.retireActiveTask(id)
 
 	// Merge granted approvals in checkpoint.
 	grants := []string{}
@@ -812,6 +835,9 @@ func (s *Supervisor) pythonCommand(ctx context.Context) *exec.Cmd {
 }
 
 func (s *Supervisor) handleProtocolFrame(id string, task *runningTask, frame []byte) bool {
+	if task.retired.Load() {
+		return true
+	}
 	base, err := python_protocol.Unmarshal(frame)
 	if err != nil {
 		s.emitEvent(id, "protocol_error", map[string]any{"code": "invalid_message"})
@@ -828,6 +854,9 @@ func (s *Supervisor) handleProtocolFrame(id string, task *runningTask, frame []b
 		state, err := python_protocol.DecodeTaskState(frame)
 		if err != nil {
 			s.emitEvent(id, "protocol_error", map[string]any{"code": "invalid_task_state"})
+			return true
+		}
+		if task.retired.Load() {
 			return true
 		}
 		version := 0
@@ -879,6 +908,9 @@ func (s *Supervisor) handleProtocolFrame(id string, task *runningTask, frame []b
 			s.emitEvent(id, "protocol_error", map[string]any{"code": "invalid_task_result"})
 			return true
 		}
+		if task.retired.Load() {
+			return true
+		}
 		if len(result.Checkpoint) > 0 {
 			_ = s.store.SaveTaskState(id, result.Checkpoint)
 		}
@@ -916,6 +948,12 @@ func (s *Supervisor) handleProtocolFrame(id string, task *runningTask, frame []b
 func (r *runningTask) finish(s *Supervisor, status, result, taskError string, checkpoint []byte) error {
 	var finishErr error
 	r.once.Do(func() {
+		// A replacement run has taken ownership. Its checkpoint must not be
+		// overwritten by this retired runtime's late terminal result.
+		if r.retired.Load() {
+			close(r.done)
+			return
+		}
 		// A pre-execution cancellation may already have made this task terminal.
 		// Never let a late runtime result overwrite that supervisor decision.
 		if record, err := s.store.GetTaskRecord(r.id); err == nil && isTerminal(record.Status) {
